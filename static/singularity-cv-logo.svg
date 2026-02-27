@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 120">
+  <defs>
+    <radialGradient id="singularity" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#c8943e" stop-opacity="1"/>
+      <stop offset="40%" stop-color="#c8943e" stop-opacity="0.6"/>
+      <stop offset="70%" stop-color="#c8943e" stop-opacity="0.2"/>
+      <stop offset="100%" stop-color="#c8943e" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="core" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="60%" stop-color="#c8943e"/>
+      <stop offset="100%" stop-color="#0b0a09"/>
+    </radialGradient>
+  </defs>
+  
+  <!-- Background -->
+  <rect width="400" height="120" fill="#0b0a09" rx="8"/>
+  
+  <!-- Singularity icon: concentric rings converging to a bright point -->
+  <g transform="translate(60, 60)">
+    <!-- Outer accretion rings -->
+    <ellipse cx="0" cy="0" rx="38" ry="14" fill="none" stroke="#c8943e" stroke-width="0.8" opacity="0.2" transform="rotate(-15)"/>
+    <ellipse cx="0" cy="0" rx="32" ry="12" fill="none" stroke="#c8943e" stroke-width="1" opacity="0.3" transform="rotate(-10)"/>
+    <ellipse cx="0" cy="0" rx="26" ry="10" fill="none" stroke="#c8943e" stroke-width="1.2" opacity="0.45" transform="rotate(-5)"/>
+    <ellipse cx="0" cy="0" rx="20" ry="8" fill="none" stroke="#c8943e" stroke-width="1.5" opacity="0.6"/>
+    <ellipse cx="0" cy="0" rx="14" ry="6" fill="none" stroke="#c8943e" stroke-width="1.8" opacity="0.75" transform="rotate(5)"/>
+    <ellipse cx="0" cy="0" rx="8" ry="4" fill="none" stroke="#c8943e" stroke-width="2" opacity="0.9" transform="rotate(10)"/>
+    
+    <!-- Event horizon glow -->
+    <circle cx="0" cy="0" r="6" fill="url(#singularity)"/>
+    
+    <!-- Singularity core -->
+    <circle cx="0" cy="0" r="2.5" fill="url(#core)"/>
+    <circle cx="0" cy="0" r="1" fill="#ffffff"/>
+  </g>
+  
+  <!-- Text: Singularity.cv -->
+  <text x="115" y="52" font-family="Georgia, 'Times New Roman', serif" font-size="32" font-weight="400" fill="#c8943e" letter-spacing="1">
+    Singularity
+  </text>
+  <text x="115" y="82" font-family="Georgia, 'Times New Roman', serif" font-size="20" font-weight="400" fill="#c8943e" opacity="0.7" letter-spacing="3">
+    .cv
+  </text>
+</svg>

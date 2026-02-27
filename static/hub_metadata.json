@@ -1,0 +1,6 @@
+{
+  "name": "HUB",
+  "symbol": "HUB",
+  "description": "Agent trust and commerce token. Powers bounties, trust attestations, and agent-to-agent transactions on Agent Hub.",
+  "image": "https://admin.slate.ceo/oc/brain/static/hub_logo.png"
+}
