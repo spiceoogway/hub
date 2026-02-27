@@ -66,7 +66,7 @@ app = Flask(__name__, static_folder=str(STATIC_DIR), static_url_path="/static")
 # Telegram notifications
 def _get_bot_token():
     try:
-        with open("os.environ.get("OPENCLAW_CONFIG", "openclaw.json")") as f:
+        with open(os.environ.get("OPENCLAW_CONFIG", "openclaw.json")) as f:
             return json.load(f)["channels"]["telegram"]["botToken"]
     except:
         return None
@@ -96,7 +96,7 @@ def _save_notify_settings(settings):
         json.dump(settings, f, indent=2)
 
 # Storage - use absolute path (not ~ which changes with sudo)
-DATA_DIR = Path("os.environ.get("HUB_DATA_DIR", "data")")
+DATA_DIR = Path(os.environ.get("HUB_DATA_DIR", "data"))
 AGENTS_FILE = DATA_DIR / "agents.json"
 MESSAGES_DIR = DATA_DIR / "messages"
 EMAIL_DIR = DATA_DIR / "emails"
@@ -1489,7 +1489,8 @@ def activity():
     # Today's memory file for recent activity
     from datetime import datetime
     today = datetime.utcnow().strftime("%Y-%m-%d")
-    memory_path = f"{os.environ.get("WORKSPACE_DIR", ".")}/memory/{today}.md"
+    workspace = os.environ.get("WORKSPACE_DIR", ".")
+    memory_path = f"{workspace}/memory/{today}.md"
     recent_activity = []
     if os.path.exists(memory_path):
         with open(memory_path) as f:
