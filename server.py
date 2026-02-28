@@ -977,8 +977,25 @@ def update_agent(agent_id):
     
     updated = []
     if "callback_url" in data:
-        agents[agent_id]["callback_url"] = data["callback_url"]
+        new_callback = data["callback_url"]
+        # Test the callback URL before saving
+        callback_ok = False
+        callback_error = None
+        if new_callback:
+            try:
+                import urllib.request
+                test_payload = json.dumps({"type": "callback_test", "from": "hub", "message": "Callback verification test"}).encode()
+                req = urllib.request.Request(new_callback, data=test_payload, headers={"Content-Type": "application/json"}, method="POST")
+                resp = urllib.request.urlopen(req, timeout=10)
+                callback_ok = resp.status < 400
+            except Exception as e:
+                callback_error = f"{type(e).__name__}: {str(e)[:100]}"
+        agents[agent_id]["callback_url"] = new_callback
+        agents[agent_id]["callback_verified"] = callback_ok
+        agents[agent_id]["callback_error"] = callback_error
         updated.append("callback_url")
+        if not callback_ok and new_callback:
+            updated.append(f"WARNING: callback test failed ({callback_error}). Messages may not be delivered.")
     if "description" in data:
         agents[agent_id]["description"] = data["description"]
         updated.append("description")
