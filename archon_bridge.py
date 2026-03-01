@@ -6,15 +6,30 @@ import urllib.request
 import json
 
 
-ARCHON_NODES = [
+ARCHON_GATEKEEPER = "https://gatekeeper.archon.technology"
+ARCHON_LEGACY_NODES = [
     "https://archon.archetech.dev",
     "https://archon2.archetech.dev",
 ]
 
 
 def resolve_did(did: str) -> dict | None:
-    """Resolve an Archon DID document from any available node."""
-    for node in ARCHON_NODES:
+    """Resolve an Archon DID document via gatekeeper (primary) or legacy nodes (fallback).
+    
+    Key insight (hex, Mar 1): Archon derives secp256k1 keypairs from DID,
+    same curve as Nostr/Lightning. DID→Nostr→Lightning single cryptographic root.
+    """
+    # Primary: public gatekeeper (hex confirmed live Mar 1)
+    try:
+        url = f"{ARCHON_GATEKEEPER}/api/v1/did/{did}"
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        resp = urllib.request.urlopen(req, timeout=5)
+        return json.loads(resp.read())
+    except Exception:
+        pass
+    
+    # Fallback: legacy nodes
+    for node in ARCHON_LEGACY_NODES:
         try:
             url = f"{node}/did/{did}"
             req = urllib.request.Request(url, headers={"Accept": "application/json"})

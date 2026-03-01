@@ -2148,6 +2148,55 @@ def trust_schema():
         ],
     })
 
+
+@app.route("/trust/did/<path:did_str>", methods=["GET"])
+def trust_did_resolve(did_str):
+    """Resolve an Archon DID and return linked identities + Hub trust data if linked.
+    
+    Bridges Archon persistent identity with Hub trust profiles.
+    DID→Nostr→Lightning single cryptographic root (hex, Mar 1).
+    """
+    from archon_bridge import resolve_did, extract_linked_identities
+    
+    did_doc = resolve_did(did_str)
+    if not did_doc:
+        return jsonify({
+            "ok": False,
+            "error": f"Could not resolve DID: {did_str}",
+            "hint": "Archon gatekeeper may be unreachable. Try: GET https://gatekeeper.archon.technology/api/v1/did/:did",
+        }), 404
+    
+    identities = extract_linked_identities(did_doc)
+    
+    # Check if any linked identity matches a Hub agent
+    hub_link = None
+    agents = load_agents()
+    agent_map = {a["agent_id"]: a for a in agents} if isinstance(agents, list) else {}
+    
+    for aka in did_doc.get("alsoKnownAs", []):
+        if "hub:" in aka:
+            hub_agent_id = aka.split("hub:")[-1]
+            if hub_agent_id in agent_map:
+                hub_link = hub_agent_id
+                break
+    
+    result = {
+        "ok": True,
+        "did": did_str,
+        "linked_identities": identities,
+        "hub_agent": hub_link,
+    }
+    
+    # If linked to Hub, include trust data
+    if hub_link:
+        trust_file = DATA_DIR / "trust" / f"{hub_link}.json"
+        if trust_file.exists():
+            td = json.load(open(trust_file))
+            result["trust_profile"] = td
+    
+    return jsonify(result)
+
+
 @app.route("/trust/attest/<agent_id>", methods=["GET"])
 def get_attestations(agent_id):
     """Get all attestations for an agent."""
