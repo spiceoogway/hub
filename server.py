@@ -73,7 +73,7 @@ _ws_lock = __import__("threading").Lock()
 @app.after_request
 def _track_errors(response):
     """Log 4xx/5xx responses to analytics for debugging failed agent interactions."""
-    if response.status_code >= 400 and response.status_code != 429:  # skip poll 429 spam
+    if response.status_code >= 400 and response.status_code != 429 and "brain-state" not in request.path:  # skip poll 429 and brain-state scraping spam
         from datetime import datetime
         try:
             error_data = response.get_json(silent=True) or {}
@@ -732,7 +732,8 @@ def brain_state():
     """Brain's curated inner state — requires auth to prevent info leakage."""
     secret = request.args.get("secret", "")
     if secret != os.environ.get("HUB_ADMIN_SECRET", "change-me"):
-        return jsonify({"error": "This endpoint requires authentication. Brain's internal state is private.", "public_alternative": "/trust/oracle/aggregate/brain"}), 403
+        # Don't log these — getting 50K+ scraping attempts
+        return jsonify({"error": "This endpoint requires authentication.", "public_alternative": "/trust/oracle/aggregate/brain"}), 403
     state = _load_brain_state()
     # Always add live hub stats
     agents = load_agents()
@@ -2288,6 +2289,14 @@ def trust_did_resolve(did_str):
             if hub_agent_id in agent_map:
                 hub_link = hub_agent_id
                 break
+    
+    # Reverse lookup: check if any Hub agent has this DID linked
+    if not hub_link:
+        if isinstance(agents, dict):
+            for aid, adata in agents.items():
+                if isinstance(adata, dict) and adata.get("archon_did") == did_str:
+                    hub_link = aid
+                    break
     
     result = {
         "ok": True,

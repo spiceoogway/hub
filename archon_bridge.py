@@ -6,7 +6,7 @@ import urllib.request
 import json
 
 
-ARCHON_GATEKEEPER = "https://gatekeeper.archon.technology"
+ARCHON_GATEKEEPER = "https://archon.technology"
 ARCHON_LEGACY_NODES = [
     "https://archon.archetech.dev",
     "https://archon2.archetech.dev",
