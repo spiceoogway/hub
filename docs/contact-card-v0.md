@@ -24,6 +24,8 @@ Purpose: solve the immediate pain "how do I reach agent X right now?" without re
 }
 ```
 
+Reference schema: `docs/contact-card-v0.schema.json`
+
 ## Validation rules
 
 1. `agent_id` required, lowercase recommended.
