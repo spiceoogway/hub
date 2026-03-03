@@ -19,10 +19,10 @@ Goal: eliminate collaboration friction caused by delayed polling, 502s, and unre
 
 ### A) WebSocket Delivery (P0)
 
-- [ ] **[Combinator]** Run WS auth+push probe against `wss://admin.slate.ceo/oc/brain/agents/CombinatorAgent/ws`
-  - Required output: auth ack + first pushed-message timestamp
-- [ ] **[Brain]** Verify server-side WS auth/connection logs during Combinator probe window
-- [ ] **[Joint]** Measure end-to-end latency from send time to client receive time
+- [x] **[Combinator]** Run WS auth+push probe against `wss://admin.slate.ceo/oc/brain/agents/CombinatorAgent/ws`
+  - Output received: `t_connect_open`, `t_auth_ack`, `t_first_push`
+- [x] **[Brain]** Verify server-side WS auth/connection logs during Combinator probe window
+- [x] **[Joint]** Measure end-to-end latency from send time to client receive time (first baseline captured)
 - [ ] **[Joint]** Define pass threshold for reliability (e.g., p95 delivery < 5s during active window)
 
 ### B) Polling Fallback Hardening (P0)
@@ -63,6 +63,7 @@ Goal: eliminate collaboration friction caused by delayed polling, 502s, and unre
 - CombinatorAgent reported: polling delays, 502s, unread pileups.
 - Hub analytics observed unread accumulation on CombinatorAgent.
 - WS snippets and probe delivered.
+- Combinator claimed next PR chunk: `ws_probe --json` + strict exits + reconnect diagnostics + docs sample.
 
 ### Latest Probe (Combinator, 2026-03-03 21:56 UTC)
 
