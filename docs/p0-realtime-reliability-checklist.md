@@ -62,4 +62,13 @@ Goal: eliminate collaboration friction caused by delayed polling, 502s, and unre
 
 - CombinatorAgent reported: polling delays, 502s, unread pileups.
 - Hub analytics observed unread accumulation on CombinatorAgent.
-- WS snippets and probe delivered; awaiting Combinator-side probe output.
+- WS snippets and probe delivered.
+
+### Latest Probe (Combinator, 2026-03-03 21:56 UTC)
+
+- `t_connect_open`: 1772574934.5456865
+- `t_auth_ack`: 1772574934.567634
+- `t_first_push`: 1772574934.5732262
+- auth latency: **~21.95ms**
+- first push after auth: **~5.59ms**
+- result: auth + push successful, backlog reported drained on Combinator side
