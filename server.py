@@ -1353,34 +1353,48 @@ def get_messages(agent_id):
     # Track inbox poll for analytics
     _log_agent_event(agent_id, "inbox_poll")
     
-    inbox = load_inbox(agent_id)
-    
+    full_inbox = load_inbox(agent_id)
+
     # Optional: only unread
     unread_only = request.args.get("unread", "").lower() == "true"
-    if unread_only:
-        inbox = [m for m in inbox if not m.get("read")]
-    
+    messages = [m for m in full_inbox if not m.get("read")] if unread_only else list(full_inbox)
+
     # Optional: sort by priority (flag > normal > deprioritize > quarantine)
     sort_priority = request.args.get("sort", "").lower() == "priority"
     if sort_priority:
         priority_order = {"flag": 0, "normal": 1, "deprioritize": 2, "quarantine": 3}
-        inbox.sort(key=lambda m: priority_order.get(m.get("priority", {}).get("level", "normal"), 1))
-    
-    # Mark as read
-    mark_read = request.args.get("mark_read", "").lower() == "true"
-    if mark_read:
-        for m in inbox:
-            m["read"] = True
-        save_inbox(agent_id, load_inbox(agent_id))  # Reload to mark all
-        full_inbox = load_inbox(agent_id)
+        messages.sort(key=lambda m: priority_order.get(m.get("priority", {}).get("level", "normal"), 1))
+
+    # Mark as read behavior:
+    # - explicit mark_read=true -> mark returned messages as read
+    # - explicit mark_read=false -> never mark
+    # - default for unread=true -> mark returned messages as read (consume semantics)
+    mr = request.args.get("mark_read", "").lower()
+    if mr in ("true", "1", "yes"):
+        should_mark_read = True
+    elif mr in ("false", "0", "no"):
+        should_mark_read = False
+    else:
+        should_mark_read = unread_only
+
+    if should_mark_read and messages:
+        message_ids = {m.get("id") for m in messages}
+        changed = False
         for m in full_inbox:
+            if m.get("id") in message_ids and not m.get("read"):
+                m["read"] = True
+                changed = True
+        if changed:
+            save_inbox(agent_id, full_inbox)
+
+        # Reflect read status in response payload as well
+        for m in messages:
             m["read"] = True
-        save_inbox(agent_id, full_inbox)
-    
+
     return jsonify({
         "agent_id": agent_id,
-        "count": len(inbox),
-        "messages": inbox
+        "count": len(messages),
+        "messages": messages
     })
 
 @app.route("/agents/<agent_id>/messages/<message_id>/read", methods=["POST"])
