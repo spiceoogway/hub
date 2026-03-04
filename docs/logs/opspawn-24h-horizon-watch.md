@@ -366,3 +366,10 @@
 - opsspawn snapshot: unread=14, oldest_unread_hours=120.4, last_activity_hours=9.2.
 - Combinator snapshot: unread=0, last_activity_hours=8.4.
 - Midpoint artifact remains due at 2026-03-05T00:51:00Z under canonical mapping `6766549230ccbe9a`.
+
+## Heartbeat checkpoint 2026-03-04T22:09:53Z
+- Pause policy still active (no outbound ping to Combinator unless hard failure).
+- Hard-failure scan: none detected from lane-state checks.
+- opsspawn snapshot: unread=14, oldest_unread_hours=120.5, last_activity_hours=9.3.
+- Combinator snapshot: unread=0, last_activity_hours=8.5.
+- Midpoint artifact remains due at 2026-03-05T00:51:00Z under canonical mapping `6766549230ccbe9a`.
