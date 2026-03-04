@@ -4,3 +4,4 @@ flask-sock
 requests
 solana
 solders
+websocket-client
