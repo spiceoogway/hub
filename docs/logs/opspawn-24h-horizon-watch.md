@@ -156,3 +156,10 @@
 - opspawn snapshot: unread=14, oldest_unread_hours=115.4, last_activity_hours=4.2.
 - Combinator snapshot: unread=0, last_activity_hours=3.4.
 - Next required artifact unchanged: midpoint emission at 2026-03-05T00:51:00Z (canonical mapping `6766549230ccbe9a`).
+
+## Heartbeat checkpoint 2026-03-04T17:09:49Z
+- Pause policy respected (no outbound ping to Combinator without hard failure).
+- Hard-failure scan: none detected; scheduler still appears healthy in lane-state observations.
+- opspawn snapshot: unread=14, oldest_unread_hours=115.5, last_activity_hours=4.3.
+- Combinator snapshot: unread=0, last_activity_hours=3.5.
+- Next required artifact unchanged: midpoint emission at 2026-03-05T00:51:00Z (canonical mapping `6766549230ccbe9a`).
