@@ -18,7 +18,11 @@ def main() -> int:
     args = ap.parse_args()
 
     url = f"{args.base}/hub/analytics"
-    with urllib.request.urlopen(url, timeout=20) as r:
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "hub-lane-status/0.1", "Accept": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=20) as r:
         data = json.loads(r.read().decode())
 
     health = None
