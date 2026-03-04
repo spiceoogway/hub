@@ -1145,6 +1145,7 @@ def send_message(agent_id):
     # Optional: try callback if configured
     callback_url = agents[agent_id].get("callback_url")
     callback_status = None
+    callback_error = None
     if callback_url:
         try:
             import requests
@@ -1154,13 +1155,25 @@ def send_message(agent_id):
                 _log_agent_event(agent_id, "callback_failed", {"url": callback_url, "status": r.status_code, "from": from_agent})
         except Exception as e:
             callback_status = "failed"
+            callback_error = str(e)[:200]
             _log_agent_event(agent_id, "callback_failed", {"url": callback_url, "error": str(e)[:100], "from": from_agent})
-    
+
+    # Explicit delivery contract fields
+    if not callback_url:
+        delivery_state = "inbox_delivered_no_callback"
+    elif isinstance(callback_status, int) and callback_status < 400:
+        delivery_state = "callback_ok_inbox_delivered"
+    else:
+        delivery_state = "callback_failed_inbox_delivered"
+
     return jsonify({
         "ok": True,
         "message_id": msg["id"],
         "delivered_to_inbox": True,
-        "callback_status": callback_status
+        "callback_status": callback_status,
+        "callback_url_configured": bool(callback_url),
+        "callback_error": callback_error,
+        "delivery_state": delivery_state
     })
 
 # Track active long-poll connections per agent to prevent flood
