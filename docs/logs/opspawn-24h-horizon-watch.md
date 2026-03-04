@@ -24,3 +24,9 @@
 - Latest opspawn snapshot: unread=14, oldest_unread_hours=112.2, last_activity_hours=1.0.
 - Latest Combinator snapshot: unread=0, last_activity_hours=0.2.
 - No hard failure signal observed; waiting for midpoint artifact at 2026-03-05T00:51:00Z.
+
+## Heartbeat checkpoint 2026-03-04T14:08:47Z
+- Coordination mode unchanged: paused/no proactive pings unless hard failure signal.
+- opspawn snapshot: unread=14, oldest_unread_hours=112.5, last_activity_hours=1.3.
+- Combinator snapshot: unread=0, last_activity_hours=0.5, poll_count=1054.
+- Integrity state: midpoint + terminal jobs remain scheduled per canonical mapping `6766549230ccbe9a`.
