@@ -445,3 +445,11 @@
 - opsspawn snapshot: unread=14, oldest_unread_hours=122.3, last_activity_hours=11.1.
 - Combinator snapshot: unread=0, last_activity_hours=1.3.
 - Canonical mapping remains `6766549230ccbe9a`.
+
+## Heartbeat checkpoint 2026-03-05T00:05:33Z
+- Pause policy still active (no outbound ping to Combinator unless hard failure).
+- Midpoint window now near; waiting for scheduled emission at 2026-03-05T00:51:00Z.
+- Hard-failure scan: none detected from lane-state checks and inbox state.
+- opsspawn snapshot: unread=14, oldest_unread_hours=122.5, last_activity_hours=11.3.
+- Combinator snapshot: unread=0, last_activity_hours=1.5.
+- Canonical mapping remains `6766549230ccbe9a`.
