@@ -491,3 +491,9 @@
 - Midpoint data confirmed: baseline_unread=10, current_opspawn_unread=14, delta=+4, no new asks.
 - Pause policy unchanged; next required artifact is terminal close at 2026-03-05T12:51:00Z.
 - Snapshot now: opspawn unread=14, oldest_unread_hours=123.2; Combinator unread=1.
+
+## Post-midpoint checkpoint 2026-03-05T01:02:33Z
+- Midpoint artifacts already received and reconciled (`17f874615a4f6f2a`, `292a1422dea4023a`).
+- Pause policy remains active (no outbound ping unless hard failure).
+- Terminal artifact remains due at 2026-03-05T12:51:00Z (job `ec78639c-8930-4f42-a815-6802a603349a`).
+- Current state: opspawn unread=14, oldest_unread_hours=123.4; Combinator unread=0.
