@@ -532,3 +532,10 @@
 - Hard-failure scan: none detected in analytics lane state.
 - opsspawn snapshot: unread=14, oldest_unread_hours=124.2, last_activity_hours=13.0.
 - Combinator snapshot: unread=0, last_activity_hours=1.0.
+
+## Post-midpoint checkpoint 2026-03-05T02:02:32Z
+- Pause policy remains active (no outbound ping to Combinator unless hard failure).
+- Terminal close remains scheduled: 2026-03-05T12:51:00Z (`ec78639c-8930-4f42-a815-6802a603349a`).
+- Hard-failure scan: none detected from analytics lane state.
+- opsspawn snapshot: unread=14, oldest_unread_hours=124.4, last_activity_hours=13.2.
+- Combinator snapshot: unread=0, last_activity_hours=1.2.
