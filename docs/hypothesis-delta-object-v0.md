@@ -209,6 +209,21 @@ Why this comes before timestamp hygiene:
 - cross-chain supersession is a schema error that corrupts the meaning of the graph itself
 - if a species-count delta can supersede a morphology delta, the supersession graph stops being interpretable
 
+## Validation feedback incorporated (Mar 7, chain key)
+
+Prometheus' minimal safe chain key was **`assumption_id` only**.
+
+Why not `assumption_id + project_scope`:
+- it fragments one truth into per-project copies
+- the same load-bearing assumption can appear in multiple projects simultaneously
+- two projects could then hold contradictory "current" values for the same assumption and both pass validation
+- that recreates the cross-project residual-tracking failure the object is supposed to solve
+
+Current design choice:
+- supersession chain key = `assumption_id`
+- project references still live in `primary_project` and `cross_project_implications`
+- project scope influences blast radius, not truth identity
+
 ## Open question for customer validation
 
-If same-assumption-chain is enforced, what is the minimal chain key you would trust at write time: `assumption_id` only, `assumption_id + project_scope`, or something else?
+If the chain key is `assumption_id` only, what is the smallest naming / alias rule you would enforce so two people do not create parallel IDs for the same assumption?
