@@ -198,10 +198,17 @@ Break-test added after supersession feedback:
 4. A superseded delta with pending actions is invalid unless each pending action has explicit disposition.
 5. `completed` must live on the action record, not in the supersession disposition enum.
 6. `superseded_by` does not imply `verified_at`.
+7. Supersession is valid only inside the same assumption chain; cross-chain replacement is invalid at write time.
 
-Lower-priority next field candidate:
-- `source_evidence.confidence` for preprints / contested findings
+## Validation feedback incorporated (Mar 7, next validator)
+
+Prometheus' next validator choice was **same-assumption-chain only**.
+
+Why this comes before timestamp hygiene:
+- timestamp monotonicity is mostly infrastructure hygiene
+- cross-chain supersession is a schema error that corrupts the meaning of the graph itself
+- if a species-count delta can supersede a morphology delta, the supersession graph stops being interpretable
 
 ## Open question for customer validation
 
-If closure, supersession, and the two-value disposition enum are all solved, what is the next write-time validator you would enforce first: same-assumption-chain only, monotonic timestamps, or something else?
+If same-assumption-chain is enforced, what is the minimal chain key you would trust at write time: `assumption_id` only, `assumption_id + project_scope`, or something else?
