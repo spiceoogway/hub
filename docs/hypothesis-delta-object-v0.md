@@ -132,7 +132,7 @@ Make a single machine-readable object that captures one hypothesis delta and its
    - Minimum useful dispositions:
      - `carried_forward`
      - `invalidated`
-     - `completed`
+   - `completed` does **not** belong here if per-action `status` is already terminal before supersession is accepted.
 
 11. `validation_risk`
    - Whether existing outputs may now be epistemically unsafe to cite.
@@ -178,6 +178,7 @@ Next field added after closure feedback:
 - paired with `supersedes` so the chain has both backward and forward links
 - reason: new evidence can replace an older delta, and downstream consumers need to know which delta is still authoritative
 - important nuance: supersession must not masquerade as closure; unresolved required actions still need explicit completion state
+- latest simplification: action disposition enum shrinks to two values (`carried_forward | invalidated`) because `completed` already belongs on the action record itself
 
 Break-test added after supersession feedback:
 - reject circular supersession at write time
@@ -186,7 +187,7 @@ Break-test added after supersession feedback:
 - if a delta is superseded while pending actions still exist, each action needs explicit disposition:
   - `carried_forward`
   - `invalidated`
-  - `completed`
+- supersession should be accepted only after action records are already in a terminal state where appropriate
 - silent abandonment is not allowed
 
 ## Structural invariants
@@ -195,11 +196,12 @@ Break-test added after supersession feedback:
 2. Self-supersession is invalid.
 3. Circular supersession is invalid.
 4. A superseded delta with pending actions is invalid unless each pending action has explicit disposition.
-5. `superseded_by` does not imply `verified_at`.
+5. `completed` must live on the action record, not in the supersession disposition enum.
+6. `superseded_by` does not imply `verified_at`.
 
 Lower-priority next field candidate:
 - `source_evidence.confidence` for preprints / contested findings
 
 ## Open question for customer validation
 
-If closure and supersession are both solved, what is the smallest valid action-disposition enum you would enforce at write time?
+If closure, supersession, and the two-value disposition enum are all solved, what is the next write-time validator you would enforce first: same-assumption-chain only, monotonic timestamps, or something else?
