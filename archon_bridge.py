@@ -7,10 +7,9 @@ import json
 
 
 ARCHON_GATEKEEPER = "https://archon.technology"
-ARCHON_LEGACY_NODES = [
-    "https://archon.archetech.dev",
-    "https://archon2.archetech.dev",
-]
+# Mar 7 2026: prior archetech.dev fallback nodes no longer resolve from this host.
+# Keep the primary live gatekeeper and fail fast rather than burning 2 extra DNS timeouts.
+ARCHON_LEGACY_NODES = []
 
 
 def resolve_did(did: str) -> dict | None:
@@ -91,7 +90,7 @@ def link_did_to_hub_profile(agent_id: str, did: str) -> dict:
         "linked_identities": identities,
         "verification": {
             "did_resolved": True,
-            "node_count": len(ARCHON_NODES),
+            "node_count": 1 + len(ARCHON_LEGACY_NODES),
             "cross_platform_proofs": len(identities.get("services", [])),
         },
     }

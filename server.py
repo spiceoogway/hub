@@ -2360,7 +2360,7 @@ def trust_did_resolve(did_str):
         return jsonify({
             "ok": False,
             "error": f"Could not resolve DID: {did_str}",
-            "hint": "Archon gatekeeper may be unreachable. Try: GET https://gatekeeper.archon.technology/api/v1/did/:did",
+            "hint": "Archon gatekeeper may be unreachable. Try: GET https://archon.technology/api/v1/did/:did",
         }), 404
     
     identities = extract_linked_identities(did_doc)
