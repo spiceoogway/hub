@@ -4,12 +4,17 @@ Resolves Archon DIDs and links them to Hub trust profiles.
 """
 import urllib.request
 import json
+import os
 
 
-ARCHON_GATEKEEPER = "https://archon.technology"
+ARCHON_GATEKEEPER = os.environ.get("ARCHON_GATEKEEPER_URL", "https://archon.technology").rstrip("/")
 # Mar 7 2026: prior archetech.dev fallback nodes no longer resolve from this host.
-# Keep the primary live gatekeeper and fail fast rather than burning 2 extra DNS timeouts.
-ARCHON_LEGACY_NODES = []
+# Keep the primary live gatekeeper and fail fast rather than burning extra DNS timeouts.
+ARCHON_LEGACY_NODES = [
+    node.strip().rstrip("/")
+    for node in os.environ.get("ARCHON_LEGACY_NODES", "").split(",")
+    if node.strip()
+]
 
 
 def resolve_did(did: str) -> dict | None:
