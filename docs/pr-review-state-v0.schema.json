@@ -1,0 +1,510 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://admin.slate.ceo/oc/brain/schemas/pr-review-state-v0.schema.json",
+  "title": "PR Review State v0",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "pr",
+    "decision",
+    "decision_basis",
+    "version_anchors",
+    "change_since_last_decision",
+    "checks_gate_snapshot",
+    "review_gate_snapshot",
+    "policy_gate",
+    "blockers",
+    "action_line"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "0.1"
+    },
+    "pr": {
+      "type": "object",
+      "required": ["repo", "number", "url"],
+      "properties": {
+        "repo": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "number": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "url": {
+          "type": "string",
+          "format": "uri"
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 512
+        }
+      },
+      "additionalProperties": false
+    },
+    "decision": {
+      "type": "object",
+      "required": ["state", "confidence_pct", "decision_time"],
+      "properties": {
+        "state": {
+          "type": "string",
+          "enum": ["mergeable", "blocked", "stale", "needs-human"]
+        },
+        "confidence_pct": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "decision_time": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "additionalProperties": false
+    },
+    "decision_basis": {
+      "type": "object",
+      "required": ["reasons"],
+      "properties": {
+        "reasons": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 5,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 280
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "version_anchors": {
+      "type": "object",
+      "required": ["head_sha", "base_branch", "base_sha_at_eval", "evaluated_at"],
+      "properties": {
+        "head_sha": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{7,64}$"
+        },
+        "base_branch": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "base_sha_at_eval": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{7,64}$"
+        },
+        "evaluated_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "additionalProperties": false
+    },
+    "change_since_last_decision": {
+      "type": "object",
+      "required": ["material_delta", "delta_types", "last_material_change_at"],
+      "properties": {
+        "material_delta": {
+          "type": "boolean"
+        },
+        "delta_types": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": [
+              "head_changed",
+              "checks_changed",
+              "blocking_review_changed",
+              "base_drift",
+              "policy_changed"
+            ]
+          }
+        },
+        "last_material_change_at": {
+          "type": ["string", "null"],
+          "format": "date-time"
+        }
+      },
+      "additionalProperties": false
+    },
+    "checks_gate_snapshot": {
+      "type": "object",
+      "required": ["required_checks", "failing_checks", "pending_checks"],
+      "properties": {
+        "required_checks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/checkStatus"
+          }
+        },
+        "failing_checks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/checkFailure"
+          }
+        },
+        "pending_checks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/checkPending"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "review_gate_snapshot": {
+      "type": "object",
+      "required": [
+        "required_reviewers_outstanding",
+        "blocking_artifacts",
+        "latest_blocking_artifact_link"
+      ],
+      "properties": {
+        "required_reviewers_outstanding": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          }
+        },
+        "blocking_artifacts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/blockingArtifact"
+          }
+        },
+        "latest_blocking_artifact_link": {
+          "type": ["string", "null"],
+          "format": "uri"
+        },
+        "normalizer_profile_id": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "blocking_intent_confidence_pct": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "semantic_blockers_present": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "policy_gate": {
+      "type": "object",
+      "required": ["result", "failing_rule_ids"],
+      "properties": {
+        "result": {
+          "type": "string",
+          "enum": ["pass", "fail"]
+        },
+        "failing_rule_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "blockers": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/blocker"
+      }
+    },
+    "action_line": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 280
+    },
+    "action_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160
+    },
+    "risk_phase": {
+      "type": "string",
+      "enum": ["steady", "ambiguous", "explicit-blocking", "contradictory-current-head"]
+    },
+    "risk_level": {
+      "type": "string",
+      "enum": ["low", "medium", "high"]
+    },
+    "staleness_timer_minutes": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "base_drift_commits": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "base_drift_files_hot": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "next_auto_recheck_at": {
+      "type": ["string", "null"],
+      "format": "date-time"
+    },
+    "audit_trail": {
+      "type": "array",
+      "maxItems": 10,
+      "items": {
+        "$ref": "#/$defs/transition"
+      }
+    }
+  },
+  "$defs": {
+    "checkStatus": {
+      "type": "object",
+      "required": ["name", "status"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "status": {
+          "type": "string",
+          "enum": ["success", "pending", "failed", "neutral", "skipped", "cancelled", "missing"]
+        },
+        "url": {
+          "type": ["string", "null"],
+          "format": "uri"
+        },
+        "age_minutes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "required": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "checkFailure": {
+      "type": "object",
+      "required": ["name", "url"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "url": {
+          "type": "string",
+          "format": "uri"
+        }
+      },
+      "additionalProperties": false
+    },
+    "checkPending": {
+      "type": "object",
+      "required": ["name", "age_minutes"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "url": {
+          "type": ["string", "null"],
+          "format": "uri"
+        },
+        "age_minutes": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "blockingArtifact": {
+      "type": "object",
+      "required": ["id", "type", "url", "opened_at", "resolution_condition"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "type": {
+          "type": "string",
+          "enum": ["review", "comment", "thread", "policy", "check", "other"]
+        },
+        "source_kind": {
+          "type": "string",
+          "enum": ["review_state", "review_thread", "issue_comment", "pr_comment", "policy_bot", "external"]
+        },
+        "url": {
+          "type": "string",
+          "format": "uri"
+        },
+        "author": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "opened_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "resolution_condition": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 280
+        },
+        "summary": {
+          "type": "string",
+          "maxLength": 280
+        },
+        "formal_blocking": {
+          "type": "boolean"
+        },
+        "semantic_blocking": {
+          "type": "boolean"
+        },
+        "intent_confidence_pct": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "applies_to_head_sha": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9a-f]{7,64}$"
+        },
+        "superseded_by_head_sha": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9a-f]{7,64}$"
+        },
+        "resolved_in_ui": {
+          "type": "boolean"
+        },
+        "resolved_semantically": {
+          "type": ["boolean", "null"]
+        },
+        "evidence_excerpt": {
+          "type": "string",
+          "maxLength": 280
+        }
+      },
+      "additionalProperties": false
+    },
+    "blocker": {
+      "type": "object",
+      "required": ["id", "type", "owner", "opened_at", "resolution_condition"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "failing-required-check",
+            "pending-required-check",
+            "missing-approval",
+            "blocking-review",
+            "blocking-comment",
+            "base-drift",
+            "policy-failure",
+            "ambiguous-state",
+            "other"
+          ]
+        },
+        "owner": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "opened_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "resolution_condition": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 280
+        },
+        "url": {
+          "type": ["string", "null"],
+          "format": "uri"
+        },
+        "rule_id": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "summary": {
+          "type": "string",
+          "maxLength": 280
+        },
+        "source_artifact_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          }
+        },
+        "intent_confidence_pct": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "formal_signal": {
+          "type": "string",
+          "enum": ["changes_requested", "required_approval_missing", "policy_bot_fail", "none", "other"]
+        },
+        "applies_to_head_sha": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9a-f]{7,64}$"
+        },
+        "superseded_by_head_sha": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9a-f]{7,64}$"
+        },
+        "requires_human_judgment": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "transition": {
+      "type": "object",
+      "required": ["at", "from_state", "to_state", "reason"],
+      "properties": {
+        "at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "from_state": {
+          "type": "string",
+          "enum": ["mergeable", "blocked", "stale", "needs-human"]
+        },
+        "to_state": {
+          "type": "string",
+          "enum": ["mergeable", "blocked", "stale", "needs-human"]
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 280
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,163 @@
+{
+  "schema_version": "0.1",
+  "profile_id": "acme/widgets/default-review-v1",
+  "version": "1",
+  "repo_selector": {
+    "provider": "github",
+    "owner": "acme",
+    "repo": "widgets",
+    "branch_patterns": ["main", "release/*"]
+  },
+  "trusted_actors": [
+    {
+      "subject_type": "team",
+      "subject": "release-eng",
+      "weight": 95,
+      "roles": ["release", "required-reviewer"]
+    },
+    {
+      "subject_type": "user",
+      "subject": "alice",
+      "weight": 80,
+      "roles": ["maintainer"]
+    },
+    {
+      "subject_type": "bot",
+      "subject": "release-bot",
+      "weight": 90,
+      "roles": ["policy"]
+    }
+  ],
+  "blocking_phrases": [
+    {
+      "id": "must-fix",
+      "pattern": "must fix",
+      "pattern_type": "literal",
+      "weight": 35,
+      "source_scope": ["review_thread", "pr_comment", "issue_comment"]
+    },
+    {
+      "id": "before-merge",
+      "pattern": "before merge",
+      "pattern_type": "literal",
+      "weight": 30,
+      "source_scope": ["review_thread", "pr_comment"]
+    },
+    {
+      "id": "not-safe",
+      "pattern": "not safe",
+      "pattern_type": "literal",
+      "weight": 40,
+      "source_scope": ["review_thread", "review_state", "pr_comment"],
+      "trusted_actor_only": true
+    },
+    {
+      "id": "wont-approve",
+      "pattern": "won't approve",
+      "pattern_type": "literal",
+      "weight": 45,
+      "source_scope": ["review_thread", "review_state", "pr_comment"],
+      "trusted_actor_only": true
+    }
+  ],
+  "non_blocking_phrases": [
+    {
+      "id": "nit",
+      "pattern": "nit",
+      "pattern_type": "literal",
+      "weight": 20,
+      "source_scope": ["review_thread", "pr_comment", "issue_comment"]
+    },
+    {
+      "id": "optional",
+      "pattern": "optional",
+      "pattern_type": "literal",
+      "weight": 25,
+      "source_scope": ["review_thread", "pr_comment", "issue_comment"]
+    },
+    {
+      "id": "follow-up",
+      "pattern": "follow-up",
+      "pattern_type": "literal",
+      "weight": 20,
+      "source_scope": ["review_thread", "pr_comment", "issue_comment"]
+    },
+    {
+      "id": "non-blocking",
+      "pattern": "non-blocking",
+      "pattern_type": "literal",
+      "weight": 35,
+      "source_scope": ["review_thread", "pr_comment", "issue_comment"]
+    }
+  ],
+  "hard_block_signals": [
+    {
+      "id": "required-review-missing",
+      "signal_type": "required_review_missing",
+      "source_kind": "branch_protection",
+      "actor_scope": "any"
+    },
+    {
+      "id": "required-check-failed",
+      "signal_type": "required_check_failed",
+      "source_kind": "check",
+      "actor_scope": "any"
+    },
+    {
+      "id": "changes-requested-trusted",
+      "signal_type": "changes_requested_by_trusted_actor",
+      "source_kind": "review_state",
+      "actor_scope": "trusted_only"
+    },
+    {
+      "id": "policy-rule-failed",
+      "signal_type": "policy_rule_failed",
+      "source_kind": "policy_bot",
+      "actor_scope": "any",
+      "rule_ids": ["no-approval", "failing-required-check"]
+    }
+  ],
+  "carry_forward_exceptions": [
+    {
+      "id": "same-thread-same-region-high-confidence",
+      "description": "Allow semantic blocker carry-forward only when the same unresolved thread still maps to the same code region and concern on the new head.",
+      "required_predicates": [
+        "unchanged_code_region",
+        "unresolved_thread",
+        "high_confidence_intent",
+        "trusted_actor",
+        "no_contradictory_current_head_signal",
+        "same_concern_anchor",
+        "explicit_profile_allow"
+      ],
+      "max_age_minutes": 1440,
+      "min_confidence_pct": 90,
+      "notes": "Use sparingly. Default is degrade-to-ambiguous."
+    }
+  ],
+  "confidence_thresholds": {
+    "semantic_blocking_min": 75,
+    "needs_human_min": 40,
+    "auto_resolved_min": 85
+  },
+  "staleness_rules": {
+    "on_force_push": "invalidate_current_decision",
+    "semantic_head_change_behavior": "degrade_to_ambiguous",
+    "approval_head_mismatch_behavior": "ambiguous_needs_human",
+    "ui_resolved_without_semantic_confirmation": "ambiguous",
+    "formal_head_change_behavior": "carry_if_structurally_true"
+  },
+  "policy_overrides": {
+    "suppress_redundant_policy_failures": true,
+    "strict_current_head_approval": true,
+    "treat_dismissed_reviews_as_cleared": true,
+    "require_codeowner_on_current_head": true,
+    "required_check_names": ["build-linux", "unit-tests"],
+    "stale_approvals_dismissed_on_push": null,
+    "strict_up_to_date_with_base_required": null,
+    "custom_rule_notes": [
+      "Approval on an older head does not clear a prior safety concern.",
+      "Policy-bot failures derived from the same required check may be suppressed if they add no actionability."
+    ]
+  }
+}

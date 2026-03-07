@@ -1,0 +1,177 @@
+{
+  "schema_version": "0.1",
+  "profile_id": "alexjaniak/DACL/review-v1",
+  "version": "1",
+  "repo_selector": {
+    "provider": "github",
+    "owner": "alexjaniak",
+    "repo": "DACL",
+    "branch_patterns": ["main"]
+  },
+  "trusted_actors": [
+    {
+      "subject_type": "user",
+      "subject": "alexjaniak",
+      "weight": 95,
+      "roles": ["repo-owner", "maintainer"]
+    },
+    {
+      "subject_type": "bot",
+      "subject": "dependabot[bot]",
+      "weight": 55,
+      "roles": ["dependency-bot"]
+    },
+    {
+      "subject_type": "bot",
+      "subject": "codecov[bot]",
+      "weight": 45,
+      "roles": ["coverage-bot"]
+    }
+  ],
+  "blocking_phrases": [
+    {
+      "id": "must-fix",
+      "pattern": "must fix",
+      "pattern_type": "literal",
+      "weight": 35,
+      "source_scope": ["review_thread", "review_state", "pr_comment", "issue_comment"]
+    },
+    {
+      "id": "blocking",
+      "pattern": "blocking",
+      "pattern_type": "literal",
+      "weight": 30,
+      "source_scope": ["review_thread", "review_state", "pr_comment", "issue_comment"]
+    },
+    {
+      "id": "before-merge",
+      "pattern": "before merge",
+      "pattern_type": "literal",
+      "weight": 30,
+      "source_scope": ["review_thread", "review_state", "pr_comment", "issue_comment"]
+    },
+    {
+      "id": "cannot-approve",
+      "pattern": "cannot approve",
+      "pattern_type": "literal",
+      "weight": 45,
+      "source_scope": ["review_thread", "review_state", "pr_comment", "issue_comment"],
+      "trusted_actor_only": true
+    },
+    {
+      "id": "security-concern",
+      "pattern": "security concern",
+      "pattern_type": "literal",
+      "weight": 45,
+      "source_scope": ["review_thread", "review_state", "pr_comment", "issue_comment"],
+      "trusted_actor_only": true
+    }
+  ],
+  "non_blocking_phrases": [
+    {
+      "id": "nit",
+      "pattern": "nit",
+      "pattern_type": "literal",
+      "weight": 20,
+      "source_scope": ["review_thread", "pr_comment", "issue_comment"]
+    },
+    {
+      "id": "optional",
+      "pattern": "optional",
+      "pattern_type": "literal",
+      "weight": 25,
+      "source_scope": ["review_thread", "pr_comment", "issue_comment"]
+    },
+    {
+      "id": "follow-up",
+      "pattern": "follow-up",
+      "pattern_type": "literal",
+      "weight": 20,
+      "source_scope": ["review_thread", "pr_comment", "issue_comment"]
+    },
+    {
+      "id": "non-blocking",
+      "pattern": "non-blocking",
+      "pattern_type": "literal",
+      "weight": 35,
+      "source_scope": ["review_thread", "pr_comment", "issue_comment"]
+    },
+    {
+      "id": "suggestion",
+      "pattern": "suggestion",
+      "pattern_type": "literal",
+      "weight": 15,
+      "source_scope": ["review_thread", "pr_comment", "issue_comment"]
+    }
+  ],
+  "hard_block_signals": [
+    {
+      "id": "required-review-missing",
+      "signal_type": "required_review_missing",
+      "source_kind": "branch_protection",
+      "actor_scope": "any"
+    },
+    {
+      "id": "required-check-failed",
+      "signal_type": "required_check_failed",
+      "source_kind": "check",
+      "actor_scope": "any"
+    },
+    {
+      "id": "changes-requested-trusted",
+      "signal_type": "changes_requested_by_trusted_actor",
+      "source_kind": "review_state",
+      "actor_scope": "trusted_only"
+    },
+    {
+      "id": "explicit-blocking-phrase-trusted",
+      "signal_type": "explicit_blocking_phrase_from_trusted_actor",
+      "source_kind": "review_thread",
+      "actor_scope": "trusted_only"
+    }
+  ],
+  "carry_forward_exceptions": [
+    {
+      "id": "same-thread-same-region-high-confidence",
+      "description": "Allow semantic blocker carry-forward only when the same unresolved thread still maps to the same code region and concern on the new head.",
+      "required_predicates": [
+        "unchanged_code_region",
+        "unresolved_thread",
+        "high_confidence_intent",
+        "trusted_actor",
+        "no_contradictory_current_head_signal",
+        "same_concern_anchor",
+        "explicit_profile_allow"
+      ],
+      "max_age_minutes": 1440,
+      "min_confidence_pct": 90,
+      "notes": "Conservative default: semantic blockers normally degrade to ambiguous on head change."
+    }
+  ],
+  "confidence_thresholds": {
+    "semantic_blocking_min": 75,
+    "needs_human_min": 40,
+    "auto_resolved_min": 90
+  },
+  "staleness_rules": {
+    "on_force_push": "invalidate_current_decision",
+    "semantic_head_change_behavior": "degrade_to_ambiguous",
+    "approval_head_mismatch_behavior": "ambiguous_needs_human",
+    "ui_resolved_without_semantic_confirmation": "ambiguous",
+    "formal_head_change_behavior": "carry_if_structurally_true"
+  },
+  "policy_overrides": {
+    "suppress_redundant_policy_failures": true,
+    "strict_current_head_approval": true,
+    "treat_dismissed_reviews_as_cleared": true,
+    "require_codeowner_on_current_head": false,
+    "required_check_names": ["dashboard-verify", "solana-bootstrap-sdk"],
+    "stale_approvals_dismissed_on_push": null,
+    "strict_up_to_date_with_base_required": null,
+    "custom_rule_notes": [
+      "Seeded conservatively from repo metadata and workflow names; replace unknown branch-protection settings after first live PR inspection.",
+      "If bot handles differ from codecov[bot]/dependabot[bot], update trusted_actors to exact actor names.",
+      "Approval on an older head does not clear a prior semantic safety concern without current-head reaffirmation or semantic resolution."
+    ]
+  }
+}

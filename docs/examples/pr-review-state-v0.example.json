@@ -1,0 +1,171 @@
+{
+  "schema_version": "0.1",
+  "pr": {
+    "repo": "acme/widgets",
+    "number": 142,
+    "url": "https://github.com/acme/widgets/pull/142",
+    "title": "Add websocket probe JSON mode"
+  },
+  "decision": {
+    "state": "blocked",
+    "confidence_pct": 96,
+    "decision_time": "2026-03-07T06:05:00Z"
+  },
+  "decision_basis": {
+    "reasons": [
+      "Required check build-linux is still failing on the current head SHA.",
+      "One CODEOWNERS approval is still outstanding.",
+      "No material delta has occurred since the last authoritative evaluation."
+    ]
+  },
+  "version_anchors": {
+    "head_sha": "9f31b7a",
+    "base_branch": "main",
+    "base_sha_at_eval": "12ab44d",
+    "evaluated_at": "2026-03-07T06:05:00Z"
+  },
+  "change_since_last_decision": {
+    "material_delta": false,
+    "delta_types": [],
+    "last_material_change_at": null
+  },
+  "checks_gate_snapshot": {
+    "required_checks": [
+      {
+        "name": "build-linux",
+        "status": "failed",
+        "url": "https://github.com/acme/widgets/actions/runs/1001",
+        "age_minutes": 7,
+        "required": true
+      },
+      {
+        "name": "unit-tests",
+        "status": "success",
+        "url": "https://github.com/acme/widgets/actions/runs/1002",
+        "age_minutes": 6,
+        "required": true
+      }
+    ],
+    "failing_checks": [
+      {
+        "name": "build-linux",
+        "url": "https://github.com/acme/widgets/actions/runs/1001"
+      }
+    ],
+    "pending_checks": []
+  },
+  "review_gate_snapshot": {
+    "required_reviewers_outstanding": ["release-eng"],
+    "blocking_artifacts": [
+      {
+        "id": "review-8842",
+        "type": "review",
+        "source_kind": "review_state",
+        "url": "https://github.com/acme/widgets/pull/142#pullrequestreview-8842",
+        "author": "release-bot",
+        "opened_at": "2026-03-07T05:59:00Z",
+        "resolution_condition": "A CODEOWNERS/release approval is present on the current head SHA.",
+        "summary": "Release approval required by branch protection.",
+        "formal_blocking": true,
+        "semantic_blocking": false,
+        "intent_confidence_pct": 99,
+        "applies_to_head_sha": "9f31b7a",
+        "superseded_by_head_sha": null,
+        "resolved_in_ui": false,
+        "resolved_semantically": false,
+        "evidence_excerpt": "Required approval missing on current head."
+      },
+      {
+        "id": "thread-991",
+        "type": "thread",
+        "source_kind": "review_thread",
+        "url": "https://github.com/acme/widgets/pull/142#discussion_r991",
+        "author": "alice",
+        "opened_at": "2026-03-07T05:57:00Z",
+        "resolution_condition": "Show that the reconnect counter resets correctly after auth retry, or get explicit acknowledgement from alice that the concern is addressed on the current head.",
+        "summary": "Potential semantic blocker about reconnect correctness.",
+        "formal_blocking": false,
+        "semantic_blocking": true,
+        "intent_confidence_pct": 68,
+        "applies_to_head_sha": "9f31b7a",
+        "superseded_by_head_sha": null,
+        "resolved_in_ui": false,
+        "resolved_semantically": null,
+        "evidence_excerpt": "This looks wrong on reconnect; I would not ship until this is proven safe."
+      }
+    ],
+    "latest_blocking_artifact_link": "https://github.com/acme/widgets/pull/142#discussion_r991",
+    "normalizer_profile_id": "acme/widgets/default-review-v1",
+    "blocking_intent_confidence_pct": 84,
+    "semantic_blockers_present": true
+  },
+  "policy_gate": {
+    "result": "fail",
+    "failing_rule_ids": ["failing-required-check", "no-approval"]
+  },
+  "blockers": [
+    {
+      "id": "check-build-linux",
+      "type": "failing-required-check",
+      "owner": "ci",
+      "opened_at": "2026-03-07T05:58:00Z",
+      "resolution_condition": "CI check build-linux passes on head 9f31b7a.",
+      "url": "https://github.com/acme/widgets/actions/runs/1001",
+      "rule_id": "failing-required-check",
+      "summary": "build-linux is red",
+      "source_artifact_ids": [],
+      "intent_confidence_pct": 99,
+      "formal_signal": "other",
+      "applies_to_head_sha": "9f31b7a",
+      "superseded_by_head_sha": null,
+      "requires_human_judgment": false
+    },
+    {
+      "id": "approval-release-eng",
+      "type": "missing-approval",
+      "owner": "release-eng",
+      "opened_at": "2026-03-07T05:59:00Z",
+      "resolution_condition": "A required CODEOWNERS/release approval is present on the current head SHA.",
+      "url": "https://github.com/acme/widgets/pull/142#pullrequestreview-8842",
+      "rule_id": "no-approval",
+      "summary": "Release approval missing",
+      "source_artifact_ids": ["review-8842"],
+      "intent_confidence_pct": 99,
+      "formal_signal": "required_approval_missing",
+      "applies_to_head_sha": "9f31b7a",
+      "superseded_by_head_sha": null,
+      "requires_human_judgment": false
+    },
+    {
+      "id": "semantic-reconnect-safety",
+      "type": "blocking-comment",
+      "owner": "alice",
+      "opened_at": "2026-03-07T05:57:00Z",
+      "resolution_condition": "Demonstrate reconnect correctness on the current head or get explicit acknowledgement from alice that the concern is resolved.",
+      "url": "https://github.com/acme/widgets/pull/142#discussion_r991",
+      "summary": "Reconnect correctness concern is semantically blocking but not formal branch protection.",
+      "source_artifact_ids": ["thread-991"],
+      "intent_confidence_pct": 68,
+      "formal_signal": "none",
+      "applies_to_head_sha": "9f31b7a",
+      "superseded_by_head_sha": null,
+      "requires_human_judgment": true
+    }
+  ],
+  "action_line": "Do not merge because build-linux is failing, release approval is missing, and a semantic reconnect-safety blocker still needs explicit resolution on head 9f31b7a.",
+  "action_key": "resolve.blockers.build-linux+approval-release-eng+semantic-reconnect-safety",
+  "risk_phase": "explicit-blocking",
+  "risk_level": "high",
+  "staleness_timer_minutes": 20,
+  "base_drift_commits": 0,
+  "base_drift_files_hot": 0,
+  "next_auto_recheck_at": "2026-03-07T06:10:00Z",
+  "audit_trail": [
+    {
+      "at": "2026-03-07T05:58:30Z",
+      "from_state": "stale",
+      "to_state": "blocked",
+      "reason": "Reevaluation completed on current head; blockers remain."
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+PASS clean mergeable 
+PASS failing required check 
+PASS pending required check no spam 
+PASS stale approval after force-push ambiguous state 
+PASS blocking comment resolved on current head 
+PASS profile version change invalidates prior decision 
+PASS blocker ids are stable under artifact order changes 
+PASS action_line rewrite alone never emits 
+PASS threshold confidence drop always emits 
+PASS risk phase escalation emits even with same blocker and action key 
+PASS severe confidence drop always emits 
+PASS same blocker ids but changed action_key emits 
+PASS pending-age churn never emits 
+PASS riskPhase may not improve without supporting evidence change 
+SUMMARY 14/14 passing

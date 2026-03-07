@@ -110,10 +110,19 @@ To merge: make dashboard-verify pass on head 222bbbb.
 ### Previous canonical packet (minimal)
 ```json
 {
-  "decision": {"state": "stale", "confidence_pct": 96},
+  "decision": {"state": "blocked", "confidence_pct": 95},
   "version_anchors": {"head_sha": "333cccc"},
-  "blockers": [],
-  "action_line": "To merge: wait for required checks to finish on head 333cccc."
+  "blockers": [
+    {
+      "id": "pending-required-check:check:solana-bootstrap-sdk",
+      "type": "pending-required-check",
+      "owner": "ci",
+      "resolution_condition": "Required check solana-bootstrap-sdk reaches success on head 333cccc.",
+      "applies_to_head_sha": "333cccc"
+    }
+  ],
+  "action_line": "To merge: wait for solana-bootstrap-sdk to finish on head 333cccc.",
+  "action_key": "wait.check.solana-bootstrap-sdk"
 }
 ```
 
@@ -135,21 +144,28 @@ To merge: make dashboard-verify pass on head 222bbbb.
 
 ### Expected `blockers[]`
 ```json
-[]
+[
+  {
+    "id": "pending-required-check:check:solana-bootstrap-sdk",
+    "type": "pending-required-check",
+    "owner": "ci",
+    "resolution_condition": "Required check solana-bootstrap-sdk reaches success on head 333cccc."
+  }
+]
 ```
 
 ### Expected `state`
 ```text
-stale
+blocked
 ```
 
 ### Expected `action_line`
 ```text
-To merge: wait for required checks to finish on head 333cccc.
+To merge: wait for solana-bootstrap-sdk to finish on head 333cccc.
 ```
 
 ### Notifier emits?
-**No.** Reason: state unchanged, blocker set unchanged, action line unchanged. Only pending age moved.
+**No.** Reason: state unchanged, blocker set unchanged, action key unchanged. Only pending age moved.
 
 ---
 
@@ -288,7 +304,8 @@ To merge: merge current head 666ffff now.
   ],
   "latest_valid_approval": {"author": "alexjaniak", "commit_id": "7779999"},
   "required_reviewers_outstanding": [],
-  "blocking_artifacts": []
+  "blocking_artifacts": [],
+  "policy_failures": ["policy_changed"]
 }
 ```
 
@@ -308,7 +325,7 @@ Do not merge because decision is stale after policy_changed; reevaluate current 
 ```
 
 ### Notifier emits?
-**Yes.** Reason: state changed due to policy/profile invalidation.
+**Yes.** Reason: prior state was mergeable, so the invalidation is treated as a mergeability regression (`mergeable-flip`) at notifier priority.
 
 ---
 

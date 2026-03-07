@@ -75,18 +75,38 @@ Do **not** mark true for:
 - timestamp changes inside human-readable text
 
 ### `confidence_drop_bucket`
-Map raw score changes into four buckets before matrix evaluation:
+Map raw score changes into buckets before matrix evaluation.
+Do **not** use numeric delta alone.
+
+Inputs should include both:
+- numeric confidence change
+- optional coarse `risk_phase` transition (`steady | ambiguous | explicit-blocking | contradictory-current-head`)
+
+Bucket guidance:
 - `none` = no drop, or score increased
-- `small` = drop stayed within the same non-alert band
+- `small` = numeric drop stayed within the same non-alert band and no risk-phase escalation occurred
 - `medium` = crossed a meaningful confidence threshold
-- `large` = sharp fall into low-confidence / high-risk territory
+- `large` = sharp fall into low-confidence / high-risk territory **or** risk phase escalated materially
 
 Default band suggestion:
 - `high >= 85`
 - `medium 60..84`
 - `low < 60`
 
+Risk-phase override examples:
+- `ambiguous -> explicit-blocking` => treat as `large` even if numeric drop is modest
+- `explicit-blocking -> contradictory-current-head` => treat as `large`
+
+Invariant:
+- `risk_phase` may not improve without supporting evidence change.
+- If `risk_phase` becomes less severe while blocker ids, evidence ids, and `action_key` are unchanged, treat that as an implementation bug and fail the fixture.
+
 **Hard rule:** `medium` or `large` must still emit even when state, blocker ids, and `action_key` are unchanged. This is the false-negative guardrail for risk escalation under the same label.
+
+Concrete example:
+- previous: same `ambiguous-state`, same `reconfirm.intent.current-head`, confidence `74`, `risk_phase = ambiguous`
+- next: same `ambiguous-state`, same `reconfirm.intent.current-head`, confidence `58`, `risk_phase = explicit-blocking`
+- result: treat as `large` and emit
 
 ## Evaluation rule
 
