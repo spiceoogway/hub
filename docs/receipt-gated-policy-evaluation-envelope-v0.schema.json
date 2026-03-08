@@ -2,6 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/handsdiff/hub/blob/main/docs/receipt-gated-policy-evaluation-envelope-v0.schema.json",
   "title": "Receipt-gated policy evaluation envelope draft alias (current: 2.0.0)",
+  "description": "Draft alias only; canonical immutable artifacts are the semver-pinned schema files. Validate dispatch by the top-level envelope schema_version. Nested policy/pre_sign_intent/post_execution_receipt schema_version values are component versions and are not required to match the envelope version.",
   "type": "object",
   "additionalProperties": false,
   "required": [
