@@ -1,0 +1,558 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/handsdiff/hub/blob/main/docs/receipt-gated-policy-evaluation-envelope-v0.schema.json",
+  "title": "Receipt-gated policy evaluation envelope v0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "artifact_type",
+    "policy",
+    "pre_sign_intent",
+    "post_execution_receipt",
+    "runtime_metrics",
+    "evaluations"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0.0"
+    },
+    "artifact_type": {
+      "const": "receipt_gated_policy_evaluation"
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "policy_id",
+        "policy_version",
+        "policy_hash",
+        "policy_type",
+        "trust_tier",
+        "limits",
+        "pre_sign_reject_rules",
+        "pre_sign_manual_review_rules",
+        "freeze_rules"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "1.0.0"
+        },
+        "policy_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "policy_version": {
+          "const": "1.0.0"
+        },
+        "policy_hash": {
+          "type": "string",
+          "minLength": 1
+        },
+        "policy_type": {
+          "enum": [
+            "performance_budget",
+            "continuity_budget"
+          ]
+        },
+        "trust_tier": {
+          "enum": [
+            "new",
+            "calibrated",
+            "proven"
+          ]
+        },
+        "limits": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "monthly_cap_usd",
+            "manual_review_threshold_usd",
+            "single_action_max_usd",
+            "expected_loss_ceiling_usd"
+          ],
+          "properties": {
+            "monthly_cap_usd": {
+              "type": "number",
+              "minimum": 0
+            },
+            "manual_review_threshold_usd": {
+              "type": "number",
+              "minimum": 0
+            },
+            "single_action_max_usd": {
+              "type": "number",
+              "minimum": 0
+            },
+            "expected_loss_ceiling_usd": {
+              "type": "number",
+              "minimum": 0
+            }
+          }
+        },
+        "pre_sign_reject_rules": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/rule"
+          }
+        },
+        "pre_sign_manual_review_rules": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/rule"
+          }
+        },
+        "freeze_rules": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/rule"
+          }
+        }
+      }
+    },
+    "pre_sign_intent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "intent_id",
+        "timestamp_utc",
+        "wallet_id",
+        "budget_type",
+        "spend_class",
+        "counterparty_or_protocol",
+        "amount_usd",
+        "expected_value_driver",
+        "expected_value_range_usd",
+        "expected_loss_ceiling_usd",
+        "outcome_window_hours",
+        "policy_id",
+        "policy_version_locked",
+        "policy_hash",
+        "intent_hash"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "1.0.0"
+        },
+        "intent_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "timestamp_utc": {
+          "type": "string",
+          "minLength": 1
+        },
+        "wallet_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "budget_type": {
+          "enum": [
+            "performance_budget",
+            "continuity_budget"
+          ]
+        },
+        "spend_class": {
+          "type": "string",
+          "minLength": 1
+        },
+        "counterparty_or_protocol": {
+          "type": "string",
+          "minLength": 1
+        },
+        "amount_usd": {
+          "type": "number",
+          "minimum": 0
+        },
+        "expected_value_driver": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expected_value_range_usd": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "min",
+            "max"
+          ],
+          "properties": {
+            "min": {
+              "type": "number"
+            },
+            "max": {
+              "type": "number"
+            }
+          }
+        },
+        "expected_loss_ceiling_usd": {
+          "type": "number",
+          "minimum": 0
+        },
+        "outcome_window_hours": {
+          "type": "number",
+          "minimum": 0
+        },
+        "policy_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "policy_version_locked": {
+          "const": "1.0.0"
+        },
+        "policy_hash": {
+          "type": "string",
+          "minLength": 1
+        },
+        "intent_hash": {
+          "type": "string",
+          "minLength": 1
+        },
+        "signed_at_utc": {
+          "type": "string"
+        }
+      }
+    },
+    "post_execution_receipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "receipt_id",
+        "receipt_status",
+        "intent_id",
+        "intent_hash",
+        "policy_id",
+        "policy_version_locked",
+        "policy_hash",
+        "budget_type",
+        "spend_class",
+        "wallet_id",
+        "counterparty_or_protocol",
+        "amount_usd"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "1.0.0"
+        },
+        "receipt_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "receipt_status": {
+          "enum": [
+            "pending_outcome",
+            "complete",
+            "noncompliant"
+          ]
+        },
+        "intent_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "intent_hash": {
+          "type": "string",
+          "minLength": 1
+        },
+        "policy_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "policy_version_locked": {
+          "const": "1.0.0"
+        },
+        "policy_hash": {
+          "type": "string",
+          "minLength": 1
+        },
+        "signed_at_utc": {
+          "type": "string"
+        },
+        "budget_type": {
+          "enum": [
+            "performance_budget",
+            "continuity_budget"
+          ]
+        },
+        "spend_class": {
+          "type": "string",
+          "minLength": 1
+        },
+        "wallet_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "counterparty_or_protocol": {
+          "type": "string",
+          "minLength": 1
+        },
+        "amount_usd": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    },
+    "runtime_metrics": {
+      "type": "object",
+      "additionalProperties": {
+        "type": [
+          "number",
+          "string",
+          "boolean",
+          "array",
+          "null"
+        ]
+      }
+    },
+    "evaluations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "receipt_binding",
+        "pre_sign",
+        "freeze",
+        "final"
+      ],
+      "properties": {
+        "receipt_binding": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "ok"
+          ],
+          "properties": {
+            "ok": {
+              "type": "boolean"
+            },
+            "reason": {
+              "type": "string"
+            }
+          }
+        },
+        "pre_sign": {
+          "$ref": "#/$defs/evaluator_result"
+        },
+        "freeze": {
+          "$ref": "#/$defs/evaluator_result"
+        },
+        "final": {
+          "$ref": "#/$defs/evaluator_result"
+        }
+      }
+    },
+    "notes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "$defs": {
+    "condition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "metric",
+        "op"
+      ],
+      "properties": {
+        "metric": {
+          "type": "string",
+          "minLength": 1
+        },
+        "op": {
+          "enum": [
+            ">",
+            ">=",
+            "<",
+            "<=",
+            "==",
+            "!=",
+            "in",
+            "not_in"
+          ]
+        },
+        "value": {
+          "type": [
+            "number",
+            "string",
+            "boolean",
+            "array"
+          ]
+        },
+        "metric_ref": {
+          "type": "string"
+        }
+      }
+    },
+    "condition_group": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "conditions"
+      ],
+      "properties": {
+        "mode": {
+          "enum": [
+            "all",
+            "any"
+          ]
+        },
+        "conditions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/condition"
+          }
+        }
+      }
+    },
+    "rule_outcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "decision",
+        "reason_codes"
+      ],
+      "properties": {
+        "decision": {
+          "enum": [
+            "allow",
+            "manual_review",
+            "reject",
+            "freeze"
+          ]
+        },
+        "reason_codes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "freeze_scope": {
+          "enum": [
+            "performance_only",
+            "continuity_only",
+            "wallet_global"
+          ]
+        },
+        "freeze_actions": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "disable_autosign",
+              "require_manual_review",
+              "notify_operator"
+            ]
+          }
+        },
+        "unfreeze_requirements": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "if",
+        "outcome"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "if": {
+          "$ref": "#/$defs/condition_group"
+        },
+        "outcome": {
+          "$ref": "#/$defs/rule_outcome"
+        }
+      }
+    },
+    "evaluator_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "decision",
+        "reason_codes",
+        "triggered_rule_ids",
+        "hit_counts"
+      ],
+      "properties": {
+        "decision": {
+          "enum": [
+            "allow",
+            "manual_review",
+            "reject",
+            "freeze"
+          ]
+        },
+        "reason_codes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "triggered_rule_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "freeze_scope": {
+          "enum": [
+            "performance_only",
+            "continuity_only",
+            "wallet_global"
+          ]
+        },
+        "freeze_actions": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "disable_autosign",
+              "require_manual_review",
+              "notify_operator"
+            ]
+          }
+        },
+        "unfreeze_requirements": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "hit_counts": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "freeze",
+            "reject",
+            "manual_review"
+          ],
+          "properties": {
+            "freeze": {
+              "type": "number",
+              "minimum": 0
+            },
+            "reject": {
+              "type": "number",
+              "minimum": 0
+            },
+            "manual_review": {
+              "type": "number",
+              "minimum": 0
+            }
+          }
+        }
+      }
+    }
+  }
+}

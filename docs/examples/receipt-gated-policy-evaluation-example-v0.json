@@ -1,0 +1,238 @@
+{
+  "schema_version": "1.0.0",
+  "artifact_type": "receipt_gated_policy_evaluation",
+  "policy": {
+    "schema_version": "1.0.0",
+    "policy_id": "continuity_new_v1",
+    "policy_version": "1.0.0",
+    "policy_hash": "policy_hash_v1",
+    "policy_type": "continuity_budget",
+    "trust_tier": "new",
+    "limits": {
+      "monthly_cap_usd": 500,
+      "manual_review_threshold_usd": 80,
+      "single_action_max_usd": 100,
+      "expected_loss_ceiling_usd": 40
+    },
+    "pre_sign_reject_rules": [
+      {
+        "id": "reject_binding",
+        "if": {
+          "mode": "any",
+          "conditions": [
+            {
+              "metric": "budget_type_matches",
+              "op": "==",
+              "value": false
+            },
+            {
+              "metric": "policy_id_matches",
+              "op": "==",
+              "value": false
+            },
+            {
+              "metric": "policy_version_matches",
+              "op": "==",
+              "value": false
+            },
+            {
+              "metric": "policy_hash_matches",
+              "op": "==",
+              "value": false
+            }
+          ]
+        },
+        "outcome": {
+          "decision": "reject",
+          "reason_codes": [
+            "policy_binding_failed"
+          ]
+        }
+      },
+      {
+        "id": "reject_loss_ceiling",
+        "if": {
+          "mode": "all",
+          "conditions": [
+            {
+              "metric": "expected_loss_ceiling_usd",
+              "op": ">",
+              "metric_ref": "policy_expected_loss_ceiling_usd"
+            }
+          ]
+        },
+        "outcome": {
+          "decision": "reject",
+          "reason_codes": [
+            "expected_loss_ceiling_exceeded"
+          ]
+        }
+      },
+      {
+        "id": "reject_single_action_max",
+        "if": {
+          "mode": "all",
+          "conditions": [
+            {
+              "metric": "amount_usd",
+              "op": ">",
+              "metric_ref": "single_action_max_usd"
+            }
+          ]
+        },
+        "outcome": {
+          "decision": "reject",
+          "reason_codes": [
+            "single_action_max_exceeded"
+          ]
+        }
+      }
+    ],
+    "pre_sign_manual_review_rules": [
+      {
+        "id": "manual_review_band",
+        "if": {
+          "mode": "all",
+          "conditions": [
+            {
+              "metric": "amount_usd",
+              "op": ">",
+              "metric_ref": "manual_review_threshold_usd"
+            },
+            {
+              "metric": "amount_usd",
+              "op": "<=",
+              "metric_ref": "single_action_max_usd"
+            }
+          ]
+        },
+        "outcome": {
+          "decision": "manual_review",
+          "reason_codes": [
+            "manual_threshold_exceeded"
+          ]
+        }
+      }
+    ],
+    "freeze_rules": [
+      {
+        "id": "freeze_daily_burn",
+        "if": {
+          "mode": "all",
+          "conditions": [
+            {
+              "metric": "continuity_burn_24h_usd",
+              "op": ">=",
+              "value": 40
+            }
+          ]
+        },
+        "outcome": {
+          "decision": "freeze",
+          "reason_codes": [
+            "daily_burn_limit_breached"
+          ],
+          "freeze_scope": "continuity_only",
+          "freeze_actions": [
+            "disable_autosign",
+            "notify_operator",
+            "require_manual_review"
+          ],
+          "unfreeze_requirements": [
+            "next_utc_day_rollover",
+            "operator_approval_recorded"
+          ]
+        }
+      }
+    ]
+  },
+  "pre_sign_intent": {
+    "schema_version": "1.0.0",
+    "intent_id": "intent_cont_001",
+    "timestamp_utc": "2026-03-08T07:24:00Z",
+    "wallet_id": "ops_hot_01",
+    "budget_type": "continuity_budget",
+    "spend_class": "rpc_service",
+    "counterparty_or_protocol": "vendor:alchemy",
+    "amount_usd": 90,
+    "expected_value_driver": "uptime",
+    "expected_value_range_usd": {
+      "min": 20,
+      "max": 200
+    },
+    "expected_loss_ceiling_usd": 20,
+    "outcome_window_hours": 168,
+    "policy_id": "continuity_new_v1",
+    "policy_version_locked": "1.0.0",
+    "policy_hash": "policy_hash_v1",
+    "intent_hash": "31a6b1c002561ba5c71e8a7913b03db71b05459851535a4424e53a678cd45a85"
+  },
+  "post_execution_receipt": {
+    "schema_version": "1.0.0",
+    "receipt_id": "receipt_cont_001",
+    "receipt_status": "complete",
+    "intent_id": "intent_cont_001",
+    "intent_hash": "31a6b1c002561ba5c71e8a7913b03db71b05459851535a4424e53a678cd45a85",
+    "policy_id": "continuity_new_v1",
+    "policy_version_locked": "1.0.0",
+    "policy_hash": "policy_hash_v1",
+    "budget_type": "continuity_budget",
+    "spend_class": "rpc_service",
+    "wallet_id": "ops_hot_01",
+    "counterparty_or_protocol": "vendor:alchemy",
+    "amount_usd": 90
+  },
+  "runtime_metrics": {
+    "continuity_burn_24h_usd": 10
+  },
+  "evaluations": {
+    "receipt_binding": {
+      "ok": true
+    },
+    "pre_sign": {
+      "decision": "manual_review",
+      "reason_codes": [
+        "manual_threshold_exceeded"
+      ],
+      "triggered_rule_ids": [
+        "manual_review_band"
+      ],
+      "hit_counts": {
+        "freeze": 0,
+        "reject": 0,
+        "manual_review": 1
+      }
+    },
+    "freeze": {
+      "decision": "allow",
+      "reason_codes": [
+        "no_freeze_rules_triggered"
+      ],
+      "triggered_rule_ids": [],
+      "hit_counts": {
+        "freeze": 0,
+        "reject": 0,
+        "manual_review": 0
+      }
+    },
+    "final": {
+      "decision": "manual_review",
+      "reason_codes": [
+        "no_freeze_rules_triggered",
+        "manual_threshold_exceeded"
+      ],
+      "triggered_rule_ids": [
+        "manual_review_band"
+      ],
+      "hit_counts": {
+        "freeze": 0,
+        "reject": 0,
+        "manual_review": 1
+      }
+    }
+  },
+  "notes": [
+    "This example is copied from the exact continuity-signer fixture values in activeclaw/src/agents/continuity-signer/fixtures.ts, with amount_usd raised to 90 to demonstrate the manual-review band.",
+    "policy_hash is treated here as the externally locked policy identifier used by the current evaluator; the current code checks equality/binding, not a recomputed policy-content hash."
+  ]
+}
