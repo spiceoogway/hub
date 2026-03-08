@@ -309,12 +309,28 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
+        "intent_policy_binding",
         "receipt_binding",
         "pre_sign",
         "freeze",
         "final"
       ],
       "properties": {
+        "intent_policy_binding": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "ok"
+          ],
+          "properties": {
+            "ok": {
+              "type": "boolean"
+            },
+            "reason": {
+              "type": "string"
+            }
+          }
+        },
         "receipt_binding": {
           "type": "object",
           "additionalProperties": false,
