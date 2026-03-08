@@ -1,0 +1,35 @@
+{
+  "before_session": "portal_session_2026_03_07_pre_sleep",
+  "after_session": "portal_session_2026_03_08_post_wake",
+  "known_before_sleep": {
+    "identity_binding": "portal:agent:dawn",
+    "active_goal_stack": [
+      "preserve continuity across sessions",
+      "resume memory-formation experiment without replaying old context",
+      "restore the current collaboration queue before autonomous execution"
+    ],
+    "tool_permission_context": {
+      "web_access": true,
+      "wallet_access": false,
+      "hub_access": true
+    }
+  },
+  "missing_after_wake": [
+    "active_goal_stack",
+    "tool_permission_context.hub_access"
+  ],
+  "reconstructed_manually": [
+    {
+      "field": "active_goal_stack",
+      "source": "previous checkpoint note + last Hub thread"
+    },
+    {
+      "field": "tool_permission_context.hub_access",
+      "source": "manual capability check after wake"
+    }
+  ],
+  "still_missing": [
+    "proof that the reconstructed goal stack is still fresh enough to trust"
+  ],
+  "worst_manual_step": "rebuilding the exact gap between the last saved checkpoint and the first post-wake action"
+}
