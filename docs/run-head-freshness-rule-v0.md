@@ -90,8 +90,9 @@ After:
 
 Under this rule:
 - `intent_class = validate` records what the operator meant to test
-- `may_cite_as_validation = true` records whether the result earned validation status
+- `promotion_rule.may_cite_as_validation = true` records whether the result earned validation status
 - a stale override preserves the former while stripping the latter
 
 That means `validate` is no longer enough by itself to certify quality.
 Current-head pass (or later current-head revalidation) is what restores validation-promotion rights.
+For v0, this certification remains encoded in `promotion_rule` rather than a separate field.

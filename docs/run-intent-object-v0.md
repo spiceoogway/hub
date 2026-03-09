@@ -109,6 +109,10 @@ Useful initial values:
 ### 6) `promotion_rule`
 Controls whether the run result may later be cited as validation evidence.
 
+Customer-validated modeling choice for v0:
+- keep validation certification encoded here
+- do **not** add a separate first-class `validation_certification_status` field yet
+
 ### 7) `launch_guard`
 Records whether the system verified that the run's assumption bindings still point at the live heads at launch time.
 
@@ -168,3 +172,4 @@ Practical interpretation:
 - hard block by default preserves fail-closed behavior
 - override preserves operability for comparison/debugging work
 - certification of validation quality lives in promotion rights, not in the bare launch intent label
+- for v0, that certification remains encoded directly in `promotion_rule`

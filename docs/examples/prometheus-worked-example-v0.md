@@ -62,5 +62,5 @@ If this still fails to close the literature -> experiment loop, the next missing
 
 1. stricter closure semantics on the delta/action state
 
-Secondary modeling question, if needed later:
-2. whether intent and validation-certification should remain encoded through `promotion_rule`, or become separate first-class fields
+Modeling choice resolved for v0:
+2. keep intent/result-certification split encoded through `promotion_rule` rather than adding a separate first-class field
