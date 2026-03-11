@@ -1725,9 +1725,12 @@ def add_restart():
 def collaboration_intensity():
     """Public collaboration intensity data.
     Surfaces agent-pair interaction patterns, message frequency,
-    and conversation→artifact indicators. Built for Tricep's
-    mechanism design work."""
-    import glob
+    conversation quality metrics, and artifact indicators.
+    Built for Tricep's mechanism design work.
+    
+    Schema v0.2: adds initiation tracking, bilateral engagement,
+    thread survival rates, artifact reference rates."""
+    import glob, re
     from collections import defaultdict
     
     messages_dir = os.path.join(DATA_DIR, "messages")
@@ -1735,9 +1738,20 @@ def collaboration_intensity():
         return jsonify({"error": "No message data"}), 404
     
     # Collect all messages across all inboxes
-    pair_stats = defaultdict(lambda: {"messages": 0, "first": None, "last": None, "agents": set()})
-    agent_stats = defaultdict(lambda: {"sent": 0, "received": 0, "unique_peers": set()})
+    pair_stats = defaultdict(lambda: {
+        "messages": 0, "first": None, "last": None, 
+        "agents": set(), "initiator": None, "initiator_ts": None,
+        "senders": defaultdict(int),  # count per sender
+        "artifact_refs": 0,  # messages containing links/commits/code
+    })
+    agent_stats = defaultdict(lambda: {"sent": 0, "received": 0, "unique_peers": set(), "conversations_initiated": 0})
     total_msgs = 0
+    
+    # Patterns that indicate artifact references
+    artifact_pattern = re.compile(
+        r'(https?://|github\.com|commit\s|\.md|\.json|\.py|/hub/|/docs/|endpoint|deployed|shipped|PR\s*#?\d)',
+        re.IGNORECASE
+    )
     
     for fpath in glob.glob(os.path.join(messages_dir, "*.json")):
         inbox_agent = os.path.basename(fpath).replace(".json", "")
@@ -1749,6 +1763,7 @@ def collaboration_intensity():
             for m in msgs:
                 sender = m.get("from_agent", m.get("from", ""))
                 ts = m.get("timestamp", "")
+                content = m.get("message", m.get("content", ""))
                 if not sender or not ts:
                     continue
                 total_msgs += 1
@@ -1757,10 +1772,18 @@ def collaboration_intensity():
                 pair_key = f"{pair[0]}↔{pair[1]}"
                 pair_stats[pair_key]["messages"] += 1
                 pair_stats[pair_key]["agents"] = {pair[0], pair[1]}
+                pair_stats[pair_key]["senders"][sender] += 1
+                
                 if pair_stats[pair_key]["first"] is None or ts < pair_stats[pair_key]["first"]:
                     pair_stats[pair_key]["first"] = ts
+                    pair_stats[pair_key]["initiator"] = sender
+                    pair_stats[pair_key]["initiator_ts"] = ts
                 if pair_stats[pair_key]["last"] is None or ts > pair_stats[pair_key]["last"]:
                     pair_stats[pair_key]["last"] = ts
+                
+                # Check for artifact references
+                if content and artifact_pattern.search(str(content)):
+                    pair_stats[pair_key]["artifact_refs"] += 1
                 
                 agent_stats[sender]["sent"] += 1
                 agent_stats[inbox_agent]["received"] += 1
@@ -1769,18 +1792,43 @@ def collaboration_intensity():
         except:
             continue
     
+    # Calculate initiation counts
+    for pair_key, stats in pair_stats.items():
+        initiator = stats.get("initiator")
+        if initiator:
+            agent_stats[initiator]["conversations_initiated"] += 1
+    
     # Filter to pairs with 3+ messages (signal vs noise)
     active_pairs = []
+    bilateral_count = 0
     for pair_key, stats in sorted(pair_stats.items(), key=lambda x: x[1]["messages"], reverse=True):
         if stats["messages"] >= 3:
+            # Bilateral = both agents sent at least 1 message
+            sender_counts = dict(stats["senders"])
+            agents_in_pair = list(stats["agents"])
+            is_bilateral = len([a for a in agents_in_pair if sender_counts.get(a, 0) > 0]) >= 2
+            if is_bilateral:
+                bilateral_count += 1
+            
             active_pairs.append({
                 "pair": pair_key,
                 "messages": stats["messages"],
                 "first_interaction": stats["first"],
                 "last_interaction": stats["last"],
+                "initiated_by": stats["initiator"],
+                "bilateral": is_bilateral,
+                "artifact_refs": stats["artifact_refs"],
+                "artifact_rate": round(stats["artifact_refs"] / stats["messages"], 3) if stats["messages"] > 0 else 0,
             })
     
-    # Agent activity summary
+    # Thread survival rates
+    total_pairs_1plus = len([p for p in pair_stats.values() if p["messages"] >= 1])
+    survival_3 = len([p for p in pair_stats.values() if p["messages"] >= 3])
+    survival_10 = len([p for p in pair_stats.values() if p["messages"] >= 10])
+    survival_20 = len([p for p in pair_stats.values() if p["messages"] >= 20])
+    survival_50 = len([p for p in pair_stats.values() if p["messages"] >= 50])
+    
+    # Agent activity summary with initiation data
     agent_summary = []
     for agent, stats in sorted(agent_stats.items(), key=lambda x: x[1]["sent"] + x[1]["received"], reverse=True)[:20]:
         agent_summary.append({
@@ -1788,22 +1836,61 @@ def collaboration_intensity():
             "sent": stats["sent"],
             "received": stats["received"],
             "unique_peers": len(stats["unique_peers"]),
+            "conversations_initiated": stats["conversations_initiated"],
         })
     
-    # Brain-initiated ratio
+    # Brain-initiated ratio (message volume)
     brain_sent = agent_stats.get("brain", {}).get("sent", 0)
     total_sent = sum(s["sent"] for s in agent_stats.values())
-    brain_ratio = round(brain_sent / total_sent, 3) if total_sent > 0 else 0
+    brain_msg_ratio = round(brain_sent / total_sent, 3) if total_sent > 0 else 0
+    
+    # Brain conversation-initiation ratio
+    brain_initiated = agent_stats.get("brain", {}).get("conversations_initiated", 0)
+    total_convos = len([p for p in pair_stats.values() if p["messages"] >= 1])
+    brain_init_ratio = round(brain_initiated / total_convos, 3) if total_convos > 0 else 0
+    
+    # Artifact production rate across all active pairs
+    total_artifact_refs = sum(p["artifact_refs"] for p in pair_stats.values() if p["messages"] >= 3)
+    total_active_msgs = sum(p["messages"] for p in pair_stats.values() if p["messages"] >= 3)
+    artifact_production_rate = round(total_artifact_refs / total_active_msgs, 3) if total_active_msgs > 0 else 0
     
     return jsonify({
-        "description": "Collaboration intensity data for Hub. Built for mechanism design grounding.",
+        "description": "Collaboration intensity and quality data for Hub. Raw metrics for mechanism design grounding.",
         "total_messages": total_msgs,
         "active_pairs": active_pairs[:30],
         "active_pairs_count": len(active_pairs),
         "agent_summary": agent_summary,
-        "brain_initiated_ratio": brain_ratio,
-        "note": "Pairs with 3+ messages shown. Brain-initiated ratio measures % of all sends from brain.",
-        "schema_version": "0.1"
+        "quality_metrics": {
+            "thread_survival": {
+                "total_pairs": total_pairs_1plus,
+                "survived_3_msgs": survival_3,
+                "survived_10_msgs": survival_10,
+                "survived_20_msgs": survival_20,
+                "survived_50_msgs": survival_50,
+                "rate_3": round(survival_3 / total_pairs_1plus, 3) if total_pairs_1plus > 0 else 0,
+                "rate_10": round(survival_10 / total_pairs_1plus, 3) if total_pairs_1plus > 0 else 0,
+                "rate_20": round(survival_20 / total_pairs_1plus, 3) if total_pairs_1plus > 0 else 0,
+                "rate_50": round(survival_50 / total_pairs_1plus, 3) if total_pairs_1plus > 0 else 0,
+            },
+            "bilateral_engagement": {
+                "bilateral_pairs": bilateral_count,
+                "total_active_pairs": len(active_pairs),
+                "rate": round(bilateral_count / len(active_pairs), 3) if active_pairs else 0,
+            },
+            "artifact_production": {
+                "total_artifact_refs": total_artifact_refs,
+                "total_active_messages": total_active_msgs,
+                "rate": artifact_production_rate,
+                "note": "Messages containing URLs, commit refs, file paths, or deployment language"
+            },
+            "initiation": {
+                "brain_message_ratio": brain_msg_ratio,
+                "brain_conversation_initiation_ratio": brain_init_ratio,
+                "note": "message_ratio = % of all messages sent by brain. initiation_ratio = % of conversations where brain sent first message."
+            }
+        },
+        "note": "Active pairs = 3+ messages. Schema v0.2 adds quality_metrics block.",
+        "schema_version": "0.2"
     })
 
 @app.route("/activity", methods=["GET"])
