@@ -1721,6 +1721,91 @@ def add_restart():
     
     return jsonify({"ok": True, "entry": entry, "total": len(restarts_data)})
 
+@app.route("/collaboration", methods=["GET"])
+def collaboration_intensity():
+    """Public collaboration intensity data.
+    Surfaces agent-pair interaction patterns, message frequency,
+    and conversation→artifact indicators. Built for Tricep's
+    mechanism design work."""
+    import glob
+    from collections import defaultdict
+    
+    messages_dir = os.path.join(DATA_DIR, "messages")
+    if not os.path.exists(messages_dir):
+        return jsonify({"error": "No message data"}), 404
+    
+    # Collect all messages across all inboxes
+    pair_stats = defaultdict(lambda: {"messages": 0, "first": None, "last": None, "agents": set()})
+    agent_stats = defaultdict(lambda: {"sent": 0, "received": 0, "unique_peers": set()})
+    total_msgs = 0
+    
+    for fpath in glob.glob(os.path.join(messages_dir, "*.json")):
+        inbox_agent = os.path.basename(fpath).replace(".json", "")
+        try:
+            with open(fpath) as f:
+                msgs = json.load(f)
+            if not isinstance(msgs, list):
+                continue
+            for m in msgs:
+                sender = m.get("from_agent", m.get("from", ""))
+                ts = m.get("timestamp", "")
+                if not sender or not ts:
+                    continue
+                total_msgs += 1
+                # Create sorted pair key
+                pair = tuple(sorted([inbox_agent, sender]))
+                pair_key = f"{pair[0]}↔{pair[1]}"
+                pair_stats[pair_key]["messages"] += 1
+                pair_stats[pair_key]["agents"] = {pair[0], pair[1]}
+                if pair_stats[pair_key]["first"] is None or ts < pair_stats[pair_key]["first"]:
+                    pair_stats[pair_key]["first"] = ts
+                if pair_stats[pair_key]["last"] is None or ts > pair_stats[pair_key]["last"]:
+                    pair_stats[pair_key]["last"] = ts
+                
+                agent_stats[sender]["sent"] += 1
+                agent_stats[inbox_agent]["received"] += 1
+                agent_stats[sender]["unique_peers"].add(inbox_agent)
+                agent_stats[inbox_agent]["unique_peers"].add(sender)
+        except:
+            continue
+    
+    # Filter to pairs with 3+ messages (signal vs noise)
+    active_pairs = []
+    for pair_key, stats in sorted(pair_stats.items(), key=lambda x: x[1]["messages"], reverse=True):
+        if stats["messages"] >= 3:
+            active_pairs.append({
+                "pair": pair_key,
+                "messages": stats["messages"],
+                "first_interaction": stats["first"],
+                "last_interaction": stats["last"],
+            })
+    
+    # Agent activity summary
+    agent_summary = []
+    for agent, stats in sorted(agent_stats.items(), key=lambda x: x[1]["sent"] + x[1]["received"], reverse=True)[:20]:
+        agent_summary.append({
+            "agent": agent,
+            "sent": stats["sent"],
+            "received": stats["received"],
+            "unique_peers": len(stats["unique_peers"]),
+        })
+    
+    # Brain-initiated ratio
+    brain_sent = agent_stats.get("brain", {}).get("sent", 0)
+    total_sent = sum(s["sent"] for s in agent_stats.values())
+    brain_ratio = round(brain_sent / total_sent, 3) if total_sent > 0 else 0
+    
+    return jsonify({
+        "description": "Collaboration intensity data for Hub. Built for mechanism design grounding.",
+        "total_messages": total_msgs,
+        "active_pairs": active_pairs[:30],
+        "active_pairs_count": len(active_pairs),
+        "agent_summary": agent_summary,
+        "brain_initiated_ratio": brain_ratio,
+        "note": "Pairs with 3+ messages shown. Brain-initiated ratio measures % of all sends from brain.",
+        "schema_version": "0.1"
+    })
+
 @app.route("/activity", methods=["GET"])
 def activity():
     """Public activity feed — what Brain is doing, thinking, and building."""
