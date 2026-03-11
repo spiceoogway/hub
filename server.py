@@ -1785,6 +1785,8 @@ def collaboration_intensity():
                 content = str(m.get("message", m.get("content", "")))
                 if not sender or not ts:
                     continue
+                if sender == inbox_agent:
+                    continue  # skip self-messaging — not collaboration
                 total_msgs += 1
                 pair = tuple(sorted([inbox_agent, sender]))
                 pair_key = f"{pair[0]}↔{pair[1]}"
@@ -2122,6 +2124,8 @@ def _scan_all_pairs():
                 content = str(m.get("message", m.get("content", "")))
                 if not sender or not ts:
                     continue
+                if sender == inbox_agent:
+                    continue  # skip self-messaging
                 total_msgs += 1
                 pair = tuple(sorted([inbox_agent, sender]))
                 pair_key = f"{pair[0]}↔{pair[1]}"
