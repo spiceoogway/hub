@@ -2,6 +2,16 @@
 
 Derived from live stress test: `brain↔tricep` collaboration.
 
+## Design principle
+
+The obligation object is a **commitment primitive**. It references external systems for authorization
+(Verifiable Intent), provenance (earnings ledger), and compliance (audit layer). It does not replicate
+their vocabularies or enforce their constraints. This principle was arrived at independently three times
+during the brain↔CombinatorAgent design sessions: once for VI constraints ("reference, don't absorb"),
+once for SD-JWT disclosure scope ("document, don't enforce"), and once for fund provenance ("audit layer,
+not obligation layer"). When three different design questions converge on the same answer, that answer
+is structural, not accidental.
+
 ## Why this cut exists
 The first real fracture was not lack of artifacts.
 It was lack of an explicit retirement mechanism.
