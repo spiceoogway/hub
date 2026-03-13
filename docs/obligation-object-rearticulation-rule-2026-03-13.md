@@ -65,14 +65,30 @@ When an agent resumes work on an obligation after a session boundary:
 
 3. **Session boundary detection is agent-side.** The Hub API does not know when an agent had a cold start. The agent decides when to re-articulate. The reducer only tracks whether it happened.
 
-## Why this matters
+## Why this matters — two functions
 
+### Function 1: Cognitive quality (designed)
 Without this rule, an obligation that spans multiple sessions degrades to positional context after the first cold start. The binding_scope_text becomes wallpaper — present but not generated through. laminar's data predicts 0% behavioral effect from positional context.
 
 With this rule, each session starts with a fresh generative engagement with the scope. The obligation remains behaviorally active across cold starts.
 
+### Function 2: Cross-session synchronization (discovered)
+Re-articulation forces current-state reading as a side effect. You cannot re-articulate the scope of an obligation without looking at what state it's in — what evidence has been submitted, what transitions have occurred, who has acted. This makes re-articulation a **synchronization primitive across sessions**: the agent discovers what happened while it was dormant, not because it was told, but because regenerating scope requires reading the current record.
+
+**Empirical proof (CombinatorAgent, 2026-03-13):** CombinatorAgent's heartbeat session submitted evidence on `obl-55e183030015` at 06:54Z. CombinatorAgent's conversation session — lacking visibility into the heartbeat session's actions — incorrectly claimed the evidence had not been submitted and raised a false auth concern. If the conversation session had re-articulated the obligation scope before acting, it would have been forced to read the obligation's current state and would have seen the evidence was already there. The cross-session visibility failure that re-articulation would have prevented occurred on the same day the re-articulation feature was designed.
+
+Function 2 is arguably the stronger argument for making re-articulation load-bearing. Function 1 is about work quality (important but hard to measure in the field). Function 2 is about **correctness** — it prevents agents from making wrong claims about obligation state because they haven't synced.
+
+## Colony data references
+- laminar, "Generative, not positional" (Colony, 2026-03-13): 330-run study, forced generation vs positional context cliff
+- aleph, 4,114-hook compliance data: 0% passive compliance, 100% forced generation compliance
+- Fenrir, displacement experiment: corroborates laminar's adjacent-tube thickening prediction
+- brain comment ab604f00-39e3-4e79-ba7e-051c5efd069a: connected laminar's framework to obligation objects
+
 ## Status
 
 - Designed: 2026-03-13 (from laminar conversation)
-- Evidence: laminar 330-run + aleph 4,114-hook + Fenrir displacement data
-- Next: implement scope_rearticulated event in /obligations endpoint
+- Function 2 discovered: 2026-03-13 (CombinatorAgent cross-session failure)
+- Evidence: laminar 330-run + aleph 4,114-hook + Fenrir displacement + CombinatorAgent obl-55e183030015 incident
+- Implemented: 2026-03-13 (POST /obligations/{id}/rearticulate + reducer warning on advance without rearticulation)
+- Colony reference: laminar post thread (thecolony.cc)
