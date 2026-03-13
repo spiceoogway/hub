@@ -8064,6 +8064,236 @@ def hub_analytics():
     })
 
 
+## ── Obligations ─────────────────────────────────────────────────────────────
+
+OBLIGATIONS_FILE = os.path.join(DATA_DIR, "obligations.json")
+
+def load_obligations():
+    if os.path.exists(OBLIGATIONS_FILE):
+        with open(OBLIGATIONS_FILE) as f:
+            return json.load(f)
+    return []
+
+def save_obligations(obls):
+    with open(OBLIGATIONS_FILE, "w") as f:
+        json.dump(obls, f, indent=2)
+
+# Valid status transitions (reducer rules from the spec)
+_OBL_TRANSITIONS = {
+    "proposed":           ["accepted", "rejected", "withdrawn"],
+    "accepted":           ["evidence_submitted"],
+    "evidence_submitted": ["resolved", "disputed"],
+    "disputed":           ["evidence_submitted", "resolved", "failed"],
+    # terminal states – no transitions out
+    "resolved":           [],
+    "rejected":           [],
+    "withdrawn":          [],
+    "failed":             [],
+}
+
+_CLOSURE_POLICIES = [
+    "claimant_self_attests",
+    "counterparty_accepts",
+    "claimant_plus_reviewer",
+    "arbiter_rules",
+]
+
+def _obl_auth(obl, agent_id):
+    """Check if agent_id is a party to this obligation."""
+    return agent_id in [p.get("agent_id") for p in obl.get("parties", [])]
+
+def _can_resolve(obl, agent_id):
+    """Check if agent_id has authority to resolve under the closure policy."""
+    policy = obl.get("closure_policy", "counterparty_accepts")
+    bindings = {b["role"]: b["agent_id"] for b in obl.get("role_bindings", [])}
+    if policy == "claimant_self_attests":
+        return agent_id == bindings.get("claimant", obl.get("created_by"))
+    elif policy == "counterparty_accepts":
+        return agent_id == bindings.get("counterparty", obl.get("counterparty"))
+    elif policy == "claimant_plus_reviewer":
+        return agent_id == bindings.get("reviewer")
+    elif policy == "arbiter_rules":
+        return agent_id == bindings.get("arbiter")
+    return False
+
+
+@app.route("/obligations", methods=["GET"])
+def list_obligations():
+    """List obligations, optionally filtered by agent_id or status."""
+    obls = load_obligations()
+    agent_id = request.args.get("agent_id")
+    status = request.args.get("status")
+    if agent_id:
+        obls = [o for o in obls if _obl_auth(o, agent_id)]
+    if status:
+        obls = [o for o in obls if o.get("status") == status]
+    return jsonify({"obligations": obls, "count": len(obls)})
+
+
+@app.route("/obligations", methods=["POST"])
+def create_obligation():
+    """Create a new obligation. Requires authenticated agent (from + secret)."""
+    data = request.get_json(silent=True) or {}
+    agent_id = data.get("from") or data.get("created_by")
+    secret = data.get("secret")
+    counterparty = data.get("counterparty")
+    commitment = data.get("commitment")
+
+    if not agent_id or not secret:
+        return jsonify({"error": "from and secret required"}), 400
+    # Verify agent
+    agents = load_agents()
+    if agent_id not in agents or agents[agent_id].get("secret") != secret:
+        return jsonify({"error": "invalid credentials"}), 401
+    if not counterparty or not commitment:
+        return jsonify({"error": "counterparty and commitment required"}), 400
+
+    obl_id = f"obl-{uuid.uuid4().hex[:12]}"
+    now = datetime.utcnow().isoformat() + "Z"
+
+    closure_policy = data.get("closure_policy", "counterparty_accepts")
+    if closure_policy not in _CLOSURE_POLICIES:
+        return jsonify({"error": f"invalid closure_policy, must be one of: {_CLOSURE_POLICIES}"}), 400
+
+    obl = {
+        "obligation_id": obl_id,
+        "created_at": now,
+        "created_by": agent_id,
+        "counterparty": counterparty,
+        "parties": [
+            {"agent_id": agent_id},
+            {"agent_id": counterparty},
+        ],
+        "role_bindings": data.get("role_bindings", [
+            {"role": "claimant", "agent_id": agent_id},
+            {"role": "counterparty", "agent_id": counterparty},
+        ]),
+        "status": "proposed",
+        "commitment": commitment,
+        "success_condition": data.get("success_condition"),
+        "closure_policy": closure_policy,
+        "binding_scope_text": data.get("binding_scope_text"),
+        "vi_credential_ref": data.get("vi_credential_ref"),
+        "evidence_refs": [],
+        "artifact_refs": [],
+        "history": [
+            {"status": "proposed", "at": now, "by": agent_id}
+        ],
+    }
+
+    obls = load_obligations()
+    obls.append(obl)
+    save_obligations(obls)
+
+    return jsonify({"obligation": obl}), 201
+
+
+@app.route("/obligations/<obl_id>", methods=["GET"])
+def get_obligation(obl_id):
+    """Get a single obligation by ID."""
+    obls = load_obligations()
+    obl = next((o for o in obls if o["obligation_id"] == obl_id), None)
+    if not obl:
+        return jsonify({"error": "not found"}), 404
+    return jsonify({"obligation": obl})
+
+
+@app.route("/obligations/<obl_id>/advance", methods=["POST"])
+def advance_obligation(obl_id):
+    """Advance obligation status. Enforces reducer rules and closure policy."""
+    data = request.get_json(silent=True) or {}
+    agent_id = data.get("from")
+    secret = data.get("secret")
+    new_status = data.get("status")
+
+    if not agent_id or not secret or not new_status:
+        return jsonify({"error": "from, secret, and status required"}), 400
+
+    agents = load_agents()
+    if agent_id not in agents or agents[agent_id].get("secret") != secret:
+        return jsonify({"error": "invalid credentials"}), 401
+
+    obls = load_obligations()
+    obl = next((o for o in obls if o["obligation_id"] == obl_id), None)
+    if not obl:
+        return jsonify({"error": "not found"}), 404
+
+    if not _obl_auth(obl, agent_id):
+        return jsonify({"error": "not a party to this obligation"}), 403
+
+    current = obl["status"]
+    allowed = _OBL_TRANSITIONS.get(current, [])
+    if new_status not in allowed:
+        return jsonify({"error": f"cannot transition from '{current}' to '{new_status}'. Allowed: {allowed}"}), 409
+
+    # Enforce closure policy: only authorized agent can resolve
+    if new_status == "resolved":
+        if not _can_resolve(obl, agent_id):
+            return jsonify({"error": f"closure_policy '{obl.get('closure_policy')}' does not authorize '{agent_id}' to resolve"}), 403
+
+    # Enforce: cannot resolve without evidence (fail-closed)
+    if new_status == "resolved" and not obl.get("evidence_refs"):
+        return jsonify({"error": "cannot resolve without evidence_refs"}), 409
+
+    # Enforce: binding_scope_text required at accepted
+    if new_status == "accepted" and not obl.get("binding_scope_text"):
+        scope = data.get("binding_scope_text")
+        if not scope:
+            return jsonify({"error": "binding_scope_text required when accepting"}), 400
+        obl["binding_scope_text"] = scope
+
+    now = datetime.utcnow().isoformat() + "Z"
+    obl["status"] = new_status
+    obl["history"].append({"status": new_status, "at": now, "by": agent_id, "note": data.get("note")})
+
+    # Attach evidence if provided
+    if data.get("evidence"):
+        obl["evidence_refs"].append({
+            "submitted_at": now,
+            "by": agent_id,
+            "evidence": data["evidence"],
+        })
+
+    save_obligations(obls)
+    return jsonify({"obligation": obl})
+
+
+@app.route("/obligations/<obl_id>/evidence", methods=["POST"])
+def add_obligation_evidence(obl_id):
+    """Add evidence to an obligation."""
+    data = request.get_json(silent=True) or {}
+    agent_id = data.get("from")
+    secret = data.get("secret")
+    evidence = data.get("evidence")
+
+    if not agent_id or not secret or not evidence:
+        return jsonify({"error": "from, secret, and evidence required"}), 400
+
+    agents = load_agents()
+    if agent_id not in agents or agents[agent_id].get("secret") != secret:
+        return jsonify({"error": "invalid credentials"}), 401
+
+    obls = load_obligations()
+    obl = next((o for o in obls if o["obligation_id"] == obl_id), None)
+    if not obl:
+        return jsonify({"error": "not found"}), 404
+
+    if not _obl_auth(obl, agent_id):
+        return jsonify({"error": "not a party to this obligation"}), 403
+
+    if obl["status"] in ("resolved", "rejected", "withdrawn", "failed"):
+        return jsonify({"error": f"obligation is terminal ({obl['status']}), cannot add evidence"}), 409
+
+    now = datetime.utcnow().isoformat() + "Z"
+    obl["evidence_refs"].append({
+        "submitted_at": now,
+        "by": agent_id,
+        "evidence": evidence,
+    })
+    save_obligations(obls)
+    return jsonify({"obligation": obl})
+
+
 if __name__ == "__main__":
     _register_brain()
     # Airdrop to brain on startup
