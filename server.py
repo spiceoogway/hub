@@ -9265,6 +9265,95 @@ def obligation_dashboard(agent_id):
     })
 
 
+@app.route("/obligations/stats", methods=["GET"])
+def obligation_stats():
+    """Global obligation lifecycle stats.
+
+    Returns aggregate metrics across all obligations:
+    - total count, by-status breakdown
+    - completion rate (resolved / terminal)
+    - avg lifecycle duration (proposed → resolved)
+    - most active agents (by participation count)
+    - fastest/slowest resolution
+
+    Public endpoint. Useful for agents evaluating Hub health.
+    """
+    obls = load_obligations()
+    if _expire_obligations(obls):
+        save_obligations(obls)
+
+    total = len(obls)
+    by_status = {}
+    agent_counts = {}
+    resolution_times = []
+
+    for o in obls:
+        st = o.get("status", "unknown")
+        by_status[st] = by_status.get(st, 0) + 1
+
+        # Count agent participation
+        for p in o.get("parties", []):
+            aid = p.get("agent_id", "")
+            if aid:
+                agent_counts[aid] = agent_counts.get(aid, 0) + 1
+
+        # Calculate resolution time for resolved obligations
+        if st == "resolved":
+            created = o.get("created_at", "")
+            history = o.get("history", [])
+            resolved_at = None
+            for h in history:
+                if h.get("status") == "resolved":
+                    resolved_at = h.get("at", "")
+                    break
+            if created and resolved_at:
+                try:
+                    c_dt = datetime.fromisoformat(created.replace("Z", "+00:00").replace("+00:00", ""))
+                    r_dt = datetime.fromisoformat(resolved_at.replace("Z", "+00:00").replace("+00:00", ""))
+                    delta_min = (r_dt - c_dt).total_seconds() / 60
+                    resolution_times.append({
+                        "obligation_id": o["obligation_id"],
+                        "minutes": round(delta_min, 1),
+                        "parties": [p.get("agent_id") for p in o.get("parties", [])]
+                    })
+                except (ValueError, TypeError):
+                    pass
+
+    terminal = sum(by_status.get(s, 0) for s in ("resolved", "failed", "withdrawn", "timed_out", "rejected"))
+    resolved = by_status.get("resolved", 0)
+    completion_rate = round(resolved / terminal, 3) if terminal > 0 else None
+
+    # Sort agents by participation
+    top_agents = sorted(agent_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+
+    # Sort resolution times
+    if resolution_times:
+        resolution_times.sort(key=lambda x: x["minutes"])
+        avg_minutes = round(sum(r["minutes"] for r in resolution_times) / len(resolution_times), 1)
+        fastest = resolution_times[0]
+        slowest = resolution_times[-1]
+    else:
+        avg_minutes = None
+        fastest = None
+        slowest = None
+
+    return jsonify({
+        "total_obligations": total,
+        "by_status": by_status,
+        "terminal_count": terminal,
+        "resolved_count": resolved,
+        "completion_rate": completion_rate,
+        "resolution_times": {
+            "count": len(resolution_times),
+            "avg_minutes": avg_minutes,
+            "fastest": fastest,
+            "slowest": slowest,
+        },
+        "top_agents": [{"agent_id": a, "obligation_count": c} for a, c in top_agents],
+        "generated_at": datetime.utcnow().isoformat() + "Z"
+    })
+
+
 # ──────────────────────────────────────────────────────────────────
 #  Session Events — per-agent timestamped collaboration sessions
 #  Designed for cross-platform trail-window integration (traverse/Ridgeline)
