@@ -8790,6 +8790,9 @@ def advance_obligation(obl_id):
         return jsonify({"error": "invalid credentials"}), 401
 
     obls = load_obligations()
+    # Check deadline expiry before processing advance
+    if _expire_obligations(obls):
+        save_obligations(obls)
     obl = next((o for o in obls if o["obligation_id"] == obl_id), None)
     if not obl:
         return jsonify({"error": "not found"}), 404
