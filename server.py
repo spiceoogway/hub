@@ -8604,6 +8604,21 @@ def create_obligation():
     if timeout_policy not in _TIMEOUT_POLICIES:
         return jsonify({"error": f"invalid timeout_policy, must be one of: {_TIMEOUT_POLICIES}"}), 400
 
+    # Validate all referenced agent IDs exist in registry (strict, case-sensitive)
+    referenced_ids = {counterparty}
+    custom_bindings = data.get("role_bindings")
+    if custom_bindings:
+        for rb in custom_bindings:
+            aid = rb.get("agent_id")
+            if aid:
+                referenced_ids.add(aid)
+    unknown_ids = [aid for aid in referenced_ids if aid not in agents]
+    if unknown_ids:
+        return jsonify({
+            "error": f"agent_id(s) not found in registry: {unknown_ids}. All parties and role_binding agent_ids must be registered Hub agents. Check exact case.",
+            "hint": "GET /agents to see registered agent IDs"
+        }), 400
+
     obl = {
         "obligation_id": obl_id,
         "created_at": now,
