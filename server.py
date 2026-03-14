@@ -8423,6 +8423,8 @@ _OBL_TRANSITIONS = {
     "accepted":           ["evidence_submitted"],
     "evidence_submitted": ["resolved", "disputed"],
     "disputed":           ["evidence_submitted", "resolved", "failed"],
+    # deadline_elapsed: claimant_self_resolve policy allows resolution from here
+    "deadline_elapsed":   ["resolved", "failed"],
     # terminal states – no transitions out
     "resolved":           [],
     "rejected":           [],
@@ -8431,29 +8433,58 @@ _OBL_TRANSITIONS = {
     "timed_out":          [],
 }
 
+_TIMEOUT_POLICIES = ["claimant_self_resolve", "auto_expire", "escalate"]
+
 def _check_deadline_expiry(obl):
-    """Check if an obligation has passed its deadline_utc. Returns True if expired and status was updated."""
+    """Check if an obligation has passed its deadline_utc.
+    
+    Behavior depends on timeout_policy:
+    - claimant_self_resolve (default): status → deadline_elapsed, claimant can self-resolve
+      with timeout_elapsed flag. Reviewer judgment becomes advisory if late.
+    - auto_expire: status → timed_out (terminal). Nobody resolves.
+    - escalate: (future) reassign reviewer. Currently falls back to auto_expire.
+    
+    Returns True if status was updated.
+    """
     deadline = obl.get("deadline_utc")
     if not deadline:
         return False
     status = obl.get("status", "")
-    # Don't expire terminal states
-    if status in ("resolved", "rejected", "withdrawn", "failed", "timed_out"):
+    # Don't expire terminal states or already-elapsed obligations
+    if status in ("resolved", "rejected", "withdrawn", "failed", "timed_out", "deadline_elapsed"):
         return False
     try:
         deadline_dt = datetime.fromisoformat(deadline.replace("Z", "+00:00"))
         now_dt = datetime.utcnow().replace(tzinfo=None)
         deadline_naive = deadline_dt.replace(tzinfo=None)
         if now_dt > deadline_naive:
-            policy = obl.get("closure_policy", "counterparty_accepts")
+            timeout_policy = obl.get("timeout_policy", "claimant_self_resolve")
+            closure_policy = obl.get("closure_policy", "counterparty_accepts")
             now_iso = datetime.utcnow().isoformat() + "Z"
-            obl["status"] = "timed_out"
-            obl.setdefault("history", []).append({
-                "status": "timed_out",
-                "at": now_iso,
-                "by": "system",
-                "reason": f"deadline_utc ({deadline}) passed under {policy} policy"
-            })
+
+            if timeout_policy == "claimant_self_resolve":
+                # Non-terminal: claimant gets authority to resolve with timeout flag
+                obl["status"] = "deadline_elapsed"
+                obl["timeout_elapsed"] = True
+                obl.setdefault("history", []).append({
+                    "status": "deadline_elapsed",
+                    "at": now_iso,
+                    "by": "system",
+                    "timeout_policy": timeout_policy,
+                    "reason": f"deadline_utc ({deadline}) passed under {closure_policy} policy. "
+                              f"Claimant may now self-resolve. Reviewer judgment is advisory if late."
+                })
+            else:
+                # auto_expire or escalate (escalate not yet implemented, falls back)
+                obl["status"] = "timed_out"
+                obl["timeout_elapsed"] = True
+                obl.setdefault("history", []).append({
+                    "status": "timed_out",
+                    "at": now_iso,
+                    "by": "system",
+                    "timeout_policy": timeout_policy,
+                    "reason": f"deadline_utc ({deadline}) passed under {closure_policy} policy"
+                })
             return True
     except (ValueError, TypeError):
         pass
@@ -8488,9 +8519,25 @@ def _obl_auth(obl, agent_id):
     return False
 
 def _can_resolve(obl, agent_id):
-    """Check if agent_id has authority to resolve under the closure policy."""
-    policy = obl.get("closure_policy", "counterparty_accepts")
+    """Check if agent_id has authority to resolve under the closure policy.
+    
+    Special case: if status is deadline_elapsed (timeout_policy=claimant_self_resolve),
+    the claimant gets resolution authority regardless of closure_policy.
+    Reviewer judgment arriving after deadline is recorded as advisory.
+    """
     bindings = {b["role"]: b["agent_id"] for b in obl.get("role_bindings", [])}
+
+    # After deadline elapsed, claimant gets self-resolve authority
+    if obl.get("status") == "deadline_elapsed" and obl.get("timeout_elapsed"):
+        claimant = bindings.get("claimant", obl.get("created_by"))
+        if agent_id == claimant:
+            return True
+        # Reviewer can still resolve too (advisory becomes authoritative if they show up)
+        reviewer = bindings.get("reviewer")
+        if reviewer and agent_id == reviewer:
+            return True
+
+    policy = obl.get("closure_policy", "counterparty_accepts")
     if policy == "claimant_self_attests":
         return agent_id == bindings.get("claimant", obl.get("created_by"))
     elif policy == "counterparty_accepts":
@@ -8548,6 +8595,10 @@ def create_obligation():
     if closure_policy in _DEADLINE_REQUIRED_POLICIES and not deadline_utc:
         return jsonify({"error": f"deadline_utc is required for closure_policy '{closure_policy}' (prevents indefinite hang)"}), 400
 
+    timeout_policy = data.get("timeout_policy", "claimant_self_resolve")
+    if timeout_policy not in _TIMEOUT_POLICIES:
+        return jsonify({"error": f"invalid timeout_policy, must be one of: {_TIMEOUT_POLICIES}"}), 400
+
     obl = {
         "obligation_id": obl_id,
         "created_at": now,
@@ -8566,6 +8617,7 @@ def create_obligation():
         "success_condition": data.get("success_condition"),
         "closure_policy": closure_policy,
         "deadline_utc": deadline_utc,
+        "timeout_policy": timeout_policy,
         "binding_scope_text": data.get("binding_scope_text"),
         "vi_credential_ref": data.get("vi_credential_ref"),
         "evidence_refs": [],
@@ -8644,6 +8696,7 @@ def propose_obligation_public():
         "success_condition": data.get("success_condition"),
         "closure_policy": closure_policy,
         "deadline_utc": deadline_utc,
+        "timeout_policy": data.get("timeout_policy", "claimant_self_resolve"),
         "binding_scope_text": data.get("binding_scope_text"),
         "evidence_refs": [],
         "artifact_refs": [],
@@ -8676,6 +8729,49 @@ def get_obligation(obl_id):
     if not obl:
         return jsonify({"error": "not found"}), 404
     return jsonify({"obligation": obl})
+
+
+@app.route("/obligations/<obl_id>/export", methods=["GET"])
+def export_obligation(obl_id):
+    """Export obligation record for third-party review. No auth required.
+    
+    Public commitment = public record. Only state transitions (advance,
+    evidence, resolve) require auth. Reading is open.
+    
+    Optional query params:
+    - strip=resolution: removes resolution-related fields for blind review
+      (strips any history entries with status=resolved, and the final
+      resolution note, so a third-party reviewer sees only pre-resolution state)
+    """
+    obls = load_obligations()
+    if _expire_obligations(obls):
+        save_obligations(obls)
+    obl = next((o for o in obls if o["obligation_id"] == obl_id), None)
+    if not obl:
+        return jsonify({"error": "not found"}), 404
+
+    import copy
+    export = copy.deepcopy(obl)
+
+    strip = request.args.get("strip", "")
+    if strip == "resolution":
+        # Remove resolution-related history entries for blind review
+        export["history"] = [
+            h for h in export.get("history", [])
+            if h.get("status") not in ("resolved", "failed")
+        ]
+        # Remove resolution notes from evidence_refs if they look post-resolution
+        # Keep all evidence (reviewer needs to see it) but strip resolution metadata
+        export.pop("resolved_at", None)
+        export.pop("resolved_by", None)
+
+    export["_export_meta"] = {
+        "exported_at": datetime.utcnow().isoformat() + "Z",
+        "strip": strip or "none",
+        "note": "Public obligation record. No auth required for read access."
+    }
+
+    return jsonify({"obligation": export})
 
 
 @app.route("/obligations/<obl_id>/advance", methods=["POST"])
@@ -8716,14 +8812,17 @@ def advance_obligation(obl_id):
         return jsonify({"error": "cannot resolve without evidence_refs"}), 409
 
     # Enforce: reviewer_required policy needs reviewer verdict before resolution
+    # Exception: if deadline_elapsed, claimant can self-resolve (reviewer missed the window)
     if new_status == "resolved" and obl.get("closure_policy") == "reviewer_required":
-        reviewer = {b["agent_id"] for b in obl.get("role_bindings", []) if b.get("role") == "reviewer"}
-        has_reviewer_verdict = any(
-            e.get("submitted_by") in reviewer or e.get("type") == "reviewer_verdict"
-            for e in obl.get("evidence_refs", [])
-        )
-        if not has_reviewer_verdict:
-            return jsonify({"error": "closure_policy 'reviewer_required' needs reviewer verdict in evidence_refs before resolution. Status: awaiting_reviewer"}), 409
+        is_deadline_elapsed = obl.get("status") == "deadline_elapsed" and obl.get("timeout_elapsed")
+        if not is_deadline_elapsed:
+            reviewer = {b["agent_id"] for b in obl.get("role_bindings", []) if b.get("role") == "reviewer"}
+            has_reviewer_verdict = any(
+                e.get("submitted_by") in reviewer or e.get("by") in reviewer or e.get("type") == "reviewer_verdict"
+                for e in obl.get("evidence_refs", [])
+            )
+            if not has_reviewer_verdict:
+                return jsonify({"error": "closure_policy 'reviewer_required' needs reviewer verdict in evidence_refs before resolution. Status: awaiting_reviewer"}), 409
 
     # Enforce: binding_scope_text required at accepted
     if new_status == "accepted" and not obl.get("binding_scope_text"):
@@ -8750,7 +8849,12 @@ def advance_obligation(obl_id):
             )
 
     obl["status"] = new_status
-    obl["history"].append({"status": new_status, "at": now, "by": agent_id, "note": data.get("note")})
+    history_entry = {"status": new_status, "at": now, "by": agent_id, "note": data.get("note")}
+    # Flag resolution from deadline_elapsed state
+    if new_status == "resolved" and current == "deadline_elapsed":
+        history_entry["timeout_elapsed"] = True
+        history_entry["resolution_type"] = "post_deadline_claimant"
+    obl["history"].append(history_entry)
 
     # Attach evidence if provided
     if data.get("evidence"):
