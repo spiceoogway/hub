@@ -8428,14 +8428,55 @@ _OBL_TRANSITIONS = {
     "rejected":           [],
     "withdrawn":          [],
     "failed":             [],
+    "timed_out":          [],
 }
+
+def _check_deadline_expiry(obl):
+    """Check if an obligation has passed its deadline_utc. Returns True if expired and status was updated."""
+    deadline = obl.get("deadline_utc")
+    if not deadline:
+        return False
+    status = obl.get("status", "")
+    # Don't expire terminal states
+    if status in ("resolved", "rejected", "withdrawn", "failed", "timed_out"):
+        return False
+    try:
+        deadline_dt = datetime.fromisoformat(deadline.replace("Z", "+00:00"))
+        now_dt = datetime.utcnow().replace(tzinfo=None)
+        deadline_naive = deadline_dt.replace(tzinfo=None)
+        if now_dt > deadline_naive:
+            policy = obl.get("closure_policy", "counterparty_accepts")
+            now_iso = datetime.utcnow().isoformat() + "Z"
+            obl["status"] = "timed_out"
+            obl.setdefault("history", []).append({
+                "status": "timed_out",
+                "at": now_iso,
+                "by": "system",
+                "reason": f"deadline_utc ({deadline}) passed under {policy} policy"
+            })
+            return True
+    except (ValueError, TypeError):
+        pass
+    return False
+
+def _expire_obligations(obls):
+    """Check all obligations for deadline expiry. Returns True if any were expired."""
+    changed = False
+    for obl in obls:
+        if _check_deadline_expiry(obl):
+            changed = True
+    return changed
 
 _CLOSURE_POLICIES = [
     "claimant_self_attests",
     "counterparty_accepts",
     "claimant_plus_reviewer",
+    "reviewer_required",
     "arbiter_rules",
 ]
+
+# Policies that REQUIRE a deadline (obligations that can hang indefinitely without one)
+_DEADLINE_REQUIRED_POLICIES = ["reviewer_required", "claimant_plus_reviewer"]
 
 def _obl_auth(obl, agent_id):
     """Check if agent_id is a party or role-bound actor in this obligation."""
@@ -8456,6 +8497,8 @@ def _can_resolve(obl, agent_id):
         return agent_id == bindings.get("counterparty", obl.get("counterparty"))
     elif policy == "claimant_plus_reviewer":
         return agent_id == bindings.get("reviewer")
+    elif policy == "reviewer_required":
+        return agent_id == bindings.get("reviewer")
     elif policy == "arbiter_rules":
         return agent_id == bindings.get("arbiter")
     return False
@@ -8465,6 +8508,8 @@ def _can_resolve(obl, agent_id):
 def list_obligations():
     """List obligations, optionally filtered by agent_id or status."""
     obls = load_obligations()
+    if _expire_obligations(obls):
+        save_obligations(obls)
     agent_id = request.args.get("agent_id")
     status = request.args.get("status")
     if agent_id:
@@ -8499,6 +8544,10 @@ def create_obligation():
     if closure_policy not in _CLOSURE_POLICIES:
         return jsonify({"error": f"invalid closure_policy, must be one of: {_CLOSURE_POLICIES}"}), 400
 
+    deadline_utc = data.get("deadline_utc")
+    if closure_policy in _DEADLINE_REQUIRED_POLICIES and not deadline_utc:
+        return jsonify({"error": f"deadline_utc is required for closure_policy '{closure_policy}' (prevents indefinite hang)"}), 400
+
     obl = {
         "obligation_id": obl_id,
         "created_at": now,
@@ -8516,6 +8565,7 @@ def create_obligation():
         "commitment": commitment,
         "success_condition": data.get("success_condition"),
         "closure_policy": closure_policy,
+        "deadline_utc": deadline_utc,
         "binding_scope_text": data.get("binding_scope_text"),
         "vi_credential_ref": data.get("vi_credential_ref"),
         "evidence_refs": [],
@@ -8571,6 +8621,10 @@ def propose_obligation_public():
     if closure_policy not in _CLOSURE_POLICIES:
         return jsonify({"error": f"invalid closure_policy, must be one of: {_CLOSURE_POLICIES}"}), 400
 
+    deadline_utc = data.get("deadline_utc")
+    if closure_policy in _DEADLINE_REQUIRED_POLICIES and not deadline_utc:
+        return jsonify({"error": f"deadline_utc is required for closure_policy '{closure_policy}' (prevents indefinite hang)"}), 400
+
     obl = {
         "obligation_id": obl_id,
         "created_at": now,
@@ -8589,6 +8643,7 @@ def propose_obligation_public():
         "commitment": commitment,
         "success_condition": data.get("success_condition"),
         "closure_policy": closure_policy,
+        "deadline_utc": deadline_utc,
         "binding_scope_text": data.get("binding_scope_text"),
         "evidence_refs": [],
         "artifact_refs": [],
@@ -8615,6 +8670,8 @@ def propose_obligation_public():
 def get_obligation(obl_id):
     """Get a single obligation by ID."""
     obls = load_obligations()
+    if _expire_obligations(obls):
+        save_obligations(obls)
     obl = next((o for o in obls if o["obligation_id"] == obl_id), None)
     if not obl:
         return jsonify({"error": "not found"}), 404
@@ -8657,6 +8714,16 @@ def advance_obligation(obl_id):
     # Enforce: cannot resolve without evidence (fail-closed)
     if new_status == "resolved" and not obl.get("evidence_refs"):
         return jsonify({"error": "cannot resolve without evidence_refs"}), 409
+
+    # Enforce: reviewer_required policy needs reviewer verdict before resolution
+    if new_status == "resolved" and obl.get("closure_policy") == "reviewer_required":
+        reviewer = {b["agent_id"] for b in obl.get("role_bindings", []) if b.get("role") == "reviewer"}
+        has_reviewer_verdict = any(
+            e.get("submitted_by") in reviewer or e.get("type") == "reviewer_verdict"
+            for e in obl.get("evidence_refs", [])
+        )
+        if not has_reviewer_verdict:
+            return jsonify({"error": "closure_policy 'reviewer_required' needs reviewer verdict in evidence_refs before resolution. Status: awaiting_reviewer"}), 409
 
     # Enforce: binding_scope_text required at accepted
     if new_status == "accepted" and not obl.get("binding_scope_text"):
