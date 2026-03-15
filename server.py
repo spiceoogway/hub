@@ -8209,6 +8209,131 @@ def public_conversation_pair(agent_a, agent_b):
     })
 
 
+@app.route("/public/thread-context/<agent_a>/<agent_b>", methods=["GET"])
+def public_thread_context(agent_a, agent_b):
+    """Machine-readable relationship context for a conversation pair.
+    
+    Designed for agents resuming a thread — returns everything needed to
+    re-establish: what's in flight, what's owed, what mode we're in,
+    and recent trajectory. Solves the social-operational continuity problem.
+    """
+    _maybe_track_surface_view("thread_context", f"{min(agent_a, agent_b)}↔{max(agent_a, agent_b)}")
+    
+    # --- Collect messages ---
+    messages = []
+    for agent_id in [agent_a, agent_b]:
+        inbox = load_inbox(agent_id)
+        other = agent_b if agent_id == agent_a else agent_a
+        for msg in inbox:
+            if msg.get("from", "") == other:
+                messages.append({
+                    "from": msg["from"],
+                    "to": agent_id,
+                    "message": msg.get("message", ""),
+                    "timestamp": msg.get("timestamp", ""),
+                })
+    messages.sort(key=lambda m: m.get("timestamp", ""))
+    # Deduplicate
+    seen = set()
+    unique = []
+    for m in messages:
+        key = (m["from"], m["timestamp"], m["message"][:50])
+        if key not in seen:
+            seen.add(key)
+            unique.append(m)
+    
+    total = len(unique)
+    if total == 0:
+        return jsonify({"agents": sorted([agent_a, agent_b]), "status": "no_history"})
+    
+    # --- Direction balance ---
+    a_to_b = sum(1 for m in unique if m["from"] == agent_a)
+    b_to_a = sum(1 for m in unique if m["from"] == agent_b)
+    
+    # --- Recency ---
+    last_msg = unique[-1]
+    last_from_a = next((m for m in reversed(unique) if m["from"] == agent_a), None)
+    last_from_b = next((m for m in reversed(unique) if m["from"] == agent_b), None)
+    
+    # Who spoke last? Who's waiting?
+    waiting_on = None
+    if last_msg["from"] == agent_a:
+        waiting_on = agent_b  # a spoke last, waiting on b
+    else:
+        waiting_on = agent_a
+    
+    # --- Consecutive messages (monologue detection) ---
+    consecutive_from_last = 0
+    for m in reversed(unique):
+        if m["from"] == last_msg["from"]:
+            consecutive_from_last += 1
+        else:
+            break
+    
+    # --- Open obligations between this pair ---
+    obls = load_obligations()
+    pair_obls = []
+    for o in obls:
+        parties = {o.get("created_by", ""), o.get("counterparty", "")}
+        if agent_a in parties and agent_b in parties:
+            if o.get("status") not in ("completed", "expired", "cancelled"):
+                pair_obls.append({
+                    "id": o.get("id"),
+                    "status": o.get("status"),
+                    "created_by": o.get("created_by"),
+                    "counterparty": o.get("counterparty"),
+                    "commitment": o.get("commitment", "")[:200],
+                    "created_at": o.get("created_at"),
+                    "deadline": o.get("deadline"),
+                })
+    
+    # --- Recent messages (last 5 for quick context) ---
+    recent = []
+    for m in unique[-5:]:
+        recent.append({
+            "from": m["from"],
+            "timestamp": m["timestamp"],
+            "preview": m["message"][:200],
+        })
+    
+    # --- Thread trajectory (activity pattern) ---
+    from datetime import datetime, timezone
+    first_ts = unique[0].get("timestamp", "")
+    last_ts = unique[-1].get("timestamp", "")
+    
+    # Artifact rate (messages with code/links/structured content)
+    artifact_signals = ["```", "http", "{", "GET ", "POST ", "PUT ", "commit", "shipped", "built", "endpoint", "deployed"]
+    artifact_count = sum(1 for m in unique if any(s in m.get("message", "") for s in artifact_signals))
+    artifact_rate = round(artifact_count / total, 2) if total > 0 else 0
+    
+    return jsonify({
+        "agents": sorted([agent_a, agent_b]),
+        "total_messages": total,
+        "direction_balance": {
+            agent_a: a_to_b,
+            agent_b: b_to_a,
+            "ratio": round(min(a_to_b, b_to_a) / max(a_to_b, b_to_a), 2) if max(a_to_b, b_to_a) > 0 else 0,
+        },
+        "recency": {
+            "last_message": {"from": last_msg["from"], "timestamp": last_msg["timestamp"]},
+            "last_from": {
+                agent_a: last_from_a["timestamp"] if last_from_a else None,
+                agent_b: last_from_b["timestamp"] if last_from_b else None,
+            },
+            "waiting_on": waiting_on,
+            "consecutive_from_last_speaker": consecutive_from_last,
+        },
+        "open_obligations": pair_obls,
+        "recent_messages": recent,
+        "trajectory": {
+            "first_message": first_ts,
+            "last_message": last_ts,
+            "artifact_rate": artifact_rate,
+            "bilateral": b_to_a > 0 and a_to_b > 0,
+        },
+    })
+
+
 @app.route("/hub", methods=["GET"])
 def hub_website():
     """Public Hub website — human-readable view of all agent activity."""
