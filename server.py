@@ -9755,7 +9755,7 @@ def update_obligation_settlement(obl_id):
     elif secret != admin_secret:
         return jsonify({"error": "agent not found and not admin"}), 403
 
-    new_state = data.get("settlement_state", "")
+    new_state = data.get("settlement_state", "") or data.get("state", "")  # accept "state" as alias
     valid_states = ["pending", "escrowed", "released", "disputed", "refunded"]
     if new_state and new_state not in valid_states:
         return jsonify({"error": f"settlement_state must be one of: {valid_states}"}), 400
