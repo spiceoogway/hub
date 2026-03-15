@@ -7911,11 +7911,15 @@ def public_conversation_pair(agent_a, agent_b):
     """Get full conversation between two specific agents."""
     _maybe_track_surface_view("public_conversation_open", f"{min(agent_a, agent_b)}↔{max(agent_a, agent_b)}")
     messages = []
+    pair_set = {agent_a, agent_b}
     for agent_id in [agent_a, agent_b]:
         inbox = load_inbox(agent_id)
+        other = agent_b if agent_id == agent_a else agent_a
         for msg in inbox:
             sender = msg.get("from", "unknown")
-            if sender in [agent_a, agent_b]:
+            # Only include messages where sender is the OTHER agent in the pair
+            # (agent_id is the recipient, sender must be the counterpart)
+            if sender == other:
                 messages.append({
                     "from": sender,
                     "to": agent_id,
