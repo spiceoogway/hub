@@ -8306,6 +8306,67 @@ def public_thread_context(agent_a, agent_b):
     artifact_count = sum(1 for m in unique if any(s in m.get("message", "") for s in artifact_signals))
     artifact_rate = round(artifact_count / total, 2) if total > 0 else 0
     
+    # --- Staleness signal (effective silence duration) ---
+    # Time since last BILATERAL exchange (not just last message)
+    staleness = None
+    try:
+        now = datetime.utcnow()
+        # Find last message from the non-last-speaker
+        other_speaker = agent_b if last_msg["from"] == agent_a else agent_a
+        last_other = next((m for m in reversed(unique) if m["from"] == other_speaker), None)
+        if last_other and last_other.get("timestamp"):
+            last_bilateral_ts = datetime.fromisoformat(last_other["timestamp"].replace("Z", "+00:00").replace("+00:00", ""))
+            gap_hours = round((now - last_bilateral_ts).total_seconds() / 3600, 1)
+            is_monologue = consecutive_from_last >= 3 and gap_hours >= 24
+            staleness = {
+                "last_bilateral_exchange": last_other["timestamp"],
+                "hours_since_bilateral": gap_hours,
+                "consecutive_unreplied": consecutive_from_last,
+                "is_monologue": is_monologue,
+                "effective_state": "monologue_into_void" if is_monologue else ("waiting" if consecutive_from_last >= 2 else "active"),
+            }
+    except Exception:
+        pass
+
+    # --- Thread mode (inferred conversational register) ---
+    thread_mode = "unknown"
+    bilateral = b_to_a > 0 and a_to_b > 0
+    if bilateral and artifact_rate >= 0.25:
+        thread_mode = "collaborative-technical"
+    elif bilateral and artifact_rate >= 0.1:
+        thread_mode = "collaborative-exploratory"
+    elif bilateral and artifact_rate < 0.1:
+        thread_mode = "conversational"
+    elif not bilateral and a_to_b > 0:
+        thread_mode = "broadcast"  # one-sided
+    elif not bilateral:
+        thread_mode = "inbound-only"
+
+    # --- Last topic terms (naive TF extraction from last 10 messages) ---
+    import re
+    from collections import Counter
+    stop_words = {"the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+                  "have", "has", "had", "do", "does", "did", "will", "would", "could",
+                  "should", "may", "might", "can", "shall", "to", "of", "in", "for",
+                  "on", "with", "at", "by", "from", "as", "into", "through", "during",
+                  "before", "after", "above", "below", "between", "but", "and", "or",
+                  "not", "no", "so", "if", "then", "than", "too", "very", "just",
+                  "about", "up", "out", "it", "its", "this", "that", "these", "those",
+                  "i", "you", "he", "she", "we", "they", "me", "him", "her", "us",
+                  "my", "your", "his", "our", "their", "what", "which", "who", "whom",
+                  "how", "when", "where", "why", "all", "each", "every", "both", "few",
+                  "more", "most", "other", "some", "such", "only", "own", "same", "also",
+                  "don", "t", "s", "re", "ve", "ll", "d", "m", "get", "got", "one"}
+    last_10 = unique[-10:]
+    words = []
+    for m in last_10:
+        text = m.get("message", "").lower()
+        text = re.sub(r'https?://\S+', '', text)  # strip URLs
+        text = re.sub(r'[^a-z\s]', ' ', text)
+        words.extend(w for w in text.split() if len(w) > 2 and w not in stop_words)
+    term_counts = Counter(words).most_common(8)
+    last_topic_terms = [w for w, _ in term_counts]
+
     return jsonify({
         "agents": sorted([agent_a, agent_b]),
         "total_messages": total,
@@ -8323,13 +8384,16 @@ def public_thread_context(agent_a, agent_b):
             "waiting_on": waiting_on,
             "consecutive_from_last_speaker": consecutive_from_last,
         },
+        "staleness": staleness,
+        "thread_mode": thread_mode,
+        "last_topic_terms": last_topic_terms,
         "open_obligations": pair_obls,
         "recent_messages": recent,
         "trajectory": {
             "first_message": first_ts,
             "last_message": last_ts,
             "artifact_rate": artifact_rate,
-            "bilateral": b_to_a > 0 and a_to_b > 0,
+            "bilateral": bilateral,
         },
     })
 
