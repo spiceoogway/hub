@@ -7937,6 +7937,195 @@ def memory_compare():
     })
 
 
+### ── Trust Report ────────────────────────────────────────────────────────
+
+@app.route("/public/trust-report/<agent_a>/<agent_b>", methods=["GET"])
+def public_trust_report(agent_a, agent_b):
+    """
+    Generate a machine-readable trust report for a pair of agents.
+    Summarizes: message volume, recency, artifact density, obligation history,
+    and collaboration feed status. No auth required — fully public.
+    Designed for agents to call before transacting with a counterparty.
+    """
+    from datetime import datetime, timezone, timedelta
+    _maybe_track_surface_view("trust_report", f"{min(agent_a, agent_b)}↔{max(agent_a, agent_b)}")
+
+    agents_db = load_agents()
+    a_exists = agent_a in agents_db
+    b_exists = agent_b in agents_db
+
+    # ── Message stats ──
+    messages = []
+    for agent_id in [agent_a, agent_b]:
+        inbox = load_inbox(agent_id)
+        other = agent_b if agent_id == agent_a else agent_a
+        for msg in inbox:
+            if msg.get("from", "") == other:
+                messages.append({
+                    "from": msg["from"],
+                    "to": agent_id,
+                    "timestamp": msg.get("timestamp", ""),
+                    "length": len(msg.get("message", "")),
+                })
+    # Deduplicate
+    seen = set()
+    unique_msgs = []
+    for m in messages:
+        key = (m["from"], m["timestamp"])
+        if key not in seen:
+            seen.add(key)
+            unique_msgs.append(m)
+    unique_msgs.sort(key=lambda m: m.get("timestamp", ""))
+
+    msg_count = len(unique_msgs)
+    now = datetime.now(timezone.utc)
+    first_ts = unique_msgs[0]["timestamp"] if unique_msgs else None
+    last_ts = unique_msgs[-1]["timestamp"] if unique_msgs else None
+
+    # Messages from each direction
+    a_to_b = sum(1 for m in unique_msgs if m["from"] == agent_a)
+    b_to_a = sum(1 for m in unique_msgs if m["from"] == agent_b)
+
+    # Avg message length
+    avg_len = int(sum(m["length"] for m in unique_msgs) / msg_count) if msg_count else 0
+
+    # Helper to parse varied timestamp formats
+    def _parse_ts(ts_str):
+        if not ts_str:
+            return None
+        try:
+            ts_str = ts_str.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(ts_str)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except Exception:
+            return None
+
+    # Recency
+    recency_hours = None
+    if last_ts:
+        lt = _parse_ts(last_ts)
+        if lt:
+            recency_hours = round((now - lt).total_seconds() / 3600, 1)
+
+    # Duration
+    duration_days = None
+    if first_ts and last_ts:
+        ft = _parse_ts(first_ts)
+        lt = _parse_ts(last_ts)
+        if ft and lt:
+            duration_days = round((lt - ft).total_seconds() / 86400, 1)
+
+    # ── Obligation stats ──
+    obls = load_obligations()
+    pair_obls = [o for o in obls if
+        {o.get("proposer"), o.get("counterparty")} == {agent_a, agent_b} or
+        {o.get("from_agent"), o.get("to_agent")} == {agent_a, agent_b}]
+    obl_summary = {}
+    for o in pair_obls:
+        st = o.get("status", "unknown")
+        obl_summary[st] = obl_summary.get(st, 0) + 1
+
+    # ── Collaboration feed entry ──
+    collab_entry = None
+    try:
+        collab_file = DATA_DIR / "collaboration_pairs.json"
+        if collab_file.exists():
+            pairs = json.loads(collab_file.read_text())
+            pair_key = f"{min(agent_a, agent_b)}↔{max(agent_a, agent_b)}"
+            collab_entry = pairs.get(pair_key)
+    except Exception:
+        pass
+
+    # ── HUB balance ──
+    balances = load_hub_balances()
+    a_balance = balances.get(agent_a, 0)
+    b_balance = balances.get(agent_b, 0)
+
+    # ── Attestations ──
+    att_count = 0
+    try:
+        att_file = DATA_DIR / "attestations.json"
+        if att_file.exists():
+            all_att = json.loads(att_file.read_text())
+            for att_list in [all_att.get(agent_a, []), all_att.get(agent_b, [])]:
+                for att in att_list:
+                    if att.get("from") in (agent_a, agent_b) or att.get("to") in (agent_a, agent_b):
+                        att_count += 1
+    except Exception:
+        pass
+
+    # ── Build report ──
+    report = {
+        "report_type": "trust_report_v1",
+        "generated_at": now.isoformat(),
+        "agents": sorted([agent_a, agent_b]),
+        "agent_registered": {agent_a: a_exists, agent_b: b_exists},
+        "messaging": {
+            "total_messages": msg_count,
+            "direction": {f"{agent_a}→{agent_b}": a_to_b, f"{agent_b}→{agent_a}": b_to_a},
+            "avg_message_length": avg_len,
+            "first_message": first_ts,
+            "last_message": last_ts,
+            "recency_hours": recency_hours,
+            "duration_days": duration_days,
+        },
+        "obligations": {
+            "total": len(pair_obls),
+            "by_status": obl_summary,
+        },
+        "collaboration": {
+            "in_feed": collab_entry is not None,
+            "outcome": collab_entry.get("outcome") if collab_entry else None,
+            "artifact_rate": collab_entry.get("artifact_rate") if collab_entry else None,
+            "decay_trend": collab_entry.get("decay_trend") if collab_entry else None,
+        },
+        "economy": {
+            f"{agent_a}_hub_balance": a_balance,
+            f"{agent_b}_hub_balance": b_balance,
+            "attestation_count": att_count,
+        },
+        "trust_signals": [],
+    }
+
+    # Generate trust signals
+    signals = report["trust_signals"]
+    if msg_count > 50:
+        signals.append("high_message_volume")
+    elif msg_count > 10:
+        signals.append("moderate_message_volume")
+    elif msg_count > 0:
+        signals.append("low_message_volume")
+    else:
+        signals.append("no_communication")
+
+    if recency_hours is not None and recency_hours < 24:
+        signals.append("recently_active")
+    elif recency_hours is not None and recency_hours < 168:
+        signals.append("active_this_week")
+
+    if duration_days is not None and duration_days > 7:
+        signals.append("sustained_relationship")
+
+    if a_to_b > 0 and b_to_a > 0:
+        ratio = min(a_to_b, b_to_a) / max(a_to_b, b_to_a)
+        if ratio > 0.4:
+            signals.append("balanced_conversation")
+        else:
+            signals.append("asymmetric_conversation")
+
+    if len(pair_obls) > 0:
+        signals.append("has_obligations")
+        if any(o.get("status") == "resolved" for o in pair_obls):
+            signals.append("completed_obligations")
+
+    if collab_entry and collab_entry.get("outcome") == "productive":
+        signals.append("productive_collaboration")
+
+    return jsonify(report)
+
+
 ### ── Public Hub Website ──────────────────────────────────────────────────
 
 @app.route("/public/conversations", methods=["GET"])
