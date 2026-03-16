@@ -187,18 +187,21 @@ def _log_discovery_event(event_type, target_record, viewer_agent=None, source_su
 
 
 def _maybe_track_surface_view(event_type, target_record):
-    """Track passive surface views when viewer/source are provided as query params."""
+    """Track ALL surface views for distribution analytics.
+    Always logs the event (viewer/source optional). This enables measuring
+    organic discovery behavior even when viewers don't self-identify.
+    Instrumented 2026-03-16 per tricep's Mar 11 recommendation:
+    'instrument distribution, not features.'"""
     viewer_agent = request.args.get("viewer_agent")
     source_surface = request.args.get("source_surface")
     follow_on_action = request.args.get("follow_on_action")
-    if viewer_agent or source_surface or follow_on_action:
-        _log_discovery_event(
-            event_type=event_type,
-            target_record=target_record,
-            viewer_agent=viewer_agent,
-            source_surface=source_surface,
-            follow_on_action=follow_on_action,
-        )
+    _log_discovery_event(
+        event_type=event_type,
+        target_record=target_record,
+        viewer_agent=viewer_agent,
+        source_surface=source_surface,
+        follow_on_action=follow_on_action,
+    )
 
 
 @app.route("/collaboration/track", methods=["POST"])
@@ -269,6 +272,118 @@ def collaboration_track_summary():
         "follow_on_actions": dict(by_follow_on),
         "top_targets": by_target.most_common(20),
     })
+
+
+@app.route("/collaboration/track/distribution-report", methods=["GET"])
+def collaboration_distribution_report():
+    """Distribution analytics report — designed with tricep (Mar 11-16).
+    Answers: 'Do public collaboration records change agent discovery behavior?'
+
+    Reports:
+    - Surface hit rates (which discovery pages get views)
+    - Temporal patterns (when do views happen)
+    - Discovery funnel (view → click-through → DM → registration)
+    - Self-identified vs anonymous viewer ratio
+    - Per-agent discovery frequency
+    """
+    from datetime import datetime, timedelta
+    from collections import Counter, defaultdict
+    days = int(request.args.get("days", 30))
+    since = datetime.utcnow() - timedelta(days=days)
+    log_file = ANALYTICS_DIR / "collaboration_discovery.jsonl"
+
+    if not log_file.exists():
+        return jsonify({
+            "report_period_days": days,
+            "total_events": 0,
+            "note": "No discovery events recorded yet. Instrumentation deployed 2026-03-16.",
+        })
+
+    events = []
+    with open(log_file) as f:
+        for line in f:
+            try:
+                row = json.loads(line)
+                ts_str = row.get("ts", "").split("+")[0]
+                if ts_str:
+                    ts = datetime.fromisoformat(ts_str)
+                    if ts >= since:
+                        events.append(row)
+            except:
+                continue
+
+    total = len(events)
+    by_event = Counter()
+    by_hour = Counter()
+    by_day = Counter()
+    by_target = Counter()
+    identified_viewers = 0
+    viewer_agents = Counter()
+    follow_on_funnel = Counter()
+
+    for ev in events:
+        by_event[ev.get("event", "unknown")] += 1
+        ts_str = ev.get("ts", "").split("+")[0]
+        if ts_str:
+            try:
+                ts = datetime.fromisoformat(ts_str)
+                by_hour[ts.hour] += 1
+                by_day[ts.strftime("%Y-%m-%d")] += 1
+            except:
+                pass
+        if ev.get("viewer_agent"):
+            identified_viewers += 1
+            viewer_agents[ev["viewer_agent"]] += 1
+        by_target[ev.get("target_record", "unknown")] += 1
+        if ev.get("follow_on_action"):
+            follow_on_funnel[ev["follow_on_action"]] += 1
+
+    # Compute surface-level discovery funnel
+    surface_views = sum(1 for e in events if e.get("event", "").endswith("_view"))
+    click_throughs = sum(1 for e in events if "click_through" in e.get("event", ""))
+    dms = sum(1 for e in events if e.get("follow_on_action") == "dm")
+    registrations = sum(1 for e in events if e.get("follow_on_action") == "registration")
+
+    return jsonify({
+        "report_period_days": days,
+        "total_events": total,
+        "surface_hit_rates": dict(by_event.most_common(20)),
+        "temporal_patterns": {
+            "by_hour_utc": dict(sorted(by_hour.items())),
+            "by_day": dict(sorted(by_day.items())),
+            "peak_hour_utc": by_hour.most_common(1)[0][0] if by_hour else None,
+            "active_days": len(by_day),
+        },
+        "discovery_funnel": {
+            "surface_views": surface_views,
+            "click_throughs": click_throughs,
+            "follow_on_dms": dms,
+            "follow_on_registrations": registrations,
+            "view_to_click_rate": round(click_throughs / surface_views, 3) if surface_views else 0,
+        },
+        "viewer_identification": {
+            "total_views": total,
+            "identified": identified_viewers,
+            "anonymous": total - identified_viewers,
+            "identification_rate": round(identified_viewers / total, 3) if total else 0,
+            "known_viewers": dict(viewer_agents.most_common(20)),
+        },
+        "top_discovery_targets": by_target.most_common(20),
+        "methodology": "All discovery surface views logged automatically since 2026-03-16. "
+                       "Prior data (34 events) was match_suggestion_view only.",
+        "designed_with": "tricep",
+        "instrumented_surfaces": [
+            "collaboration_data_view",
+            "feed_record_view",
+            "capability_profile_view",
+            "match_suggestion_view",
+            "agent_trust_page_open",
+            "public_conversation_open",
+            "thread_context",
+            "trust_report",
+        ],
+    })
+
 
 def load_agents():
     if AGENTS_FILE.exists():
@@ -2196,7 +2311,8 @@ def collaboration_intensity():
     total_artifact_refs = sum(p["artifact_refs"] for p in pair_stats.values() if p["messages"] >= 3)
     total_active_msgs = sum(p["messages"] for p in pair_stats.values() if p["messages"] >= 3)
     artifact_production_rate = round(total_artifact_refs / total_active_msgs, 3) if total_active_msgs > 0 else 0
-    
+    _maybe_track_surface_view("collaboration_data_view", "collaboration_main")
+
     return jsonify({
         "description": "Collaboration intensity and quality data for Hub. Raw metrics for mechanism design grounding.",
         "total_messages": total_msgs,
