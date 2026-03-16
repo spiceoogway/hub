@@ -5089,6 +5089,68 @@ def per_agent_card(agent_id):
     # Last active timestamp
     hub_profile["registeredAt"] = agent.get("registered_at")
 
+    # --- Inline capability profile from collaboration/capabilities data ---
+    try:
+        from datetime import datetime as _dt
+        from collections import defaultdict as _dd, Counter as _Counter
+        import math as _math
+
+        pair_stats, _, _ = _scan_all_pairs()
+        now = _dt.utcnow()
+        agent_records = []
+        for pair_key, stats in (pair_stats or {}).items():
+            msgs_count = stats.get("messages", 0)
+            if msgs_count < 10:
+                continue
+            agents_in_pair = list(stats.get("agents", []))
+            if agent_id not in agents_in_pair:
+                continue
+            sender_counts = dict(stats.get("senders", {}))
+            is_bilateral = len([a for a in agents_in_pair if sender_counts.get(a, 0) > 0]) >= 2
+            artifact_rate = stats.get("artifact_refs", 0) / msgs_count if msgs_count > 0 else 0
+            try:
+                last_ts = _dt.fromisoformat(stats["last"].replace("Z", "+00:00").split("+")[0])
+                first_ts = _dt.fromisoformat(stats["first"].replace("Z", "+00:00").split("+")[0])
+                days_since_last = (now - last_ts).days
+                duration_days = max(1, (last_ts - first_ts).days)
+            except:
+                continue
+            outcome = _classify_outcome(artifact_rate, is_bilateral, days_since_last, duration_days)
+            if outcome not in ("productive", "diverged"):
+                continue
+            agent_records.append({
+                "bilateral": is_bilateral,
+                "artifact_rate": artifact_rate,
+                "artifact_types": dict(stats.get("artifact_types", {})),
+                "duration_days": duration_days,
+                "days_since_last": days_since_last,
+                "last_interaction": stats.get("last"),
+            })
+
+        if agent_records:
+            n = len(agent_records)
+            bilateral_count = sum(1 for r in agent_records if r["bilateral"])
+            avg_artifact_rate = sum(r["artifact_rate"] for r in agent_records) / n
+            all_types = set()
+            for r in agent_records:
+                all_types.update(r["artifact_types"].keys())
+            last_active = max(r["last_interaction"] for r in agent_records if r.get("last_interaction"))
+            confidence = "high" if n >= 6 else ("medium" if n >= 3 else "low")
+            avg_duration = sum(r["duration_days"] for r in agent_records) / n
+
+            hub_profile["capabilityProfile"] = {
+                "collaborationPartners": n,
+                "bilateralRate": round(bilateral_count / n, 3),
+                "avgArtifactRate": round(avg_artifact_rate, 3),
+                "artifactTypesSeen": len(all_types),
+                "primaryArtifactTypes": sorted(all_types)[:5],
+                "confidence": confidence,
+                "avgDurationDays": round(avg_duration, 1),
+                "lastActiveAt": last_active,
+            }
+    except Exception:
+        pass  # don't break the card if capability computation fails
+
     card = {
         "name": agent_id,
         "description": agent.get("description", f"Agent registered on Hub"),
