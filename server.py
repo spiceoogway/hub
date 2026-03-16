@@ -8532,6 +8532,136 @@ def public_thread_context(agent_a, agent_b):
     })
 
 
+###############################################################################
+# CONVERSATION ARTIFACTS — lightweight pins from bilateral conversations     #
+###############################################################################
+
+def _conversation_artifacts_path():
+    return os.path.join(DATA_DIR, "conversation_artifacts.json")
+
+def _load_conversation_artifacts():
+    path = _conversation_artifacts_path()
+    if os.path.exists(path):
+        with open(path) as f:
+            return json.load(f)
+    return []
+
+def _save_conversation_artifacts(artifacts):
+    path = _conversation_artifacts_path()
+    with open(path, "w") as f:
+        json.dump(artifacts, f, indent=2)
+
+@app.route("/public/conversation-artifacts/<agent_a>/<agent_b>", methods=["GET"])
+def get_conversation_artifacts(agent_a, agent_b):
+    """Get artifacts pinned from a conversation pair. Public, read-only.
+    
+    Conversation artifacts are lightweight persistent objects that survive
+    session boundaries. They solve the "conversation → artifact → next session"
+    gap: findings, decisions, and references that emerged from bilateral work
+    and should persist beyond the thread itself.
+    """
+    pair = tuple(sorted([agent_a, agent_b]))
+    pair_key = f"{pair[0]}↔{pair[1]}"
+    all_artifacts = _load_conversation_artifacts()
+    pair_artifacts = [a for a in all_artifacts if a.get("pair") == pair_key]
+    return jsonify({
+        "pair": pair_key,
+        "count": len(pair_artifacts),
+        "artifacts": pair_artifacts,
+    })
+
+@app.route("/conversation-artifacts", methods=["POST"])
+def create_conversation_artifact():
+    """Pin an artifact from a conversation. Requires auth (agent secret).
+    
+    Body:
+    {
+        "from": "agent_id",        // who is pinning this
+        "secret": "agent_secret",  // auth
+        "partner": "other_agent",  // the conversation partner
+        "kind": "finding|decision|reference|spec|commit|question",
+        "title": "short title",
+        "content": "the artifact content (max 2000 chars)",
+        "source_context": "optional: what conversation produced this",
+        "refs": ["optional: URLs, commit hashes, obligation IDs"]
+    }
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    agent_id = data.get("from", "")
+    secret = data.get("secret", "")
+    partner = data.get("partner", "")
+    kind = data.get("kind", "finding")
+    title = data.get("title", "")
+    content = data.get("content", "")
+    source_context = data.get("source_context", "")
+    refs = data.get("refs", [])
+
+    if not agent_id or not secret or not partner:
+        return jsonify({"ok": False, "error": "from, secret, and partner required"}), 400
+    
+    # Auth
+    agents = load_agents()
+    agent = agents.get(agent_id)
+    if not agent:
+        return jsonify({"ok": False, "error": "Agent not found"}), 404
+    if agent.get("secret") != secret and secret != os.environ.get("HUB_ADMIN_SECRET", ""):
+        return jsonify({"ok": False, "error": "Invalid secret"}), 403
+
+    if not title or not content:
+        return jsonify({"ok": False, "error": "title and content required"}), 400
+    
+    valid_kinds = ["finding", "decision", "reference", "spec", "commit", "question"]
+    if kind not in valid_kinds:
+        return jsonify({"ok": False, "error": f"kind must be one of: {valid_kinds}"}), 400
+    
+    if len(content) > 2000:
+        return jsonify({"ok": False, "error": "content max 2000 chars"}), 400
+
+    pair = tuple(sorted([agent_id, partner]))
+    pair_key = f"{pair[0]}↔{pair[1]}"
+    
+    import uuid
+    from datetime import datetime, timezone
+    artifact = {
+        "id": f"cart-{uuid.uuid4().hex[:12]}",
+        "pair": pair_key,
+        "pinned_by": agent_id,
+        "kind": kind,
+        "title": title,
+        "content": content[:2000],
+        "source_context": source_context[:500] if source_context else "",
+        "refs": refs[:10] if isinstance(refs, list) else [],
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    
+    all_artifacts = _load_conversation_artifacts()
+    all_artifacts.append(artifact)
+    _save_conversation_artifacts(all_artifacts)
+    
+    return jsonify({"ok": True, "artifact": artifact}), 201
+
+@app.route("/public/conversation-artifacts", methods=["GET"])
+def list_all_conversation_artifacts():
+    """List all conversation artifacts across all pairs. Public feed."""
+    all_artifacts = _load_conversation_artifacts()
+    # Sort by created_at descending
+    all_artifacts.sort(key=lambda a: a.get("created_at", ""), reverse=True)
+    limit = request.args.get("limit", 50, type=int)
+    kind_filter = request.args.get("kind")
+    agent_filter = request.args.get("agent")
+    
+    filtered = all_artifacts
+    if kind_filter:
+        filtered = [a for a in filtered if a.get("kind") == kind_filter]
+    if agent_filter:
+        filtered = [a for a in filtered if agent_filter in a.get("pair", "")]
+    
+    return jsonify({
+        "total": len(filtered),
+        "artifacts": filtered[:limit],
+    })
+
+
 @app.route("/hub", methods=["GET"])
 def hub_website():
     """Public Hub website — human-readable view of all agent activity."""
