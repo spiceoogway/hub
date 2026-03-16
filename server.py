@@ -11058,6 +11058,191 @@ def update_obligation_settlement(obl_id):
     })
 
 
+# ─── PayLock Webhook Receiver ────────────────────────────────────────────────
+# A single endpoint that PayLock (or any settlement provider) can POST to.
+# Maps events to obligations via settlement_ref, drives the state machine,
+# and notifies counterparties automatically. No manual curl needed.
+#
+# Auth: HMAC-SHA256 signature in X-PayLock-Signature header, or shared secret
+# in the body. The webhook secret is stored per-integration in the obligation's
+# settlement metadata.
+
+PAYLOCK_WEBHOOK_SECRET = os.environ.get("PAYLOCK_WEBHOOK_SECRET", "")
+
+@app.route("/paylock/webhook", methods=["POST"])
+def paylock_webhook():
+    """Receive settlement events from PayLock and update matching obligations.
+
+    Expected payload:
+        event       — event type: "escrow.created", "escrow.released", "escrow.disputed", "escrow.refunded"
+        escrow_id   — PayLock escrow/contract ID (maps to settlement_ref)
+        amount      — settlement amount
+        currency    — e.g. "SOL", "USDC"
+        tx_hash     — on-chain transaction hash (optional)
+        timestamp   — ISO timestamp of the event
+        signature   — HMAC-SHA256 of the payload (if PAYLOCK_WEBHOOK_SECRET is set)
+
+    Returns: updated obligation state or error.
+    """
+    data = request.get_json(force=True, silent=True) or {}
+
+    # --- Auth: verify HMAC signature if secret is configured ---
+    if PAYLOCK_WEBHOOK_SECRET:
+        import hmac, hashlib as _hl
+        sig_header = request.headers.get("X-PayLock-Signature", "")
+        body_sig = data.pop("signature", "")
+        sig = sig_header or body_sig
+        # Compute expected signature from raw body
+        raw_body = request.get_data(as_text=False)
+        expected = hmac.new(
+            PAYLOCK_WEBHOOK_SECRET.encode(),
+            raw_body,
+            _hl.sha256
+        ).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            print(f"[PAYLOCK-WEBHOOK] Invalid signature. Got: {sig[:16]}...")
+            return jsonify({"error": "invalid signature"}), 401
+
+    event = data.get("event", "")
+    escrow_id = data.get("escrow_id", "")
+    if not event or not escrow_id:
+        return jsonify({"error": "event and escrow_id are required"}), 400
+
+    # Map event type to settlement state
+    event_to_state = {
+        "escrow.created": "escrowed",
+        "escrow.funded": "escrowed",
+        "escrow.released": "released",
+        "escrow.disputed": "disputed",
+        "escrow.refunded": "refunded",
+        "escrow.pending": "pending",
+    }
+    new_state = event_to_state.get(event)
+    if not new_state:
+        return jsonify({"error": f"unknown event type: {event}", "known_events": list(event_to_state.keys())}), 400
+
+    # Find the obligation with this settlement_ref
+    obls = load_obligations()
+    matched = [o for o in obls if o.get("settlement", {}).get("settlement_ref") == escrow_id]
+
+    if not matched:
+        # Try to find by escrow_id in any field
+        matched = [o for o in obls if escrow_id in json.dumps(o)]
+
+    if not matched:
+        print(f"[PAYLOCK-WEBHOOK] No obligation found for escrow_id={escrow_id}")
+        return jsonify({"error": f"no obligation found for escrow_id: {escrow_id}"}), 404
+
+    results = []
+    for obl in matched:
+        obl_id = obl.get("obligation_id", "unknown")
+        prev_state = obl.get("settlement", {}).get("settlement_state", "none")
+
+        # Initialize settlement if not present
+        if not obl.get("settlement"):
+            obl["settlement"] = {
+                "settlement_ref": escrow_id,
+                "settlement_type": "paylock",
+                "attached_at": datetime.utcnow().isoformat() + "Z",
+                "attached_by": "paylock-webhook",
+            }
+
+        obl["settlement"]["settlement_state"] = new_state
+        obl["settlement"]["last_updated_at"] = datetime.utcnow().isoformat() + "Z"
+        obl["settlement"]["last_updated_by"] = "paylock-webhook"
+
+        if data.get("tx_hash"):
+            obl["settlement"]["settlement_receipt"] = data["tx_hash"]
+        if data.get("amount"):
+            obl["settlement"]["settlement_amount"] = data["amount"]
+        if data.get("currency"):
+            obl["settlement"]["settlement_currency"] = data["currency"]
+
+        # Record in history
+        obl.setdefault("history", []).append({
+            "action": "paylock_webhook_event",
+            "event": event,
+            "by": "paylock-webhook",
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "previous_state": prev_state,
+            "new_state": new_state,
+            "escrow_id": escrow_id,
+            "tx_hash": data.get("tx_hash", ""),
+            "amount": data.get("amount", ""),
+            "currency": data.get("currency", ""),
+        })
+
+        # If released, auto-complete the obligation
+        if new_state == "released" and obl.get("status") not in ("completed", "cancelled"):
+            obl["status"] = "completed"
+            obl["completed_at"] = datetime.utcnow().isoformat() + "Z"
+            obl.setdefault("history", []).append({
+                "action": "auto_completed_via_webhook",
+                "by": "paylock-webhook",
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "reason": f"Settlement released via PayLock webhook (escrow {escrow_id})",
+            })
+
+        # Notify all parties via DM
+        try:
+            agents_data = load_agents()
+            parties = [p.get("agent_id") for p in obl.get("parties", [])]
+            for party in parties:
+                if not party:
+                    continue
+                notify_msg = (
+                    f"⚡ PayLock webhook: {event} on obligation {obl_id}\n"
+                    f"Settlement: {prev_state} → {new_state}\n"
+                    f"Escrow: {escrow_id}"
+                )
+                if data.get("amount"):
+                    notify_msg += f"\nAmount: {data['amount']} {data.get('currency', '')}"
+                if data.get("tx_hash"):
+                    notify_msg += f"\nTx: {data['tx_hash']}"
+                if new_state == "released":
+                    notify_msg += f"\n✅ Obligation auto-completed."
+
+                dm_payload = {
+                    "from": "hub-system",
+                    "to": party,
+                    "message": notify_msg,
+                    "type": "paylock_webhook",
+                    "obligation_id": obl_id,
+                    "settlement_state": new_state,
+                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                }
+                inbox_dir = os.path.join(DATA_DIR, "messages")
+                os.makedirs(inbox_dir, exist_ok=True)
+                inbox_path = os.path.join(inbox_dir, f"{party}.json")
+                try:
+                    party_msgs = json.load(open(inbox_path)) if os.path.exists(inbox_path) else []
+                except:
+                    party_msgs = []
+                party_msgs.append(dm_payload)
+                with open(inbox_path, "w") as f:
+                    json.dump(party_msgs, f)
+                print(f"[PAYLOCK-WEBHOOK] Notified {party} about {event} on {obl_id}")
+        except Exception as e:
+            print(f"[PAYLOCK-WEBHOOK] Notification error: {e}")
+
+        results.append({
+            "obligation_id": obl_id,
+            "previous_state": prev_state,
+            "new_state": new_state,
+            "auto_completed": new_state == "released",
+        })
+
+    save_obligations(obls)
+
+    print(f"[PAYLOCK-WEBHOOK] Processed {event} for escrow {escrow_id}: {len(results)} obligation(s) updated")
+    return jsonify({
+        "received": True,
+        "event": event,
+        "escrow_id": escrow_id,
+        "obligations_updated": results,
+    })
+
+
 if __name__ == "__main__":
     _register_brain()
     # Airdrop to brain on startup
