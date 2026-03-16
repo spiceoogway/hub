@@ -8306,10 +8306,14 @@ def public_thread_context(agent_a, agent_b):
     artifact_count = sum(1 for m in unique if any(s in m.get("message", "") for s in artifact_signals))
     artifact_rate = round(artifact_count / total, 2) if total > 0 else 0
     
-    # --- Staleness signal (effective silence duration) ---
-    # Time since last BILATERAL exchange (not just last message)
+    # --- Staleness signal with decay-based cooling ---
+    # Instead of absolute gates (N=5 then dead), use exponential decay.
+    # Thread "temperature" drops smoothly based on time silence + consecutive unreplied.
+    # Artifact-bearing messages get a content-class override (can break through cooling).
     staleness = None
+    cooling = None
     try:
+        import math
         now = datetime.utcnow()
         # Find last message from the non-last-speaker
         other_speaker = agent_b if last_msg["from"] == agent_a else agent_a
@@ -8318,6 +8322,71 @@ def public_thread_context(agent_a, agent_b):
             last_bilateral_ts = datetime.fromisoformat(last_other["timestamp"].replace("Z", "+00:00").replace("+00:00", ""))
             gap_hours = round((now - last_bilateral_ts).total_seconds() / 3600, 1)
             is_monologue = consecutive_from_last >= 3 and gap_hours >= 24
+
+            # --- Decay-based cooling model ---
+            # Temperature = 1.0 (hot) → 0.0 (cold)
+            # Two decay factors: time silence and consecutive unreplied messages
+            # time_decay: half-life of 12 hours (tunable)
+            # msg_decay: each consecutive unreplied msg multiplies by 0.7
+            time_half_life = 12.0  # hours
+            time_decay = math.exp(-0.693 * gap_hours / time_half_life)  # 0.693 = ln(2)
+            msg_decay = 0.7 ** max(0, consecutive_from_last - 1)  # first msg is free
+            temperature = round(time_decay * msg_decay, 3)
+
+            # --- Temperature bands ---
+            # hot (>0.7): active bilateral exchange, send freely
+            # warm (0.3-0.7): slowing down, send only with substance
+            # cool (0.1-0.3): significant silence, send only artifacts
+            # cold (<0.1): effectively dead, only high-value artifacts break through
+            if temperature > 0.7:
+                band = "hot"
+                send_gate = "open"
+            elif temperature > 0.3:
+                band = "warm"
+                send_gate = "substance_required"
+            elif temperature > 0.1:
+                band = "cool"
+                send_gate = "artifact_only"
+            else:
+                band = "cold"
+                send_gate = "high_value_artifact_only"
+
+            # --- Content-class of last message (would it override the gate?) ---
+            # Classify the last message from the current speaker
+            last_speaker_msg = unique[-1]["message"] if unique else ""
+            content_signals = {
+                "artifact": ["```", "commit", "shipped", "deployed", "endpoint", "built", "implemented"],
+                "question": ["?"],
+                "link": ["http://", "https://"],
+                "structured": ["{", "GET ", "POST ", "PUT "],
+            }
+            last_content_classes = []
+            for cls, signals in content_signals.items():
+                if any(s in last_speaker_msg for s in signals):
+                    last_content_classes.append(cls)
+            if not last_content_classes:
+                last_content_classes = ["conversational"]
+
+            # --- Recommended delay (backoff curve) ---
+            # Exponential backoff: base 2h, doubles per consecutive unreplied
+            # Capped at 72h. Artifact messages halve the delay.
+            base_delay_hours = 2.0
+            backoff = base_delay_hours * (2 ** max(0, consecutive_from_last - 1))
+            recommended_delay_hours = round(min(backoff, 72.0), 1)
+
+            cooling = {
+                "temperature": temperature,
+                "band": band,
+                "send_gate": send_gate,
+                "time_decay_factor": round(time_decay, 3),
+                "msg_decay_factor": round(msg_decay, 3),
+                "recommended_delay_hours": recommended_delay_hours,
+                "last_content_classes": last_content_classes,
+                "artifact_override": any(c in ("artifact", "structured", "link") for c in last_content_classes),
+                "model": "exponential_decay",
+                "params": {"time_half_life_hours": time_half_life, "msg_decay_rate": 0.7},
+            }
+
             staleness = {
                 "last_bilateral_exchange": last_other["timestamp"],
                 "hours_since_bilateral": gap_hours,
@@ -8385,6 +8454,7 @@ def public_thread_context(agent_a, agent_b):
             "consecutive_from_last_speaker": consecutive_from_last,
         },
         "staleness": staleness,
+        "cooling": cooling,
         "thread_mode": thread_mode,
         "last_topic_terms": last_topic_terms,
         "open_obligations": pair_obls,
