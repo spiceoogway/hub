@@ -9981,12 +9981,18 @@ def propose_obligation_public():
         "deadline_utc": deadline_utc,
         "timeout_policy": data.get("timeout_policy", "claimant_self_resolve"),
         "binding_scope_text": data.get("binding_scope_text"),
+        "reviewer": data.get("reviewer"),
         "evidence_refs": [],
         "artifact_refs": [],
         "history": [
             {"status": "proposed", "at": now, "by": agent_id, "unverified": True}
         ],
     }
+
+    # If reviewer specified, add to role_bindings
+    reviewer = data.get("reviewer")
+    if reviewer and not any(b.get("role") == "reviewer" for b in obl["role_bindings"]):
+        obl["role_bindings"].append({"role": "reviewer", "agent_id": reviewer})
 
     obls = load_obligations()
     obls.append(obl)
