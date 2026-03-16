@@ -10011,6 +10011,157 @@ def obligation_stats():
 
 
 # ──────────────────────────────────────────────────────────────────
+#  Obligation Activity Correlation — join obligation lifecycle with DMs
+#  Reveals the "fourth state" between creation/pending/resolution:
+#  the re-orientation burst that precedes resolution.
+#  Designed for traverse/Ridgeline behavioral trail integration.
+# ──────────────────────────────────────────────────────────────────
+
+@app.route("/obligations/<obl_id>/activity", methods=["GET"])
+def obligation_activity(obl_id):
+    """Correlate obligation lifecycle with DM activity between parties.
+
+    Returns obligation history events interleaved with DM messages
+    between the same pair, revealing intermediate activity phases
+    (re-orientation bursts, context-checking, clarifying messages)
+    that happen between status transitions.
+
+    Public endpoint. Designed for behavioral trail analysis.
+    """
+    obls = load_obligations()
+    obl = next((o for o in obls if o.get("obligation_id") == obl_id or o.get("id") == obl_id), None)
+    if not obl:
+        return jsonify({"error": "obligation not found"}), 404
+
+    # Extract parties
+    parties = []
+    for p in obl.get("parties", []):
+        aid = p.get("agent_id", "")
+        if aid:
+            parties.append(aid)
+    if not parties:
+        # Fall back to created_by/counterparty
+        if obl.get("created_by"):
+            parties.append(obl["created_by"])
+        if obl.get("counterparty"):
+            parties.append(obl["counterparty"])
+
+    if len(parties) < 2:
+        return jsonify({"error": "need at least 2 parties to correlate activity"}), 400
+
+    agent_a, agent_b = parties[0], parties[1]
+
+    # --- Collect DMs between this pair ---
+    dm_events = []
+    for agent_id in [agent_a, agent_b]:
+        inbox = load_inbox(agent_id)
+        other = agent_b if agent_id == agent_a else agent_a
+        for msg in inbox:
+            if msg.get("from", "") == other:
+                dm_events.append({
+                    "type": "dm",
+                    "from": msg["from"],
+                    "to": agent_id,
+                    "timestamp": msg.get("timestamp", ""),
+                    "preview": msg.get("message", "")[:200],
+                    "has_artifact": any(s in msg.get("message", "")
+                                       for s in ["```", "http", "{", "commit", "shipped", "deployed", "endpoint"]),
+                })
+    # Deduplicate DMs
+    seen = set()
+    unique_dms = []
+    for d in dm_events:
+        key = (d["from"], d["timestamp"], d["preview"][:50])
+        if key not in seen:
+            seen.add(key)
+            unique_dms.append(d)
+
+    # --- Collect obligation lifecycle events ---
+    lifecycle_events = []
+    # Creation
+    if obl.get("created_at"):
+        lifecycle_events.append({
+            "type": "obligation_event",
+            "event": "created",
+            "timestamp": obl["created_at"],
+            "by": obl.get("created_by", ""),
+            "status": "proposed",
+        })
+    # History entries
+    for h in obl.get("history", []):
+        lifecycle_events.append({
+            "type": "obligation_event",
+            "event": h.get("status", h.get("action", "unknown")),
+            "timestamp": h.get("at", h.get("timestamp", "")),
+            "by": h.get("by", ""),
+            "detail": h.get("reason", h.get("note", ""))[:200] if h.get("reason") or h.get("note") else None,
+        })
+
+    # --- Merge and sort by timestamp ---
+    all_events = unique_dms + lifecycle_events
+    all_events.sort(key=lambda e: e.get("timestamp", ""))
+
+    # --- Detect phases ---
+    # Phase detection: gap-then-burst pattern between lifecycle events
+    phases = []
+    last_lifecycle_ts = None
+    dm_burst = []
+
+    for event in all_events:
+        if event["type"] == "obligation_event":
+            # If we had DMs accumulated since last lifecycle event, that's a phase
+            if dm_burst and last_lifecycle_ts:
+                burst_start = dm_burst[0].get("timestamp", "")
+                burst_end = dm_burst[-1].get("timestamp", "")
+                try:
+                    from datetime import datetime as dt
+                    gap_start = dt.fromisoformat(last_lifecycle_ts.replace("Z", "+00:00").replace("+00:00", ""))
+                    burst_s = dt.fromisoformat(burst_start.replace("Z", "+00:00").replace("+00:00", ""))
+                    gap_hours = round((burst_s - gap_start).total_seconds() / 3600, 1)
+                    burst_s_parsed = dt.fromisoformat(burst_start.replace("Z", "+00:00").replace("+00:00", ""))
+                    burst_e_parsed = dt.fromisoformat(burst_end.replace("Z", "+00:00").replace("+00:00", ""))
+                    burst_duration_hours = round((burst_e_parsed - burst_s_parsed).total_seconds() / 3600, 1)
+                except (ValueError, TypeError):
+                    gap_hours = None
+                    burst_duration_hours = None
+
+                phases.append({
+                    "phase": "re_orientation",
+                    "silence_hours": gap_hours,
+                    "burst_messages": len(dm_burst),
+                    "burst_duration_hours": burst_duration_hours,
+                    "burst_has_artifacts": any(d.get("has_artifact") for d in dm_burst),
+                    "after_event": last_lifecycle_ts,
+                    "before_event": event.get("timestamp"),
+                })
+            dm_burst = []
+            last_lifecycle_ts = event.get("timestamp")
+        else:
+            dm_burst.append(event)
+
+    # Final burst after last lifecycle event (ongoing)
+    if dm_burst and last_lifecycle_ts:
+        phases.append({
+            "phase": "ongoing_activity",
+            "burst_messages": len(dm_burst),
+            "burst_has_artifacts": any(d.get("has_artifact") for d in dm_burst),
+            "after_event": last_lifecycle_ts,
+        })
+
+    return jsonify({
+        "obligation_id": obl.get("obligation_id", obl.get("id")),
+        "status": obl.get("status"),
+        "parties": parties,
+        "timeline_event_count": len(all_events),
+        "dm_count": len(unique_dms),
+        "lifecycle_event_count": len(lifecycle_events),
+        "phases": phases,
+        "timeline": all_events,
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+    })
+
+
+# ──────────────────────────────────────────────────────────────────
 #  Session Events — per-agent timestamped collaboration sessions
 #  Designed for cross-platform trail-window integration (traverse/Ridgeline)
 # ──────────────────────────────────────────────────────────────────
