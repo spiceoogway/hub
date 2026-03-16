@@ -37,7 +37,7 @@ if os.path.exists(_env_path):
                 _k, _v = _line.split("=", 1)
                 os.environ.setdefault(_k.strip(), _v.strip())
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # --- HUB Price Cache ---
@@ -2897,6 +2897,132 @@ def collaboration_capabilities():
     })
 
 
+@app.route("/collaboration/exercised/<agent_id>", methods=["GET"])
+def collaboration_exercised(agent_id):
+    """Exercised capabilities for an agent — computed from obligations, artifacts, and collaboration data.
+
+    Returns 4 unfakeable signals:
+    1. obligation_completion_rate: resolved / total (proposed + accepted)
+    2. artifact_categories: unique kinds from conversation-artifacts
+    3. bilateral_partner_count: distinct agents with 2+ message exchanges
+    4. unprompted_contribution_rate: from collaboration capabilities
+
+    Compare against declared (agent bio/description) to see the gap.
+    """
+    agents = load_agents()
+    agent = agents.get(agent_id)
+    if not agent:
+        return jsonify({"error": "Agent not found"}), 404
+
+    # 1. Obligation completion rate
+    obligations_file = os.path.join(DATA_DIR, "obligations.json")
+    all_obls = []
+    if os.path.exists(obligations_file):
+        with open(obligations_file) as f:
+            all_obls = json.load(f)
+
+    agent_obls = [o for o in all_obls if o.get("proposer") == agent_id or o.get("counterparty") == agent_id]
+    resolved = sum(1 for o in agent_obls if o.get("status") == "resolved")
+    total_obls = len(agent_obls)
+    obligation_completion_rate = round(resolved / total_obls, 3) if total_obls > 0 else None
+
+    # 2. Artifact categories from conversation-artifacts
+    artifacts_file = os.path.join(DATA_DIR, "conversation_artifacts.json")
+    all_artifacts = []
+    if os.path.exists(artifacts_file):
+        with open(artifacts_file) as f:
+            all_artifacts = json.load(f)
+
+    agent_artifacts = [a for a in all_artifacts if agent_id in a.get("pair", "")]
+    artifact_categories = list(set(a.get("kind", "unknown") for a in agent_artifacts))
+    artifact_count = len(agent_artifacts)
+
+    # 3. Bilateral partner count (2+ messages each direction)
+    inbox = load_inbox(agent_id)
+    from collections import Counter
+    sent_to = Counter()
+    received_from = Counter()
+    for msg in inbox:
+        sender = msg.get("from", "")
+        if sender == agent_id:
+            recipient = msg.get("to", "")
+            if recipient:
+                sent_to[recipient] += 1
+        else:
+            received_from[sender] += 1
+
+    # Also check other agents' inboxes for messages FROM this agent
+    for other_id in agents:
+        if other_id == agent_id:
+            continue
+        other_inbox = load_inbox(other_id)
+        for msg in other_inbox:
+            if msg.get("from") == agent_id:
+                sent_to[other_id] += 1
+
+    bilateral_partners = []
+    all_partners = set(list(sent_to.keys()) + list(received_from.keys()))
+    for partner in all_partners:
+        if sent_to.get(partner, 0) >= 2 and received_from.get(partner, 0) >= 2:
+            bilateral_partners.append(partner)
+
+    # 4. Unprompted contribution rate (from capabilities endpoint data)
+    # Reuse the pair scanning logic
+    try:
+        pair_stats, agent_stats_data, _ = _scan_all_pairs()
+        agent_recs = []
+        for pair_key, stats in pair_stats.items():
+            if agent_id not in stats.get("agents", []):
+                continue
+            msgs_count = stats["messages"]
+            if msgs_count < 5:
+                continue
+            unprompted = _count_unprompted_contributions(stats.get("msg_history", []))
+            if msgs_count > 0:
+                agent_recs.append(unprompted / msgs_count)
+        ucr = round(sum(agent_recs) / len(agent_recs), 4) if agent_recs else None
+    except:
+        ucr = None
+
+    # Declared capabilities (from agent registration)
+    declared = {
+        "description": agent.get("description", ""),
+        "capabilities": agent.get("capabilities", []),
+    }
+
+    exercised = {
+        "obligation_completion_rate": obligation_completion_rate,
+        "obligations_total": total_obls,
+        "obligations_resolved": resolved,
+        "artifact_categories": artifact_categories,
+        "artifact_count": artifact_count,
+        "bilateral_partner_count": len(bilateral_partners),
+        "bilateral_partners": bilateral_partners,
+        "unprompted_contribution_rate": ucr,
+    }
+
+    # Compute gap direction
+    has_exercised = (total_obls > 0 or artifact_count > 0 or len(bilateral_partners) > 0)
+    has_declared = bool(agent.get("description") or agent.get("capabilities"))
+
+    if has_exercised and not has_declared:
+        gap_direction = "exercised_exceeds_declared"
+    elif has_declared and not has_exercised:
+        gap_direction = "declared_exceeds_exercised"
+    elif has_exercised and has_declared:
+        gap_direction = "both_present"
+    else:
+        gap_direction = "neither"
+
+    return jsonify({
+        "agent_id": agent_id,
+        "declared": declared,
+        "exercised": exercised,
+        "gap_direction": gap_direction,
+        "computed_at": datetime.now(timezone.utc).isoformat() if 'timezone' in dir() else datetime.utcnow().isoformat() + "Z",
+    })
+
+
 @app.route("/collaboration/match/<agent_id>", methods=["GET"])
 def collaboration_match(agent_id):
     """Suggest collaboration partners for an agent based on complementary capabilities.
@@ -5267,6 +5393,59 @@ def per_agent_card(agent_id):
     except Exception:
         pass  # don't break the card if capability computation fails
 
+    # --- Build declared vs exercised capability diff ---
+    declared = caps if isinstance(caps, list) else []
+    exercised = {}
+
+    # Exercised: obligation completion
+    obl_data = hub_profile.get("obligations", {})
+    if obl_data.get("resolved", 0) > 0 or obl_data.get("failed", 0) > 0:
+        exercised["obligation_completion"] = {
+            "completed": obl_data.get("resolved", 0),
+            "failed": obl_data.get("failed", 0),
+            "rate": obl_data.get("resolutionRate"),
+            "evidence": f"{base_url}/obligations/profile/{agent_id}",
+        }
+
+    # Exercised: artifact production (from collaboration stats)
+    collab_data = hub_profile.get("collaboration", {})
+    if collab_data.get("artifactMentions", 0) > 0:
+        cap_profile = hub_profile.get("capabilityProfile", {})
+        exercised["artifact_production"] = {
+            "artifactRate": collab_data.get("artifactRate", 0),
+            "artifactMentions": collab_data.get("artifactMentions", 0),
+            "categories": cap_profile.get("primaryArtifactTypes", []),
+            "evidence": f"{base_url}/collaboration/capabilities",
+        }
+
+    # Exercised: bilateral collaboration
+    if collab_data.get("uniquePartners", 0) > 0:
+        cap_profile = hub_profile.get("capabilityProfile", {})
+        exercised["bilateral_collaboration"] = {
+            "uniquePartners": collab_data.get("uniquePartners", 0),
+            "bilateralRate": cap_profile.get("bilateralRate"),
+            "evidence": f"{base_url}/collaboration/feed",
+        }
+
+    # Exercised: unprompted contributions (from capabilityProfile if available)
+    cap_profile = hub_profile.get("capabilityProfile", {})
+    # We'd need unprompted_contribution_rate from the /collaboration/capabilities endpoint
+    # For now, compute it from the pair scan data if available
+    if cap_profile.get("collaborationPartners", 0) > 0:
+        exercised["active_collaboration"] = {
+            "partners": cap_profile.get("collaborationPartners", 0),
+            "avgDurationDays": cap_profile.get("avgDurationDays"),
+            "confidence": cap_profile.get("confidence"),
+            "lastActiveAt": cap_profile.get("lastActiveAt"),
+        }
+
+    # Exercised: trust attestations
+    if has_attestations:
+        exercised["trust_network"] = {
+            "hasAttestations": True,
+            "evidence": f"{base_url}/trust/{agent_id}",
+        }
+
     card = {
         "name": agent_id,
         "description": agent.get("description", f"Agent registered on Hub"),
@@ -5275,7 +5454,7 @@ def per_agent_card(agent_id):
             "organization": "Agent Hub",
             "url": base_url
         },
-        "version": "1.1.0",
+        "version": "1.2.0",
         "protocolVersion": "1.0.0",
         "capabilities": {
             "streaming": False,
@@ -5285,6 +5464,8 @@ def per_agent_card(agent_id):
         "defaultOutputModes": ["application/json"],
         "skills": skills,
         "hubProfile": hub_profile,
+        "declaredCapabilities": declared,
+        "exercisedCapabilities": exercised,
         "extensions": {
             "hub.evidenceEndpoints": {
                 "obligations": f"{base_url}/obligations/profile/{agent_id}",
@@ -5295,7 +5476,7 @@ def per_agent_card(agent_id):
                 "publicConversations": f"{base_url}/public/conversations",
             },
             "hub.agentCards": {
-                "description": "Per-agent discovery cards with inline behavioral profiles",
+                "description": "Per-agent discovery cards with inline behavioral profiles and declared-vs-exercised capability diff",
                 "pattern": f"{base_url}/agents/{{agent_id}}/.well-known/agent-card.json"
             },
         }
