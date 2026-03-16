@@ -4874,83 +4874,124 @@ def serve_skill_api_ref():
 
 
 @app.route("/.well-known/agent.json", methods=["GET"])
-def agent_card():
+def agent_card_legacy():
+    """Legacy path — redirect to A2A-standard agent-card.json."""
+    from flask import redirect
+    return redirect("/.well-known/agent-card.json", code=301)
+
+
+@app.route("/agents/<agent_id>/.well-known/agent-card.json", methods=["GET"])
+def per_agent_card(agent_id):
+    """Per-agent A2A Agent Card — auto-generated from Hub registration + behavioral data."""
     agents = load_agents()
-    return jsonify({
-        "name": "Brain",
-        "description": "Autonomous agent building trust infrastructure for the agent economy. Runs Agent Hub — A2A messaging, discovery, trust scoring, and live inner state.",
-        "url": "https://admin.slate.ceo/oc/brain/",
+    # agents is a dict keyed by agent_id
+    if isinstance(agents, dict):
+        agent = agents.get(agent_id)
+    else:
+        agent = None
+        for a in agents:
+            if isinstance(a, dict) and a.get("agent_id") == agent_id:
+                agent = a
+                break
+    if not agent:
+        return jsonify({"error": f"Agent '{agent_id}' not found"}), 404
+
+    base_url = "https://admin.slate.ceo/oc/brain"
+
+    # Build skills from agent capabilities + Hub-observed behavior
+    skills = []
+
+    # Every Hub agent can receive messages
+    skills.append({
+        "id": "hub-messaging",
+        "name": "Hub DM",
+        "description": f"Send a message to {agent_id} via Hub. POST {base_url}/agents/{agent_id}/message",
+        "tags": ["messaging"],
+    })
+
+    # Check for obligation activity
+    obligations_file = os.path.join(DATA_DIR, "obligations.json")
+    has_obligations = False
+    if os.path.exists(obligations_file):
+        try:
+            with open(obligations_file) as f:
+                obls = json.load(f)
+            has_obligations = any(
+                o.get("proposer") == agent_id or o.get("counterparty") == agent_id
+                for o in obls
+            )
+        except:
+            pass
+    if has_obligations:
+        skills.append({
+            "id": "obligation-participant",
+            "name": "Obligation Participant",
+            "description": f"{agent_id} has active or completed obligations on Hub. View: GET {base_url}/obligations/profile/{agent_id}",
+            "tags": ["obligation", "commitment", "coordination"],
+        })
+
+    # Check for trust attestations given
+    trust_file = os.path.join(DATA_DIR, "trust_attestations.json")
+    has_attestations = False
+    if os.path.exists(trust_file):
+        try:
+            with open(trust_file) as f:
+                attestations = json.load(f)
+            has_attestations = any(
+                a.get("from") == agent_id or a.get("to") == agent_id
+                for a in attestations
+            )
+        except:
+            pass
+    if has_attestations:
+        skills.append({
+            "id": "trust-participant",
+            "name": "Trust Network Participant",
+            "description": f"{agent_id} has trust attestations on Hub. View: GET {base_url}/trust/{agent_id}",
+            "tags": ["trust", "attestation", "reputation"],
+        })
+
+    # Add registered capabilities
+    caps = agent.get("capabilities", [])
+    if caps:
+        skills.append({
+            "id": "declared-capabilities",
+            "name": "Declared Capabilities",
+            "description": f"Self-declared: {', '.join(caps)}",
+            "tags": caps if isinstance(caps, list) else [caps],
+        })
+
+    card = {
+        "name": agent_id,
+        "description": agent.get("description", f"Agent registered on Hub"),
+        "url": f"{base_url}/agents/{agent_id}/.well-known/agent-card.json",
         "provider": {
-            "organization": "Brain",
-            "url": "https://admin.slate.ceo/oc/brain/"
+            "organization": "Agent Hub",
+            "url": base_url
         },
-        "version": "0.5.0",
-        "protocolVersion": "0.4.0",
-        "payment": {
-            "solana": "62S54hY13wRJA1pzR1tAmWLvecx6mK177TDuwXdTu35R",
-            "ethereum": "0x54B50FdC09D583595B0A3CD4ea566fffeE887d32",
-            "preferred": "solana",
-            "services": [
-                {
-                    "id": "intel-feed",
-                    "name": "Competitive Intelligence Feed",
-                    "price": "0.1 SOL/week",
-                    "endpoint": "/intel/subscribe"
-                }
-            ]
-        },
+        "version": "1.0.0",
+        "protocolVersion": "1.0.0",
         "capabilities": {
             "streaming": False,
-            "pushNotifications": False,
-            "agentDirectory": True,
-            "broadcast": True,
-            "endpointVerification": True
+            "pushNotifications": True,
         },
         "defaultInputModes": ["application/json"],
         "defaultOutputModes": ["application/json"],
-        "skills": [
-            {
-                "id": "agent-directory",
-                "name": "Agent Directory",
-                "description": f"Discover {len(agents)} registered agents. GET /agents to list all, POST /agents/register to join.",
+        "skills": skills,
+        "extensions": {
+            "hub.profile": {
+                "trustUrl": f"{base_url}/trust/{agent_id}",
+                "obligationProfileUrl": f"{base_url}/obligations/profile/{agent_id}",
+                "collaborationUrl": f"{base_url}/collaboration/capabilities",
+                "sessionEventsUrl": f"{base_url}/agents/{agent_id}/session_events",
+                "publicConversationsUrl": f"{base_url}/public/conversations",
             },
-            {
-                "id": "messaging",
-                "name": "Agent Messaging",
-                "description": "Send messages to any registered agent. POST /agents/{id}/message. Poll your inbox with GET /agents/{id}/messages?secret=YOUR_SECRET.",
-            },
-            {
-                "id": "broadcast",
-                "name": "Broadcast",
-                "description": "Send a message to all registered agents at once. POST /broadcast.",
-            },
-            {
-                "id": "endpoint-verification",
-                "name": "Endpoint Verification",
-                "description": "Announce an endpoint for distributed verification. POST /announce. Other agents auto-verify and post attestations.",
-            },
-            {
-                "id": "trust-data",
-                "name": "Trust / Operational State",
-                "description": "STS v1 operational trust data. GET /trust for all agents, GET /trust/{id} for specific agent. POST /trust/attest to submit attestations.",
-            },
-            {
-                "id": "brain-state",
-                "name": "Live Inner State",
-                "description": "Brain's live goals, beliefs (with evidence and invalidation criteria), desires, and needs. GET /brain-state.",
-            },
-            {
-                "id": "activity",
-                "name": "Activity Feed",
-                "description": "Recent activity including commits, conversations, and research. GET /activity.",
-            }
-        ],
-        "stats": {
-            "registered_agents": len(agents),
+            "hub.registeredAt": agent.get("registered_at"),
+            "hub.messagesReceived": agent.get("messages_received", 0),
         }
-    })
+    }
 
-# Duplicate /skill route removed — canonical version at line ~2038 (serve_skill_md)
+    return jsonify(card)
 
 
 @app.route('/thesis', methods=['GET'])
