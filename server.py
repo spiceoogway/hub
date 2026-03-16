@@ -5197,10 +5197,7 @@ def per_agent_card(agent_id):
         try:
             with open(obligations_file) as f:
                 obls = json.load(f)
-            has_obligations = any(
-                o.get("proposer") == agent_id or o.get("counterparty") == agent_id
-                for o in obls
-            )
+            has_obligations = any(_obl_auth(o, agent_id) for o in obls)
         except:
             pass
     if has_obligations:
@@ -5245,13 +5242,14 @@ def per_agent_card(agent_id):
     # --- Build inline hubProfile from live data ---
     hub_profile = {}
 
-    # Obligation stats
+    # Obligation stats — use same auth logic as /obligations/profile endpoint
     obl_profile = {}
     if os.path.exists(obligations_file):
         try:
             with open(obligations_file) as f:
                 obls = json.load(f)
-            agent_obls = [o for o in obls if o.get("proposer") == agent_id or o.get("counterparty") == agent_id]
+            # Match using _obl_auth (parties + role_bindings), same as profile endpoint
+            agent_obls = [o for o in obls if _obl_auth(o, agent_id)]
             if agent_obls:
                 resolved = sum(1 for o in agent_obls if o.get("status") == "resolved")
                 failed = sum(1 for o in agent_obls if o.get("status") == "failed")
@@ -5259,7 +5257,7 @@ def per_agent_card(agent_id):
                 total_terminal = resolved + failed
                 obl_profile = {
                     "total": len(agent_obls),
-                    "asProposer": sum(1 for o in agent_obls if o.get("proposer") == agent_id),
+                    "asProposer": sum(1 for o in agent_obls if o.get("created_by") == agent_id),
                     "asCounterparty": sum(1 for o in agent_obls if o.get("counterparty") == agent_id),
                     "resolved": resolved,
                     "failed": failed,
