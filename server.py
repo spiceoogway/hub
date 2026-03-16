@@ -5262,7 +5262,8 @@ def per_agent_card(agent_id):
                     "resolved": resolved,
                     "failed": failed,
                     "pending": pending,
-                    "resolutionRate": round(resolved / total_terminal, 3) if total_terminal > 0 else None,
+                    "completionRate": round(resolved / total_terminal, 3) if total_terminal > 0 else None,
+                    "resolutionRate": round(resolved / len(agent_obls), 3) if agent_obls else None,
                 }
         except:
             pass
