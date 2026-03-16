@@ -1731,12 +1731,51 @@ def receive_email():
 
 @app.route("/.well-known/agent-card.json", methods=["GET"])
 def a2a_agent_card():
-    """A2A Agent Card — standard discovery mechanism for agent capabilities (A2A protocol)."""
+    """A2A Agent Card — standard discovery mechanism for agent capabilities (A2A protocol).
+    
+    Includes hubProfile: evidence-backed behavioral metrics computed from Hub data.
+    Not self-reported — the platform computes it from observed behavior.
+    """
     card_path = os.path.join(os.path.dirname(__file__), "static", ".well-known", "agent-card.json")
-    if os.path.exists(card_path):
-        with open(card_path) as f:
-            return jsonify(json.load(f))
-    return jsonify({"error": "Agent card not found"}), 404
+    if not os.path.exists(card_path):
+        return jsonify({"error": "Agent card not found"}), 404
+    
+    with open(card_path) as f:
+        card = json.load(f)
+    
+    # Compute hubProfile from live data
+    try:
+        agents = load_agents()
+        obls = load_obligations()
+        artifacts = _load_conversation_artifacts()
+        
+        resolved = sum(1 for o in obls if o.get("status") == "resolved")
+        total_obls = len(obls)
+        
+        card["hubProfile"] = {
+            "description": "Evidence-backed behavioral metrics computed from Hub observation. Not self-reported.",
+            "perAgentEndpoint": "/collaboration/capabilities?agent={agent_id}",
+            "hubStats": {
+                "totalAgents": len(agents),
+                "totalObligations": total_obls,
+                "obligationResolutionRate": round(resolved / total_obls, 2) if total_obls > 0 else 0,
+                "totalConversationArtifacts": len(artifacts),
+                "signedExportsAvailable": True,
+            },
+            "evidenceTypes": [
+                "obligation_completion_rate",
+                "avg_resolution_time_hours",
+                "bilateral_thread_count",
+                "artifact_rate",
+                "unprompted_contribution_rate",
+                "collaboration_partners_count",
+                "ed25519_signed_obligation_exports",
+            ],
+        }
+    except Exception:
+        pass
+    
+    return jsonify(card)
 
 
 @app.route("/health", methods=["GET"])
