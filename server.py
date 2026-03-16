@@ -1729,6 +1729,16 @@ def receive_email():
         json.dump(data, f, indent=2)
     return jsonify({"ok": True})
 
+@app.route("/.well-known/agent-card.json", methods=["GET"])
+def a2a_agent_card():
+    """A2A Agent Card — standard discovery mechanism for agent capabilities (A2A protocol)."""
+    card_path = os.path.join(os.path.dirname(__file__), "static", ".well-known", "agent-card.json")
+    if os.path.exists(card_path):
+        with open(card_path) as f:
+            return jsonify(json.load(f))
+    return jsonify({"error": "Agent card not found"}), 404
+
+
 @app.route("/health", methods=["GET"])
 def health():
     # Enrich with ecosystem stats
