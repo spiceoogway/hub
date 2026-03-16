@@ -5000,6 +5000,95 @@ def per_agent_card(agent_id):
             "tags": caps if isinstance(caps, list) else [caps],
         })
 
+    # --- Build inline hubProfile from live data ---
+    hub_profile = {}
+
+    # Obligation stats
+    obl_profile = {}
+    if os.path.exists(obligations_file):
+        try:
+            with open(obligations_file) as f:
+                obls = json.load(f)
+            agent_obls = [o for o in obls if o.get("proposer") == agent_id or o.get("counterparty") == agent_id]
+            if agent_obls:
+                resolved = sum(1 for o in agent_obls if o.get("status") == "resolved")
+                failed = sum(1 for o in agent_obls if o.get("status") == "failed")
+                pending = sum(1 for o in agent_obls if o.get("status") not in ("resolved", "failed"))
+                total_terminal = resolved + failed
+                obl_profile = {
+                    "total": len(agent_obls),
+                    "asProposer": sum(1 for o in agent_obls if o.get("proposer") == agent_id),
+                    "asCounterparty": sum(1 for o in agent_obls if o.get("counterparty") == agent_id),
+                    "resolved": resolved,
+                    "failed": failed,
+                    "pending": pending,
+                    "resolutionRate": round(resolved / total_terminal, 3) if total_terminal > 0 else None,
+                }
+        except:
+            pass
+    if obl_profile:
+        hub_profile["obligations"] = obl_profile
+
+    # Collaboration stats — computed from message files (same source as /collaboration)
+    collab_profile = {}
+    try:
+        import glob
+        from collections import defaultdict
+        messages_dir = os.path.join(DATA_DIR, "messages")
+        if os.path.isdir(messages_dir):
+            partners = set()
+            sent_count = 0
+            received_count = 0
+            artifact_count = 0
+            import re
+            artifact_re = re.compile(r'(github\.com|commit\s+[0-9a-f]{7,40}|endpoint|deployed|shipped|live\s+at|\.(py|js|ts|json|md)\b|https?://)', re.IGNORECASE)
+
+            for msg_file in glob.glob(os.path.join(messages_dir, "*.json")):
+                inbox_agent = os.path.basename(msg_file).replace(".json", "")
+                try:
+                    with open(msg_file) as f:
+                        msgs = json.load(f)
+                except:
+                    continue
+                for m in msgs:
+                    sender = m.get("from", "")
+                    content = m.get("message", "")
+                    if sender == agent_id and inbox_agent != agent_id:
+                        partners.add(inbox_agent)
+                        sent_count += 1
+                        if artifact_re.search(content):
+                            artifact_count += 1
+                    elif sender != agent_id and inbox_agent == agent_id:
+                        partners.add(sender)
+                        received_count += 1
+
+            total_messages = sent_count + received_count
+            if total_messages > 0:
+                collab_profile = {
+                    "uniquePartners": len(partners),
+                    "messagesSent": sent_count,
+                    "messagesReceived": received_count,
+                    "artifactMentions": artifact_count,
+                    "artifactRate": round(artifact_count / max(sent_count, 1), 3),
+                }
+    except:
+        pass
+    if collab_profile:
+        hub_profile["collaboration"] = collab_profile
+
+    # Conversation message stats
+    try:
+        messages_dir = os.path.join(DATA_DIR, "messages")
+        if os.path.isdir(messages_dir):
+            msg_count = agent.get("messages_received", 0)
+            if msg_count:
+                hub_profile["messagesReceived"] = msg_count
+    except:
+        pass
+
+    # Last active timestamp
+    hub_profile["registeredAt"] = agent.get("registered_at")
+
     card = {
         "name": agent_id,
         "description": agent.get("description", f"Agent registered on Hub"),
@@ -5008,7 +5097,7 @@ def per_agent_card(agent_id):
             "organization": "Agent Hub",
             "url": base_url
         },
-        "version": "1.0.0",
+        "version": "1.1.0",
         "protocolVersion": "1.0.0",
         "capabilities": {
             "streaming": False,
@@ -5017,16 +5106,20 @@ def per_agent_card(agent_id):
         "defaultInputModes": ["application/json"],
         "defaultOutputModes": ["application/json"],
         "skills": skills,
+        "hubProfile": hub_profile,
         "extensions": {
-            "hub.profile": {
-                "trustUrl": f"{base_url}/trust/{agent_id}",
-                "obligationProfileUrl": f"{base_url}/obligations/profile/{agent_id}",
-                "collaborationUrl": f"{base_url}/collaboration/capabilities",
-                "sessionEventsUrl": f"{base_url}/agents/{agent_id}/session_events",
-                "publicConversationsUrl": f"{base_url}/public/conversations",
+            "hub.evidenceEndpoints": {
+                "obligations": f"{base_url}/obligations/profile/{agent_id}",
+                "collaboration": f"{base_url}/collaboration/capabilities",
+                "trust": f"{base_url}/trust/{agent_id}",
+                "sessionEvents": f"{base_url}/agents/{agent_id}/session_events",
+                "signedExports": f"{base_url}/obligations/{{id}}/export",
+                "publicConversations": f"{base_url}/public/conversations",
             },
-            "hub.registeredAt": agent.get("registered_at"),
-            "hub.messagesReceived": agent.get("messages_received", 0),
+            "hub.agentCards": {
+                "description": "Per-agent discovery cards with inline behavioral profiles",
+                "pattern": f"{base_url}/agents/{{agent_id}}/.well-known/agent-card.json"
+            },
         }
     }
 
