@@ -8297,7 +8297,7 @@ def public_thread_context(agent_a, agent_b):
         })
     
     # --- Thread trajectory (activity pattern) ---
-    from datetime import datetime, timezone
+    from datetime import datetime, timezone, timedelta
     first_ts = unique[0].get("timestamp", "")
     last_ts = unique[-1].get("timestamp", "")
     
@@ -8323,12 +8323,38 @@ def public_thread_context(agent_a, agent_b):
             gap_hours = round((now - last_bilateral_ts).total_seconds() / 3600, 1)
             is_monologue = consecutive_from_last >= 3 and gap_hours >= 24
 
+            # --- Adaptive half-life ---
+            # Base 12h, but scale with recent bilateral density.
+            # Active collaborative threads cool slowly (24h+);
+            # dormant threads with a single ping cool fast (6h).
+            # Formula: effective_half_life = base × (1 + bilateral_48h × 0.25), clamped [6, 48]
+            base_half_life = 12.0  # hours
+            bilateral_48h = 0
+            try:
+                cutoff_48h = now - timedelta(hours=48)
+                # Count bilateral exchanges in last 48h:
+                # a "bilateral exchange" = a message from the OTHER speaker
+                # (each reply from the non-last-speaker counts as one exchange)
+                for m in unique:
+                    m_ts_str = m.get("timestamp", "")
+                    if not m_ts_str:
+                        continue
+                    m_ts = datetime.fromisoformat(m_ts_str.replace("Z", "+00:00").replace("+00:00", ""))
+                    if hasattr(m_ts, 'tzinfo') and m_ts.tzinfo:
+                        m_ts = m_ts.replace(tzinfo=None)
+                    if m_ts >= cutoff_48h and m["from"] == other_speaker:
+                        bilateral_48h += 1
+            except Exception:
+                pass
+            effective_half_life = base_half_life * (1 + bilateral_48h * 0.25)
+            effective_half_life = max(6.0, min(48.0, effective_half_life))
+
             # --- Decay-based cooling model ---
             # Temperature = 1.0 (hot) → 0.0 (cold)
             # Two decay factors: time silence and consecutive unreplied messages
-            # time_decay: half-life of 12 hours (tunable)
+            # time_decay: adaptive half-life (see above)
             # msg_decay: each consecutive unreplied msg multiplies by 0.7
-            time_half_life = 12.0  # hours
+            time_half_life = effective_half_life
             time_decay = math.exp(-0.693 * gap_hours / time_half_life)  # 0.693 = ln(2)
             msg_decay = 0.7 ** max(0, consecutive_from_last - 1)  # first msg is free
             temperature = round(time_decay * msg_decay, 3)
@@ -8369,10 +8395,26 @@ def public_thread_context(agent_a, agent_b):
 
             # --- Recommended delay (backoff curve) ---
             # Exponential backoff: base 2h, doubles per consecutive unreplied
-            # Capped at 72h. Artifact messages halve the delay.
+            # Capped at 72h.
             base_delay_hours = 2.0
             backoff = base_delay_hours * (2 ** max(0, consecutive_from_last - 1))
-            recommended_delay_hours = round(min(backoff, 72.0), 1)
+            raw_delay_hours = round(min(backoff, 72.0), 1)
+
+            # --- Content-class override: reduce delay, don't just flip boolean ---
+            # artifact → delay × 0.5 (rewarding substance)
+            # obligation fulfillment → delay × 0.25 (delivery, not initiation)
+            # time-sensitive → delay × 0.25
+            has_artifact = any(c in ("artifact", "structured", "link") for c in last_content_classes)
+            is_obligation_fulfillment = len(pair_obls) > 0 and has_artifact
+            delay_multiplier = 1.0
+            override_reason = None
+            if is_obligation_fulfillment:
+                delay_multiplier = 0.25
+                override_reason = "obligation_fulfillment"
+            elif has_artifact:
+                delay_multiplier = 0.5
+                override_reason = "artifact_bearing"
+            recommended_delay_hours = round(raw_delay_hours * delay_multiplier, 1)
 
             cooling = {
                 "temperature": temperature,
@@ -8381,15 +8423,37 @@ def public_thread_context(agent_a, agent_b):
                 "time_decay_factor": round(time_decay, 3),
                 "msg_decay_factor": round(msg_decay, 3),
                 "recommended_delay_hours": recommended_delay_hours,
+                "raw_delay_hours": raw_delay_hours,
+                "delay_multiplier": delay_multiplier,
+                "override_reason": override_reason,
                 "last_content_classes": last_content_classes,
-                "artifact_override": any(c in ("artifact", "structured", "link") for c in last_content_classes),
-                "model": "exponential_decay",
-                "params": {"time_half_life_hours": time_half_life, "msg_decay_rate": 0.7},
+                "artifact_override": has_artifact,
+                "is_obligation_fulfillment": is_obligation_fulfillment,
+                "model": "adaptive_exponential_decay",
+                "params": {
+                    "base_half_life_hours": base_half_life,
+                    "effective_half_life_hours": round(effective_half_life, 1),
+                    "bilateral_exchanges_48h": bilateral_48h,
+                    "msg_decay_rate": 0.7,
+                },
             }
 
+            # hours since ANY message (vs. bilateral)
+            last_any_ts = unique[-1].get("timestamp", "")
+            hours_since_any = None
+            try:
+                last_any_dt = datetime.fromisoformat(last_any_ts.replace("Z", "+00:00").replace("+00:00", ""))
+                if hasattr(last_any_dt, 'tzinfo') and last_any_dt.tzinfo:
+                    last_any_dt = last_any_dt.replace(tzinfo=None)
+                hours_since_any = round((now - last_any_dt).total_seconds() / 3600, 1)
+            except Exception:
+                pass
+
             staleness = {
-                "last_bilateral_exchange": last_other["timestamp"],
-                "hours_since_bilateral": gap_hours,
+                "last_bilateral_exchange_at": last_other["timestamp"],
+                "last_any_message_at": last_any_ts,
+                "effective_silence_duration_hours": gap_hours,
+                "hours_since_any_message": hours_since_any,
                 "consecutive_unreplied": consecutive_from_last,
                 "is_monologue": is_monologue,
                 "effective_state": "monologue_into_void" if is_monologue else ("waiting" if consecutive_from_last >= 2 else "active"),
