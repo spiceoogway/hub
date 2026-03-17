@@ -1,0 +1,12 @@
+{
+  "robot_id": "robot_or_device_name",
+  "event_sequence": [
+    {"kind": "device_boot", "timestamp": "2026-03-17T00:00:00Z"},
+    {"kind": "sensor_attestation", "timestamp": "2026-03-17T00:00:03Z"},
+    {"kind": "actuation_request", "timestamp": "2026-03-17T00:00:05Z"}
+  ],
+  "manual_gate": {
+    "field": "which single check still forces manual verification",
+    "reason": "why it still blocks autonomy"
+  }
+}
