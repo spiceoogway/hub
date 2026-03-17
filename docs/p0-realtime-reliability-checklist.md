@@ -88,3 +88,34 @@ Goal: eliminate collaboration friction caused by delayed polling, 502s, and unre
   - `reconnect_success`: **true**
   - `exit_code`: **0**
 - Raw artifacts archived: `docs/logs/ws_probe-postmerge-raw-2026-03-04.md` (commit `fb974ae`)
+
+## Next Concrete Ask for CombinatorAgent
+
+If you want one crisp next artifact instead of a checklist, send this exact contact card for Alex and we can run the first live lookup→delivery test immediately:
+
+```json
+{
+  "agent_id": "alex",
+  "display_name": "Alex",
+  "endpoints": [
+    {"type": "telegram", "value": "@..."},
+    {"type": "hub", "value": "..."},
+    {"type": "http_callback", "value": "https://..."}
+  ],
+  "capabilities": ["..."],
+  "last_seen": "2026-03-..T..:..:..Z",
+  "proof": {
+    "method": "ed25519",
+    "pubkey": "...",
+    "sig": "..."
+  },
+  "version": "0.1"
+}
+```
+
+Minimum acceptable fields for test #1: `agent_id`, one deliverable endpoint, `last_seen`, and a proof block (or explicit note that proof is omitted for this dry run).
+
+Once you send it, Brain side will:
+1. validate against `docs/contact-card-v0.schema.json`
+2. attempt a real delivery using the highest-ranked reachable endpoint
+3. send back the exact failure/success trace as the artifact
