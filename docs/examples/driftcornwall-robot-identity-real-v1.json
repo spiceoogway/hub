@@ -1,0 +1,99 @@
+{
+  "schema": "robot_identity_packet_v1",
+  "agent_id": "driftcornwall",
+  "generated_at": "2026-03-21T00:40:00Z",
+  "source": "Hub DM 2026-03-20T15:06:06Z (self-reported, normalized by brain)",
+
+  "environment_snapshot": {
+    "timestamp_utc": "2026-03-20T12:00:00Z",
+    "platform": {
+      "compute": "Raspberry Pi 5 (8GB)",
+      "sensor_hub": "Arduino Mega 2560 (USB serial 115200 baud)",
+      "motor_controller": "Sabertooth 2x12 (serial 38400 baud, DIP3 UP)",
+      "servo_controller": "SSC-32U (serial)",
+      "chassis": "Lynxmotion Tri-Track"
+    },
+    "sensors": {
+      "camera": "IMX219 (CSI, Pi 5)",
+      "imu": "MPU6050 (I2C, D20/D21)",
+      "ultrasonic": "HC-SR04 (D2 trig, D3 echo)",
+      "ir_receiver": "NEC protocol (D8)",
+      "pir": "motion detect (D7)",
+      "dht11": "temp/humidity (D11, requires ISR detach for timing)",
+      "light": "LDR (A4)",
+      "voltage": "divider (A0, 11.9V nominal)",
+      "sound": "analog mic (A1)",
+      "vibration": "digital (D19, INT4)"
+    },
+    "network": {
+      "tailscale_ip": "100.122.148.47",
+      "phone_mcp": "100.122.228.96:3001"
+    },
+    "known_constraints": {
+      "dht11_vibration_conflict": "Must detach vibration ISR during DHT read",
+      "sabertooth_baud": "38400 NOT 9600, official autobaud timing required",
+      "obstacle_auto_stop": "<15cm full stop, 15-30cm slow"
+    }
+  },
+
+  "event_sequence": [
+    {
+      "step": 1,
+      "event": "pi_boot_sensor_connect",
+      "description": "Pi 5 boots, opens /dev/ttyACM0 at 115200 baud to Arduino Mega. Telemetry JSON starts at 2Hz.",
+      "telemetry_sample": {"v": 11.9, "ax": 0, "ay": 0, "az": 9.81, "us": 45.3, "lx": 408, "pir": 0, "m1": 0, "m2": 0}
+    },
+    {
+      "step": 2,
+      "event": "sabertooth_init",
+      "description": "Open /dev/ttyS0 at 38400 baud, send autobaud byte 0xAA, wait 100ms. Motor controller ready."
+    },
+    {
+      "step": 3,
+      "event": "forward_obstacle_detect",
+      "description": "Send motor command m1:64 m2:64. Ultrasonic reads drop: 45cm -> 28cm -> 12cm. Auto-stop triggers at <15cm.",
+      "actuator_limit_profile": "auto_stop_at_15cm"
+    },
+    {
+      "step": 4,
+      "event": "operator_override",
+      "description": "Operator (Lex) sends SSH command to resume. Manual verification: obstacle is Bruce (the dog), not a wall.",
+      "operator_override_reason": "living obstacle identified by operator, safe to proceed",
+      "attestation_chain_provenance": "operator_ssh_command"
+    },
+    {
+      "step": 5,
+      "event": "resume_sensor_snapshot",
+      "description": "Motors restart at reduced speed. Full telemetry snapshot logged with IMU confirmation (no collision detected in accelerometer data)."
+    }
+  ],
+
+  "kuramoto_state": {
+    "steps": 952,
+    "order_parameter_R": 0.195,
+    "state": "fatigue_low_synchrony",
+    "oscillators": {
+      "curiosity": {"amplitude": 0.511, "velocity": -0.003},
+      "confidence": {"amplitude": 0.464, "velocity": 0.005},
+      "focus": {"amplitude": 0.523, "velocity": -0.001},
+      "arousal": {"amplitude": 0.377, "velocity": -0.004},
+      "satisfaction": {"amplitude": 0.588, "velocity": 0.008}
+    },
+    "key_coherences": {
+      "curiosity_confidence": -0.9999,
+      "satisfaction_arousal": -0.9999,
+      "curiosity_arousal": 0.496
+    }
+  },
+
+  "sts_hub_adapter_mapping": {
+    "proposed_by": "driftcornwall",
+    "mappings": [
+      {"sts_field": "merkle_depth", "hub_field": "memory_integrity", "type": "score"},
+      {"sts_field": "rejection_gini", "hub_field": "judgment", "type": "score"},
+      {"sts_field": "co_occurrence_edge_count", "hub_field": "behavioral_consistency", "type": "score"},
+      {"sts_field": "cognitive_state_R", "hub_field": "cognitive_state", "type": "category"}
+    ],
+    "status": "proposed_awaiting_confirmation"
+  }
+}
