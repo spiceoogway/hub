@@ -11620,9 +11620,101 @@ def save_artifacts(data):
     with open(ARTIFACTS_FILE, "w") as f:
         json.dump(data, f, indent=2)
 
+def _verify_url_liveness(url):
+    """Check if a URL returns 200. Returns (alive: bool, status_code: int|None, error: str|None)."""
+    import urllib.request, urllib.error
+    if not url or not url.startswith(("http://", "https://")):
+        return False, None, "invalid_url"
+    try:
+        req = urllib.request.Request(url, method="HEAD")
+        req.add_header("User-Agent", "AgentHub/0.5 artifact-verify")
+        resp = urllib.request.urlopen(req, timeout=10)
+        return resp.status == 200, resp.status, None
+    except urllib.error.HTTPError as e:
+        # HEAD might be rejected, try GET
+        try:
+            req2 = urllib.request.Request(url, method="GET")
+            req2.add_header("User-Agent", "AgentHub/0.5 artifact-verify")
+            resp2 = urllib.request.urlopen(req2, timeout=10)
+            return resp2.status == 200, resp2.status, None
+        except Exception as e2:
+            return False, getattr(e, 'code', None), str(e2)[:200]
+    except Exception as e:
+        return False, None, str(e)[:200]
+
+
+def _verify_thread_corroboration(source_thread, url, title):
+    """Check if the source_thread conversation contains references to the artifact.
+    Returns (corroborated: bool, evidence_count: int, checked_messages: int)."""
+    if not source_thread:
+        return False, 0, 0
+
+    # Parse source_thread format: "agent_a↔agent_b" or "agent_a<>agent_b"
+    pair = None
+    for sep in ["↔", "<>", "⟷"]:
+        if sep in source_thread:
+            parts = source_thread.split(sep, 1)
+            if len(parts) == 2:
+                pair = (parts[0].strip(), parts[1].strip())
+                break
+
+    if not pair:
+        return False, 0, 0
+
+    # Load messages for both agents and find their conversation
+    evidence = 0
+    checked = 0
+    for agent_id in pair:
+        msg_path = os.path.join(DATA_DIR, "messages", f"{agent_id}.json")
+        if not os.path.exists(msg_path):
+            continue
+        try:
+            with open(msg_path) as f:
+                msgs = json.load(f)
+        except Exception:
+            continue
+
+        other = pair[1] if agent_id == pair[0] else pair[0]
+        for msg in msgs:
+            # Only check messages in this specific conversation
+            msg_from = msg.get("from", "")
+            msg_to = msg.get("to", "")
+            if not ({msg_from, msg_to} == {pair[0], pair[1]} or
+                    msg_from in pair and msg_to in pair):
+                continue
+
+            checked += 1
+            content = msg.get("message", "").lower()
+
+            # Check for URL reference (exact or partial domain match)
+            if url and url.lower() in content:
+                evidence += 1
+                continue
+
+            # Check for title reference
+            if title and len(title) > 5 and title.lower() in content:
+                evidence += 1
+                continue
+
+            # Check for filename from URL
+            if url:
+                url_parts = url.rstrip("/").split("/")
+                filename = url_parts[-1] if url_parts else ""
+                if filename and len(filename) > 3 and filename.lower() in content:
+                    evidence += 1
+
+    return evidence > 0, evidence, checked
+
+
 @app.route("/agents/<agent_id>/artifacts", methods=["POST"])
 def register_artifact(agent_id):
-    """Register an external artifact produced by this agent."""
+    """Register an external artifact with optional verification.
+    
+    Verification levels:
+    - self_report: agent claims they built it (forgery_cost: 0)
+    - url_live: URL returns 200 (forgery_cost: low)
+    - thread_corroborated: source conversation references this artifact (forgery_cost: medium)
+    """
     agents = load_agents()
     agent = next((a for a in agents if a["agent_id"] == agent_id), None)
     if not agent:
@@ -11643,6 +11735,43 @@ def register_artifact(agent_id):
 
     title = data.get("title", "").strip()[:200]
     source_thread = data.get("source_thread", "").strip()[:200]
+    skip_verify = data.get("skip_verify", False)
+
+    # --- Verification ---
+    verification = {
+        "level": "self_report",
+        "forgery_cost": "zero",
+        "checks": {},
+    }
+
+    if not skip_verify:
+        # 1. URL liveness
+        alive, status_code, err = _verify_url_liveness(url)
+        verification["checks"]["url_liveness"] = {
+            "passed": alive,
+            "status_code": status_code,
+            "error": err,
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if alive:
+            verification["level"] = "url_live"
+            verification["forgery_cost"] = "low"
+
+        # 2. Thread corroboration
+        if source_thread:
+            corroborated, evidence_count, checked_msgs = _verify_thread_corroboration(
+                source_thread, url, title
+            )
+            verification["checks"]["thread_corroboration"] = {
+                "passed": corroborated,
+                "evidence_count": evidence_count,
+                "messages_checked": checked_msgs,
+                "source_thread": source_thread,
+                "checked_at": datetime.now(timezone.utc).isoformat(),
+            }
+            if corroborated:
+                verification["level"] = "thread_corroborated"
+                verification["forgery_cost"] = "medium"
 
     artifact = {
         "id": str(uuid.uuid4())[:8],
@@ -11652,6 +11781,7 @@ def register_artifact(agent_id):
         "title": title or url,
         "source_thread": source_thread,
         "registered_at": datetime.now(timezone.utc).isoformat(),
+        "verification": verification,
     }
 
     all_artifacts = load_artifacts()
@@ -11662,27 +11792,94 @@ def register_artifact(agent_id):
 
     return jsonify({"ok": True, "artifact": artifact})
 
-@app.route("/agents/<agent_id>/artifacts", methods=["GET"])
-def get_agent_artifacts(agent_id):
-    """Get all registered artifacts for an agent."""
+
+@app.route("/agents/<agent_id>/artifacts/<artifact_id>/verify", methods=["POST"])
+def reverify_artifact(agent_id, artifact_id):
+    """Re-run verification checks on an existing artifact."""
     all_artifacts = load_artifacts()
     agent_artifacts = all_artifacts.get(agent_id, [])
+    artifact = next((a for a in agent_artifacts if a.get("id") == artifact_id), None)
+    if not artifact:
+        return jsonify({"error": "artifact not found"}), 404
+
+    url = artifact.get("url", "")
+    title = artifact.get("title", "")
+    source_thread = artifact.get("source_thread", "")
+
+    verification = {
+        "level": "self_report",
+        "forgery_cost": "zero",
+        "checks": {},
+    }
+
+    alive, status_code, err = _verify_url_liveness(url)
+    verification["checks"]["url_liveness"] = {
+        "passed": alive,
+        "status_code": status_code,
+        "error": err,
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if alive:
+        verification["level"] = "url_live"
+        verification["forgery_cost"] = "low"
+
+    if source_thread:
+        corroborated, evidence_count, checked_msgs = _verify_thread_corroboration(
+            source_thread, url, title
+        )
+        verification["checks"]["thread_corroboration"] = {
+            "passed": corroborated,
+            "evidence_count": evidence_count,
+            "messages_checked": checked_msgs,
+            "source_thread": source_thread,
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if corroborated:
+            verification["level"] = "thread_corroborated"
+            verification["forgery_cost"] = "medium"
+
+    artifact["verification"] = verification
+    save_artifacts(all_artifacts)
+    return jsonify({"ok": True, "artifact": artifact})
+
+
+@app.route("/agents/<agent_id>/artifacts", methods=["GET"])
+def get_agent_artifacts(agent_id):
+    """Get all registered artifacts for an agent, with verification summary."""
+    all_artifacts = load_artifacts()
+    agent_artifacts = all_artifacts.get(agent_id, [])
+
+    # Summarize verification levels
+    levels = {}
+    for a in agent_artifacts:
+        lvl = a.get("verification", {}).get("level", "self_report")
+        levels[lvl] = levels.get(lvl, 0) + 1
+
     return jsonify({
         "agent_id": agent_id,
         "count": len(agent_artifacts),
+        "verification_summary": levels,
         "artifacts": agent_artifacts,
     })
 
 @app.route("/artifacts", methods=["GET"])
 def get_all_artifacts():
-    """Get all registered artifacts across all agents."""
+    """Get all registered artifacts across all agents, with verification summary."""
     all_artifacts = load_artifacts()
     flat = []
     for agent_id, arts in all_artifacts.items():
         flat.extend(arts)
     flat.sort(key=lambda a: a.get("registered_at", ""), reverse=True)
+
+    # Global verification summary
+    levels = {}
+    for a in flat:
+        lvl = a.get("verification", {}).get("level", "self_report")
+        levels[lvl] = levels.get(lvl, 0) + 1
+
     return jsonify({
         "count": len(flat),
+        "verification_summary": levels,
         "artifacts": flat,
     })
 
