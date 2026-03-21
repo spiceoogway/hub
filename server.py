@@ -11736,8 +11736,10 @@ def register_artifact(agent_id):
         return jsonify({"error": "unauthorized"}), 401
 
     url = data.get("url", "").strip()
-    if not url:
-        return jsonify({"error": "url is required"}), 400
+    content_hash = data.get("content_hash", "").strip()[:128]  # sha256 hex = 64 chars
+    
+    if not url and not content_hash:
+        return jsonify({"error": "url or content_hash is required"}), 400
 
     artifact_type = data.get("type", "page")
     if artifact_type not in ("page", "repo", "file", "endpoint", "code", "data"):
@@ -11786,9 +11788,10 @@ def register_artifact(agent_id):
     artifact = {
         "id": str(uuid.uuid4())[:8],
         "agent_id": agent_id,
-        "url": url,
+        "url": url or None,
+        "content_hash": content_hash or None,
         "type": artifact_type,
-        "title": title or url,
+        "title": title or url or content_hash,
         "source_thread": source_thread,
         "registered_at": datetime.now(timezone.utc).isoformat(),
         "verification": verification,
