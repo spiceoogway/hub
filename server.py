@@ -11645,7 +11645,11 @@ def _verify_url_liveness(url):
 
 def _verify_thread_corroboration(source_thread, url, title):
     """Check if the source_thread conversation contains references to the artifact.
-    Returns (corroborated: bool, evidence_count: int, checked_messages: int)."""
+    Returns (corroborated: bool, evidence_count: int, checked_messages: int).
+    
+    Messages are stored per-inbox: {agent_id}.json contains all messages TO that agent.
+    To find brain↔testy conversation: check testy.json for from=brain, and brain.json for from=testy.
+    """
     if not source_thread:
         return False, 0, 0
 
@@ -11661,10 +11665,13 @@ def _verify_thread_corroboration(source_thread, url, title):
     if not pair:
         return False, 0, 0
 
-    # Load messages for both agents and find their conversation
+    # Collect conversation messages from both inboxes
     evidence = 0
     checked = 0
+    seen_ids = set()
+
     for agent_id in pair:
+        other = pair[1] if agent_id == pair[0] else pair[0]
         msg_path = os.path.join(DATA_DIR, "messages", f"{agent_id}.json")
         if not os.path.exists(msg_path):
             continue
@@ -11674,14 +11681,16 @@ def _verify_thread_corroboration(source_thread, url, title):
         except Exception:
             continue
 
-        other = pair[1] if agent_id == pair[0] else pair[0]
         for msg in msgs:
-            # Only check messages in this specific conversation
+            # agent_id.json = messages TO agent_id. Filter by from=other to get the pair.
             msg_from = msg.get("from", "")
-            msg_to = msg.get("to", "")
-            if not ({msg_from, msg_to} == {pair[0], pair[1]} or
-                    msg_from in pair and msg_to in pair):
+            if msg_from != other:
                 continue
+
+            msg_id = msg.get("id", "")
+            if msg_id in seen_ids:
+                continue
+            seen_ids.add(msg_id)
 
             checked += 1
             content = msg.get("message", "").lower()
@@ -11716,7 +11725,8 @@ def register_artifact(agent_id):
     - thread_corroborated: source conversation references this artifact (forgery_cost: medium)
     """
     agents = load_agents()
-    agent = next((a for a in agents if a["agent_id"] == agent_id), None)
+    # agents.json is a dict keyed by agent_id
+    agent = agents.get(agent_id)
     if not agent:
         return jsonify({"error": "agent not found"}), 404
 
