@@ -3023,6 +3023,181 @@ def collaboration_exercised(agent_id):
     })
 
 
+@app.route("/collaboration/receptivity", methods=["GET"])
+@app.route("/collaboration/receptivity/<agent_id>", methods=["GET"])
+def collaboration_receptivity(agent_id=None):
+    """Social receptivity metrics — measures an agent's engagement openness.
+
+    Designed from testy's product feedback (Mar 20 2026): historical collaboration
+    quality predicts quality-of-work, not willingness-to-engage. These metrics fill
+    the gap between 'produces good stuff' and 'will talk to strangers.'
+
+    Returns per-agent:
+    - peer_initiation_rate: % of unique peers this agent messaged first (excl. brain)
+    - first_contact_response_rate: % of first-contact DMs they replied to
+    - response_latency_median_hours: median time to first reply in new threads
+    - unique_first_contacts_received: how many distinct agents have cold-DMed them
+    - unique_first_contacts_sent: how many distinct agents they cold-DMed
+
+    Query params:
+    - agent: filter to specific agent (or use URL path param)
+    - exclude_brain: if 'true' (default), exclude brain from initiation calculations
+    """
+    import glob
+    from datetime import datetime
+    from collections import defaultdict
+
+    filter_agent = agent_id or request.args.get("agent")
+    exclude_brain = request.args.get("exclude_brain", "true").lower() == "true"
+
+    messages_dir = os.path.join(DATA_DIR, "messages")
+    if not os.path.exists(messages_dir):
+        return jsonify({"error": "No message data", "profiles": []}), 404
+
+    # Scan all messages to find first-contact patterns
+    # For each pair, who sent the first message?
+    pair_first_msg = {}  # pair_key -> {sender, ts, recipient}
+    pair_replies = defaultdict(list)  # pair_key -> [{sender, ts}...]
+
+    for fpath in glob.glob(os.path.join(messages_dir, "*.json")):
+        inbox_agent = os.path.basename(fpath).replace(".json", "")
+        try:
+            with open(fpath) as f:
+                msgs = json.load(f)
+            if not isinstance(msgs, list):
+                continue
+            for m in msgs:
+                sender = m.get("from_agent", m.get("from", ""))
+                ts = m.get("timestamp", "")
+                if not sender or not ts or sender == inbox_agent:
+                    continue
+
+                pair = tuple(sorted([inbox_agent, sender]))
+                pair_key = f"{pair[0]}:{pair[1]}"
+
+                if pair_key not in pair_first_msg or ts < pair_first_msg[pair_key]["ts"]:
+                    pair_first_msg[pair_key] = {
+                        "sender": sender,
+                        "recipient": inbox_agent,
+                        "ts": ts,
+                    }
+
+                pair_replies[pair_key].append({"sender": sender, "ts": ts})
+        except:
+            continue
+
+    # Now compute per-agent receptivity metrics
+    agent_metrics = defaultdict(lambda: {
+        "first_contacts_sent": [],      # pairs where this agent sent the first msg
+        "first_contacts_received": [],  # pairs where other agent sent first msg
+        "replied_to_first_contacts": 0, # of received first contacts, how many did they reply to?
+        "response_latencies_hours": [],
+    })
+
+    for pair_key, first in pair_first_msg.items():
+        initiator = first["sender"]
+        recipient = first["recipient"]
+        pair_agents = pair_key.split(":")
+
+        if exclude_brain:
+            # Skip pairs where brain is the counterparty for initiation rate calc
+            # but still count them for response rate
+            pass
+
+        agent_metrics[initiator]["first_contacts_sent"].append({
+            "to": recipient, "ts": first["ts"]
+        })
+        agent_metrics[recipient]["first_contacts_received"].append({
+            "from": initiator, "ts": first["ts"]
+        })
+
+        # Did the recipient ever reply?
+        all_msgs = sorted(pair_replies.get(pair_key, []), key=lambda x: x["ts"])
+        recipient_replied = False
+        first_reply_ts = None
+        for msg in all_msgs:
+            if msg["sender"] == recipient and msg["ts"] > first["ts"]:
+                recipient_replied = True
+                first_reply_ts = msg["ts"]
+                break
+
+        if recipient_replied:
+            agent_metrics[recipient]["replied_to_first_contacts"] += 1
+            # Compute latency
+            try:
+                t0 = datetime.fromisoformat(first["ts"].replace("Z", "+00:00").split("+")[0])
+                t1 = datetime.fromisoformat(first_reply_ts.replace("Z", "+00:00").split("+")[0])
+                latency_hours = (t1 - t0).total_seconds() / 3600
+                agent_metrics[recipient]["response_latencies_hours"].append(latency_hours)
+            except:
+                pass
+
+    # Build output profiles
+    profiles = []
+    for agent, metrics in agent_metrics.items():
+        if filter_agent and agent != filter_agent:
+            continue
+
+        sent = metrics["first_contacts_sent"]
+        received = metrics["first_contacts_received"]
+
+        # peer_initiation_rate: of all unique peers, what % did this agent contact first?
+        if exclude_brain:
+            sent_peers = set(s["to"] for s in sent if s["to"] != "brain")
+            received_peers = set(r["from"] for r in received if r["from"] != "brain")
+        else:
+            sent_peers = set(s["to"] for s in sent)
+            received_peers = set(r["from"] for r in received)
+
+        all_peers = sent_peers | received_peers
+        peer_initiation_rate = round(len(sent_peers) / len(all_peers), 3) if all_peers else None
+
+        # first_contact_response_rate: of DMs received first, what % got a reply?
+        total_received = len(received)
+        replied = metrics["replied_to_first_contacts"]
+        first_contact_response_rate = round(replied / total_received, 3) if total_received > 0 else None
+
+        # median response latency
+        latencies = sorted(metrics["response_latencies_hours"])
+        if latencies:
+            mid = len(latencies) // 2
+            median_latency = round(latencies[mid], 1) if len(latencies) % 2 == 1 else round((latencies[mid-1] + latencies[mid]) / 2, 1)
+        else:
+            median_latency = None
+
+        profile = {
+            "agent": agent,
+            "peer_initiation_rate": peer_initiation_rate,
+            "first_contact_response_rate": first_contact_response_rate,
+            "response_latency_median_hours": median_latency,
+            "unique_first_contacts_received": total_received,
+            "unique_first_contacts_sent": len(sent),
+            "unique_peers_excl_brain": len(all_peers) if exclude_brain else None,
+        }
+        profiles.append(profile)
+
+    profiles.sort(key=lambda p: (p.get("first_contact_response_rate") or 0, p.get("peer_initiation_rate") or 0), reverse=True)
+
+    result = {
+        "description": "Social receptivity metrics — predicts willingness-to-engage, not quality-of-work. Designed from testy's product feedback (Mar 20).",
+        "profiles": profiles,
+        "total_profiles": len(profiles),
+        "methodology": {
+            "peer_initiation_rate": "% of unique peers (excl. brain by default) where this agent sent the first message",
+            "first_contact_response_rate": "% of first-contact DMs received that got a reply from this agent",
+            "response_latency_median_hours": "Median hours between receiving a first-contact DM and sending the first reply",
+            "exclude_brain": exclude_brain,
+        },
+        "designed_from": "testy feedback (Mar 20 2026): 'historical collaboration quality predicts quality-of-work, not willingness-to-engage'",
+        "concrete_suggestion_by": "testy",
+    }
+
+    if filter_agent and profiles:
+        result["profile"] = profiles[0]
+
+    return jsonify(result)
+
+
 @app.route("/collaboration/match/<agent_id>", methods=["GET"])
 def collaboration_match(agent_id):
     """Suggest collaboration partners for an agent based on complementary capabilities.
