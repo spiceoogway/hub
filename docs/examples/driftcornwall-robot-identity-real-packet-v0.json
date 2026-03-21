@@ -1,0 +1,116 @@
+{
+  "packet_id": "robot_verify_2026_03_20_drift_001",
+  "created_at": "2026-03-20T15:06:06Z",
+  "operator_agent": "driftcornwall",
+  "sequence_window": {
+    "start_event_id": "evt_001_pi_boot",
+    "end_event_id": "evt_005_resume"
+  },
+  "subject": {
+    "robot_id": "lynxmotion_tri_track_01",
+    "device_identity": "rpi5-8gb:arduino-mega-2560:sabertooth-2x12:ssc32u",
+    "claimed_role": "autonomous_ground_platform",
+    "chassis": "Lynxmotion Tri-Track"
+  },
+  "environment_snapshot": {
+    "timestamp_utc": "2026-03-20T12:00:00Z",
+    "platform": {
+      "compute": "Raspberry Pi 5 (8GB)",
+      "sensor_hub": "Arduino Mega 2560 (USB serial 115200 baud)",
+      "motor_controller": "Sabertooth 2x12 (serial 38400 baud, DIP3 UP)",
+      "servo_controller": "SSC-32U (serial)",
+      "chassis": "Lynxmotion Tri-Track"
+    },
+    "sensors": {
+      "camera": "IMX219 (CSI, Pi 5)",
+      "imu": "MPU6050 (I2C, D20/D21)",
+      "ultrasonic": "HC-SR04 (D2 trig, D3 echo)",
+      "ir_receiver": "NEC protocol (D8)",
+      "pir": "motion detect (D7)",
+      "dht11": "temp/humidity (D11, requires ISR detach for timing)",
+      "light": "LDR (A4)",
+      "voltage": "divider (A0, 11.9V nominal)",
+      "sound": "analog mic (A1)",
+      "vibration": "digital (D19, INT4)"
+    },
+    "network": {
+      "tailscale_ip": "100.122.148.47",
+      "phone_mcp": "100.122.228.96:3001"
+    },
+    "known_constraints": {
+      "dht11_vibration_conflict": "Must detach vibration ISR during DHT read",
+      "sabertooth_baud": "38400 NOT 9600, official autobaud timing required",
+      "obstacle_auto_stop": "<15cm full stop, 15-30cm slow"
+    }
+  },
+  "event_sequence": [
+    {
+      "event_id": "evt_001_pi_boot",
+      "kind": "device_boot",
+      "timestamp": "2026-03-20T12:00:00Z",
+      "detail": "Pi 5 boots, opens /dev/ttyACM0 at 115200 baud to Arduino Mega. Telemetry JSON starts at 2Hz.",
+      "telemetry_sample": {"v": 11.9, "ax": 0, "ay": 0, "az": 9.81, "us": 45.3, "lx": 408, "pir": 0, "m1": 0, "m2": 0}
+    },
+    {
+      "event_id": "evt_002_sabertooth_init",
+      "kind": "motor_controller_init",
+      "timestamp": "2026-03-20T12:00:03Z",
+      "detail": "Open /dev/ttyS0 at 38400 baud, send autobaud byte 0xAA, wait 100ms. Motor controller ready.",
+      "serial_port": "/dev/ttyS0",
+      "baud": 38400,
+      "autobaud_byte": "0xAA"
+    },
+    {
+      "event_id": "evt_003_obstacle_detect",
+      "kind": "actuation_with_safety_trigger",
+      "timestamp": "2026-03-20T12:00:10Z",
+      "detail": "Forward command m1:64 m2:64. Ultrasonic reads drop: 45cm -> 28cm -> 12cm. Auto-stop triggers at <15cm. Motors halt.",
+      "motor_command": {"m1": 64, "m2": 64},
+      "ultrasonic_readings_cm": [45, 28, 12],
+      "safety_trigger": "obstacle_auto_stop",
+      "trigger_threshold_cm": 15,
+      "result": "motors_halted"
+    },
+    {
+      "event_id": "evt_004_operator_override",
+      "kind": "manual_gate",
+      "timestamp": "2026-03-20T12:00:45Z",
+      "detail": "Lex sends SSH command to resume. Manual verification: obstacle is Bruce (the dog), not a wall. Override reason: safe to proceed, living obstacle moved.",
+      "operator": "Lex",
+      "override_method": "SSH",
+      "override_reason": "Living obstacle identified by operator, safe to proceed"
+    },
+    {
+      "event_id": "evt_005_resume",
+      "kind": "actuation_resume",
+      "timestamp": "2026-03-20T12:01:00Z",
+      "detail": "Motors restart at reduced speed. Full telemetry snapshot logged with IMU confirmation (no collision detected in accelerometer data).",
+      "imu_collision_detected": false
+    }
+  ],
+  "verification_checks": {
+    "device_identity_bound": true,
+    "sensor_provenance_verified": true,
+    "motor_controller_initialized": true,
+    "safety_system_functional": true,
+    "actuation_safety_verified": false,
+    "operator_approval_present": true
+  },
+  "manual_gate": {
+    "field": "operator_override_reason",
+    "reason": "Living obstacle identified by operator, safe to proceed. Auto-stop correctly triggered at <15cm. Operator verified via SSH that obstacle (Bruce the dog) had moved before resuming."
+  },
+  "attestation_chain_provenance": {
+    "sensor_hub_link": "USB serial 115200 baud, Arduino Mega 2560",
+    "motor_controller_link": "serial 38400 baud, Sabertooth 2x12",
+    "telemetry_rate_hz": 2,
+    "safety_chain": "ultrasonic -> auto_stop -> operator_gate -> resume"
+  },
+  "actuator_limit_profile": {
+    "obstacle_stop_threshold_cm": 15,
+    "slow_zone_threshold_cm": 30,
+    "motor_speed_range": "0-127 per channel",
+    "resume_speed": "reduced (exact value from operator command)"
+  },
+  "resume_action_line": "Robot correctly auto-stopped on obstacle detection. Operator verified obstacle was transient (living). Resume at reduced speed with IMU monitoring. Next manual gate: any new obstacle within slow zone without prior operator clearance."
+}
