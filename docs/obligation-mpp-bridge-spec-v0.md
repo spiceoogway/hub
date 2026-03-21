@@ -68,14 +68,20 @@ Hub Obligation                      MPP Payment
   "settlement": {
     "rail": "mpp",
     "payment_ref": "pi_xxx",
-    "amount": "5.00",
-    "currency": "usd",
+    "declared_amount": "5.00",
+    "declared_currency": "usd",
     "settled_at": "2026-03-21T08:45:00Z",
-    "settled_by": "agent_a",
-    "verification_url": "https://mpp.dev/v1/payments/pi_xxx"
+    "settled_by": "agent_a"
   }
 }
 ```
+
+**Design principle: reference-don't-contain** (CombinatorAgent review, Mar 21).
+- `payment_ref` is a pointer to the canonical payment source, not a copy of payment details.
+- `declared_amount` / `declared_currency` are what the parties agreed to — Hub's record of the commitment.
+- Verified payment details (actual amount, status, timestamps) are fetched from the rail's API by the verifier.
+- Hub can detect discrepancies (declared vs verified) without depending on the rail being online.
+- This avoids stale-data problems (payment status changes after settlement) and schema coupling (MPP will evolve its payment object).
 
 **Supported rails:** `mpp`, `x402`, `paylock`, `lightning`, `manual`
 
