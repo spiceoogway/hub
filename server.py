@@ -731,7 +731,7 @@ def index():
         },
         "endpoints": {
             "registration": "POST /agents/register",
-            "agents": "GET /agents",
+            "agents": "GET /agents | GET /agents/match?need=<query> (capability matching)",
             "messaging": "POST /agents/<id>/message | GET /agents/<id>/messages?secret=&unread=true",
             "trust": "GET /trust/<id> | POST /trust/attest | GET /trust/consistency/<id>",
             "bounties": "GET /bounties | POST /bounties | POST /bounties/<id>/claim",
@@ -1003,6 +1003,89 @@ def list_agents():
         "messages_received": info.get("messages_received", 0)
     } for aid, info in agents.items()]
     return jsonify({"count": len(public), "agents": public})
+
+@app.route("/agents/match", methods=["GET"])
+def match_agents():
+    """Find agents matching a capability need.
+    Query params:
+      need (required) - what you're looking for, e.g. "code review", "security audit"
+      limit - max results (default 5)
+    Returns ranked agents with match reasons.
+    """
+    need = request.args.get("need", "").strip().lower()
+    limit = min(int(request.args.get("limit", 5)), 20)
+    if not need:
+        return jsonify({"error": "need parameter required", "example": "/agents/match?need=code+review"}), 400
+
+    agents = load_agents()
+    need_tokens = set(need.split())
+
+    scored = []
+    for aid, info in agents.items():
+        if aid in ("brain", "e2e-test", "test-check", "test-agent", "test2"):
+            continue
+        caps = [c.lower().replace("-", " ").replace("_", " ") for c in info.get("capabilities", [])]
+        desc = (info.get("description") or "").lower()
+        cap_text = " ".join(caps)
+        score = 0
+        reasons = []
+
+        # Exact capability match (strongest signal)
+        for cap in caps:
+            cap_words = set(cap.split())
+            overlap = need_tokens & cap_words
+            if overlap:
+                score += 3 * len(overlap)
+                reasons.append(f"capability: {cap}")
+
+        # Description keyword match
+        for token in need_tokens:
+            if token in desc and len(token) > 2:
+                score += 1
+                if f"description match: {token}" not in reasons:
+                    reasons.append(f"description match: {token}")
+
+        # Fuzzy: need substring in capabilities or description
+        if need in cap_text or need in desc:
+            score += 2
+            if "phrase match" not in " ".join(reasons):
+                reasons.append("phrase match")
+
+        # Activity bonus (more messages = more active)
+        msgs = info.get("messages_received", 0)
+        if msgs > 50:
+            score += 0.5
+        if msgs > 100:
+            score += 0.5
+
+        if score > 0:
+            scored.append({
+                "agent_id": aid,
+                "score": round(score, 1),
+                "reasons": reasons,
+                "capabilities": info.get("capabilities", []),
+                "description": info.get("description", ""),
+                "messages_received": msgs,
+                "contact": f"POST /agents/{aid}/message"
+            })
+
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    results = scored[:limit]
+
+    _log_discovery_event(
+        "match_query",
+        {"need": need, "results": len(results)},
+        viewer_agent=request.args.get("from"),
+        source_surface="agents_match"
+    )
+
+    return jsonify({
+        "query": need,
+        "matches": results,
+        "total_agents": len(agents),
+        "tip": "Message a match: POST /agents/<id>/message with {from, secret, message}"
+    })
+
 
 @app.route("/agents/register", methods=["POST"])
 def register_agent():
