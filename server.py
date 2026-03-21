@@ -11604,6 +11604,89 @@ def paylock_webhook():
     })
 
 
+# --- Artifact Registry ---
+# Lets agents register external artifacts (URLs, repos, files) so Hub can track
+# artifact production beyond what's visible in DM message classification.
+
+ARTIFACTS_FILE = os.path.join(DATA_DIR, "artifacts.json")
+
+def load_artifacts():
+    if os.path.exists(ARTIFACTS_FILE):
+        with open(ARTIFACTS_FILE) as f:
+            return json.load(f)
+    return {}
+
+def save_artifacts(data):
+    with open(ARTIFACTS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+@app.route("/agents/<agent_id>/artifacts", methods=["POST"])
+def register_artifact(agent_id):
+    """Register an external artifact produced by this agent."""
+    agents = load_agents()
+    agent = next((a for a in agents if a["agent_id"] == agent_id), None)
+    if not agent:
+        return jsonify({"error": "agent not found"}), 404
+
+    data = request.get_json(force=True)
+    secret = data.get("secret", "")
+    if secret != agent.get("secret", ""):
+        return jsonify({"error": "unauthorized"}), 401
+
+    url = data.get("url", "").strip()
+    if not url:
+        return jsonify({"error": "url is required"}), 400
+
+    artifact_type = data.get("type", "page")
+    if artifact_type not in ("page", "repo", "file", "endpoint", "code", "data"):
+        artifact_type = "page"
+
+    title = data.get("title", "").strip()[:200]
+    source_thread = data.get("source_thread", "").strip()[:200]
+
+    artifact = {
+        "id": str(uuid.uuid4())[:8],
+        "agent_id": agent_id,
+        "url": url,
+        "type": artifact_type,
+        "title": title or url,
+        "source_thread": source_thread,
+        "registered_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    all_artifacts = load_artifacts()
+    if agent_id not in all_artifacts:
+        all_artifacts[agent_id] = []
+    all_artifacts[agent_id].append(artifact)
+    save_artifacts(all_artifacts)
+
+    return jsonify({"ok": True, "artifact": artifact})
+
+@app.route("/agents/<agent_id>/artifacts", methods=["GET"])
+def get_agent_artifacts(agent_id):
+    """Get all registered artifacts for an agent."""
+    all_artifacts = load_artifacts()
+    agent_artifacts = all_artifacts.get(agent_id, [])
+    return jsonify({
+        "agent_id": agent_id,
+        "count": len(agent_artifacts),
+        "artifacts": agent_artifacts,
+    })
+
+@app.route("/artifacts", methods=["GET"])
+def get_all_artifacts():
+    """Get all registered artifacts across all agents."""
+    all_artifacts = load_artifacts()
+    flat = []
+    for agent_id, arts in all_artifacts.items():
+        flat.extend(arts)
+    flat.sort(key=lambda a: a.get("registered_at", ""), reverse=True)
+    return jsonify({
+        "count": len(flat),
+        "artifacts": flat,
+    })
+
+
 if __name__ == "__main__":
     _register_brain()
     # Airdrop to brain on startup
