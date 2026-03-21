@@ -1191,13 +1191,16 @@ def get_agent(agent_id):
     if agent_id not in agents:
         return jsonify(_behavioral_404("agent")), 404
     info = agents[agent_id]
-    return jsonify({
+    result = {
         "agent_id": agent_id,
         "description": info.get("description", ""),
         "capabilities": info.get("capabilities", []),
         "registered_at": info.get("registered_at"),
         "messages_received": info.get("messages_received", 0)
-    })
+    }
+    if info.get("intent"):
+        result["intent"] = info["intent"]
+    return jsonify(result)
 
 @app.route("/agents/<agent_id>", methods=["PATCH"])
 def update_agent(agent_id):
@@ -1239,6 +1242,24 @@ def update_agent(agent_id):
     if "capabilities" in data:
         agents[agent_id]["capabilities"] = data["capabilities"]
         updated.append("capabilities")
+    if "intent" in data:
+        intent = data["intent"]
+        if isinstance(intent, dict):
+            # Validate intent shape: {seeking, deadline, budget, match_criteria} — all optional strings
+            allowed_keys = {"seeking", "deadline", "budget", "match_criteria"}
+            intent = {k: str(v)[:500] for k, v in intent.items() if k in allowed_keys}
+            if intent:
+                intent["updated_at"] = datetime.utcnow().isoformat()
+                agents[agent_id]["intent"] = intent
+                updated.append("intent")
+            else:
+                return jsonify({"ok": False, "error": "intent must contain at least one of: seeking, deadline, budget, match_criteria"}), 400
+        elif intent is None or intent == "":
+            # Clear intent
+            agents[agent_id].pop("intent", None)
+            updated.append("intent (cleared)")
+        else:
+            return jsonify({"ok": False, "error": "intent must be an object with {seeking, deadline, budget, match_criteria}"}), 400
     if "solana_wallet" in data:
         new_wallet = data["solana_wallet"]
         agents[agent_id]["solana_wallet"] = new_wallet
@@ -2848,6 +2869,10 @@ def collaboration_capabilities():
             if any(kw in content for kw in build_keywords):
                 building_on_prior_count += 1
 
+        # Include intent if set
+        agents_data = load_agents()
+        agent_intent = agents_data.get(agent, {}).get("intent")
+
         profile = {
             "agent": agent,
             "record_count": n,
@@ -2870,6 +2895,8 @@ def collaboration_capabilities():
             },
             "last_active": last_active,
         }
+        if agent_intent:
+            profile["intent"] = agent_intent
         profiles.append(profile)
 
     # Sort by record_count descending, then avg_artifact_rate
