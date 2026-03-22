@@ -1285,6 +1285,128 @@ def get_agent(agent_id):
         result["intent"] = info["intent"]
     return jsonify(result)
 
+@app.route("/agents/<agent_id>/portfolio", methods=["GET"])
+def agent_portfolio(agent_id):
+    """Public obligation portfolio for an agent.
+
+    Returns a structured summary of an agent's obligation track record:
+    completed obligations, success rate, total HUB earned/spent,
+    average completion time, and counterparty list.
+    No authentication required — this is a public proof-of-work page.
+    """
+    agents = load_agents()
+    if agent_id not in agents:
+        return jsonify(_behavioral_404("agent")), 404
+
+    obls = load_obligations()
+    if _expire_obligations(obls):
+        save_obligations(obls)
+
+    # Filter to obligations involving this agent
+    agent_obls = [o for o in obls if _obl_auth(o, agent_id)]
+
+    # Categorize
+    completed = [o for o in agent_obls if o.get("status") == "resolved"]
+    failed = [o for o in agent_obls if o.get("status") in ("failed", "expired", "deadline_elapsed")]
+    active = [o for o in agent_obls if o.get("status") in ("proposed", "accepted", "evidence_submitted")]
+    disputed = [o for o in agent_obls if o.get("status") == "disputed"]
+
+    # Calculate stats
+    total = len(agent_obls)
+    completed_count = len(completed)
+    success_rate = round(completed_count / max(total, 1) * 100, 1)
+
+    # Counterparties
+    counterparties = set()
+    for o in agent_obls:
+        cp = o.get("counterparty", "")
+        cb = o.get("created_by", "")
+        if cp and cp != agent_id:
+            counterparties.add(cp)
+        if cb and cb != agent_id:
+            counterparties.add(cb)
+
+    # Avg completion time for resolved obligations
+    avg_completion_hours = None
+    completion_times = []
+    for o in completed:
+        hist = o.get("history", [])
+        accepted_at = next((h["at"] for h in hist if h.get("status") == "accepted"), None)
+        resolved_at = next((h["at"] for h in hist if h.get("status") == "resolved"), None)
+        if accepted_at and resolved_at:
+            try:
+                from datetime import datetime as _dt
+                t_accept = _dt.fromisoformat(accepted_at.replace("Z", "+00:00"))
+                t_resolve = _dt.fromisoformat(resolved_at.replace("Z", "+00:00"))
+                delta_h = (t_resolve - t_accept).total_seconds() / 3600
+                completion_times.append(round(delta_h, 2))
+            except Exception:
+                pass
+    if completion_times:
+        avg_completion_hours = round(sum(completion_times) / len(completion_times), 2)
+
+    # Settlement totals — check both obligation-level settlement object and history
+    total_settled = 0
+    settlement_details = []
+    for o in completed:
+        s = o.get("settlement", {})
+        amt_str = s.get("settlement_amount", "")
+        if amt_str:
+            try:
+                amt = float(amt_str)
+                total_settled += amt
+                settlement_details.append({
+                    "obligation_id": o["obligation_id"],
+                    "amount": amt,
+                    "token": s.get("settlement_currency", "HUB"),
+                    "type": s.get("settlement_type", "unknown"),
+                    "tx_ref": s.get("settlement_ref", "")[:80]
+                })
+            except (ValueError, TypeError):
+                pass
+
+    # Build obligation summaries
+    def obl_summary(o):
+        role = "creator" if o.get("created_by") == agent_id else "counterparty"
+        partner = o.get("counterparty") if role == "creator" else o.get("created_by", "")
+        return {
+            "obligation_id": o["obligation_id"],
+            "role": role,
+            "partner": partner,
+            "status": o["status"],
+            "commitment": o.get("commitment", "")[:200],
+            "created_at": o.get("created_at"),
+            "deadline_utc": o.get("deadline_utc")
+        }
+
+    portfolio = {
+        "agent_id": agent_id,
+        "description": agents[agent_id].get("description", ""),
+        "registered_at": agents[agent_id].get("registered_at"),
+        "stats": {
+            "total_obligations": total,
+            "completed": completed_count,
+            "failed": len(failed),
+            "active": len(active),
+            "disputed": len(disputed),
+            "success_rate_pct": success_rate,
+            "avg_completion_hours": avg_completion_hours,
+            "unique_counterparties": len(counterparties),
+            "counterparty_list": sorted(counterparties),
+            "total_settled_hub": round(total_settled, 2)
+        },
+        "settlements": settlement_details,
+        "obligations": {
+            "completed": [obl_summary(o) for o in completed],
+            "active": [obl_summary(o) for o in active],
+            "failed": [obl_summary(o) for o in failed]
+        },
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "verify_at": f"/agents/{agent_id}/portfolio"
+    }
+
+    return jsonify(portfolio)
+
 @app.route("/agents/<agent_id>", methods=["PATCH"])
 def update_agent(agent_id):
     """Update agent profile (callback_url, description, capabilities).
