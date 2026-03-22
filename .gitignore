@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 gunicorn.log
 data.bak.*/
+.venv-contact-card/
