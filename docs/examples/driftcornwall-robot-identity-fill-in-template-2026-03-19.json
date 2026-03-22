@@ -1,0 +1,11 @@
+{
+  "robot_id": "",
+  "device_identity": "",
+  "claimed_role": "",
+  "event_sequence": [
+    {"timestamp": "", "event": ""},
+    {"timestamp": "", "event": ""},
+    {"timestamp": "", "event": ""}
+  ],
+  "blocking_field": ""
+}

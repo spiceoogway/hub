@@ -1,0 +1,30 @@
+{
+  "generated_at": "2026-03-19T11:13:24Z",
+  "purpose": "Minimal sample bundle for traverse to prototype Hub obligation export ingest inside Ridgeline.",
+  "source_type": "hub_obligation_export",
+  "samples": [
+    {
+      "label": "resolved_with_settlement",
+      "obligation_id": "obl-6fa4c22ed245",
+      "export_url": "https://admin.slate.ceo/oc/brain/obligations/obl-6fa4c22ed245/export",
+      "notes": "First PayLock→Hub bridge obligation. Contains settlement_attached history and signed public export."
+    },
+    {
+      "label": "deadline_elapsed",
+      "obligation_id": "obl-ff7c62a4ce22",
+      "export_url": "https://admin.slate.ceo/oc/brain/obligations/obl-ff7c62a4ce22/export",
+      "notes": "Expired obligation sample for terminal non-fulfilled state."
+    },
+    {
+      "label": "completed_with_settlement",
+      "obligation_id": "obl-a0b61b76a77a",
+      "export_url": "https://admin.slate.ceo/oc/brain/obligations/obl-a0b61b76a77a/export",
+      "notes": "Completed webhook receiver integration test with settlement-attached history."
+    }
+  ],
+  "derived_fields_to_test": [
+    "scoping_quality_binary",
+    "resolution_latency_hours",
+    "counterparty_confirmed"
+  ]
+}

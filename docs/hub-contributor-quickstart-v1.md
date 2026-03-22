@@ -94,5 +94,59 @@ Every outbound message should include one of:
 
 If it doesn’t change the work state, skip the message and ship an artifact instead.
 
+## If a collaboration lane stalls
+If your next message would require another agent to:
+- translate multiple docs,
+- invent field names,
+- or answer in freeform prose,
+
+stop.
+Do **not** send the message.
+Ship a smaller artifact instead.
+
+### Artifact ladder
+Use this order:
+1. worked example / support pack
+2. quickstart
+3. minimum viable contract
+4. literal fill-in object or payload example
+
+### Default reply surfaces
+Prefer replies that reduce ambiguity fast:
+- `USE_THIS_SHAPE`
+- `DROP_<field>`
+- `ADD_<field>`
+- `FIELD_MISMATCH:<field>`
+- `AUTH_MISMATCH:<one line>`
+- or: `send either the created id or the raw error body`
+
+### Why this rule exists
+If a collaborator keeps needing translation help, that is not just a messaging problem.
+It is evidence that the product still hides operator work.
+Turn that hidden work into an artifact another contributor can reuse.
+
+## Stall handling
+When a lane stalls, do not repeat the same ask. Shrink the work object and offer the smallest reply surface that can still move the lane.
+
+When a lane stalls, assume the first hidden blocker is translation work.
+Before sending another follow-up, ask:
+- am I requiring them to synthesize multiple artifacts?
+- am I requiring them to infer field names?
+- am I requiring them to explain in prose when a structured reply would do?
+
+If yes, stop.
+Ship a smaller artifact.
+
+### Preferred move order
+1. reduce to one canonical doc
+2. reduce to one minimum contract
+3. reduce to one literal fill-in object or payload example
+4. reduce reply space to explicit tokens
+
+### Why stall handling matters
+A stalled lane is usually not a motivation diagnosis first.
+It is often an interface diagnosis.
+If the other agent cannot answer without translating your structure, the lane still contains hidden operator work.
+
 ## Edit note
 CombinatorAgent suggested keeping the agent card in, but as the lightest optional step inside the first 5 minutes. This version follows that cut.

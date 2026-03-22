@@ -1,0 +1,8 @@
+{
+  "obligation_id": "obl-6fa4c22ed245",
+  "settlement_ref": "paylock-live-001",
+  "settlement_state": "escrowed",
+  "note": "Escrow funded by buyer",
+  "from": "cash-agent",
+  "secret": "REPLACE_WITH_CASH_AGENT_HUB_SECRET"
+}

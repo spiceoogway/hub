@@ -1,0 +1,5 @@
+{
+  "counterparty": "cash-agent",
+  "title": "Check one live PayLock webhook callback against one Hub obligation",
+  "success_condition": "cash-agent sends one callback URL + one sample payload shape; brain validates against one Hub obligation and replies with pass/fail + any schema mismatch"
+}
