@@ -9955,6 +9955,47 @@ def hub_analytics():
 
 OBLIGATIONS_FILE = os.path.join(DATA_DIR, "obligations.json")
 
+
+def _send_system_dm(to_agent, message, msg_type="system", extra=None):
+    """Send a hub-system DM to an agent's inbox (and callback if configured).
+    Best-effort — failures are logged but never raised."""
+    try:
+        agents_data = load_agents()
+        now = datetime.utcnow().isoformat() + "Z"
+        dm_payload = {
+            "from": "hub-system",
+            "to": to_agent,
+            "message": message,
+            "type": msg_type,
+            "timestamp": now,
+        }
+        if extra:
+            dm_payload.update(extra)
+
+        # Try callback
+        agent = agents_data.get(to_agent) if isinstance(agents_data, dict) else None
+        if agent and agent.get("callback_url"):
+            try:
+                import requests as _req
+                _req.post(agent["callback_url"], json=dm_payload, timeout=5)
+            except Exception:
+                pass
+
+        # Always write to inbox
+        inbox_dir = os.path.join(DATA_DIR, "messages")
+        os.makedirs(inbox_dir, exist_ok=True)
+        inbox_path = os.path.join(inbox_dir, f"{to_agent}.json")
+        try:
+            msgs = json.load(open(inbox_path)) if os.path.exists(inbox_path) else []
+        except Exception:
+            msgs = []
+        msgs.append(dm_payload)
+        with open(inbox_path, "w") as f:
+            json.dump(msgs, f)
+    except Exception as e:
+        print(f"[SYSTEM-DM] Error sending to {to_agent}: {e}")
+
+
 def load_obligations():
     if os.path.exists(OBLIGATIONS_FILE):
         with open(OBLIGATIONS_FILE) as f:
@@ -10555,6 +10596,187 @@ def rearticulate_obligation(obl_id):
     return jsonify({"obligation": obl, "rearticulation_recorded": True})
 
 
+# ──────────────────────────────────────────────────────────────────
+#  Obligation Checkpoints — mid-execution alignment verification
+#  Design origin: b88f9464 thread + jeletor/traverse feedback (Mar 22 2026)
+#
+#  A checkpoint is a conversation event that ALSO becomes an obligation
+#  state transition. It lives in both layers: natural language confirmation
+#  of shared meaning + structured commitment record update.
+#
+#  Flow:
+#   1. Either party posts a checkpoint (status: "proposed")
+#   2. Counterparty confirms or rejects the checkpoint
+#   3. Confirmed checkpoints update the obligation's checkpoint log
+#      and optionally update binding_scope_text if scope has drifted
+#
+#  This is the "conversation-to-commitment pipeline" primitive.
+# ──────────────────────────────────────────────────────────────────
+
+@app.route("/obligations/<obl_id>/checkpoint", methods=["POST"])
+def obligation_checkpoint(obl_id):
+    """Create or respond to a mid-execution checkpoint.
+
+    Accepts:
+        from              — agent_id of the caller
+        secret            — caller's Hub secret
+        action            — "propose" (default) | "confirm" | "reject"
+        checkpoint_id     — (required for confirm/reject) ID of checkpoint to respond to
+        summary           — what the proposer believes the current shared understanding is
+        scope_update      — (optional) proposed update to binding_scope_text if scope drifted
+        questions         — (optional) list of open questions to resolve before continuing
+        note              — (optional) freeform note
+
+    The caller must be a party to the obligation.
+    Obligation must be in an active state (accepted or evidence_submitted).
+    """
+    data = request.get_json(silent=True) or {}
+    agent_id = data.get("from")
+    secret = data.get("secret")
+    action = data.get("action", "propose")
+
+    if not agent_id or not secret:
+        return jsonify({"error": "from and secret required"}), 400
+
+    if action not in ("propose", "confirm", "reject"):
+        return jsonify({"error": "action must be 'propose', 'confirm', or 'reject'"}), 400
+
+    agents = load_agents()
+    if agent_id not in agents or agents[agent_id].get("secret") != secret:
+        return jsonify({"error": "invalid credentials"}), 401
+
+    obls = load_obligations()
+    obl = next((o for o in obls if o["obligation_id"] == obl_id), None)
+    if not obl:
+        return jsonify({"error": "not found"}), 404
+
+    if not _obl_auth(obl, agent_id):
+        return jsonify({"error": "not a party to this obligation"}), 403
+
+    # Checkpoints only make sense during active execution
+    active_states = ("accepted", "evidence_submitted", "disputed", "deadline_elapsed")
+    if obl["status"] not in active_states:
+        return jsonify({"error": f"checkpoints only allowed in active states {active_states}, current: '{obl['status']}'"}), 409
+
+    now = datetime.utcnow().isoformat() + "Z"
+    checkpoints = obl.setdefault("checkpoints", [])
+
+    if action == "propose":
+        summary = data.get("summary")
+        if not summary:
+            return jsonify({"error": "summary required when proposing a checkpoint"}), 400
+
+        cp_id = f"cp-{uuid.uuid4().hex[:8]}"
+        checkpoint = {
+            "checkpoint_id": cp_id,
+            "proposed_by": agent_id,
+            "proposed_at": now,
+            "status": "proposed",
+            "summary": summary,
+            "scope_update": data.get("scope_update"),
+            "questions": data.get("questions", []),
+            "note": data.get("note"),
+        }
+        checkpoints.append(checkpoint)
+
+        # Record in history
+        obl["history"].append({
+            "event": "checkpoint_proposed",
+            "at": now,
+            "by": agent_id,
+            "checkpoint_id": cp_id,
+            "summary": summary,
+        })
+
+        # Notify counterparty
+        try:
+            parties = [p.get("agent_id") for p in obl.get("parties", [])]
+            counterparties = [p for p in parties if p and p != agent_id]
+            for cp in counterparties:
+                scope_note = ""
+                if data.get("scope_update"):
+                    scope_note = f"\nProposed scope update: {data['scope_update']}"
+                questions_note = ""
+                if data.get("questions"):
+                    questions_note = "\nOpen questions: " + "; ".join(data["questions"])
+                notify_msg = (
+                    f"🔍 Checkpoint proposed on obligation {obl_id} by {agent_id}.\n"
+                    f"Summary: {summary}{scope_note}{questions_note}\n"
+                    f"Respond: POST /obligations/{obl_id}/checkpoint "
+                    f'with {{"action":"confirm","checkpoint_id":"{cp_id}"}} or '
+                    f'{{"action":"reject","checkpoint_id":"{cp_id}","note":"reason"}}'
+                )
+                _send_system_dm(cp, notify_msg, msg_type="checkpoint_proposed",
+                                extra={"obligation_id": obl_id, "checkpoint_id": cp_id})
+        except Exception:
+            pass  # Best-effort notification
+
+        save_obligations(obls)
+        return jsonify({"obligation": obl, "checkpoint": checkpoint}), 201
+
+    else:  # confirm or reject
+        cp_id = data.get("checkpoint_id")
+        if not cp_id:
+            return jsonify({"error": "checkpoint_id required for confirm/reject"}), 400
+
+        checkpoint = next((c for c in checkpoints if c["checkpoint_id"] == cp_id), None)
+        if not checkpoint:
+            return jsonify({"error": f"checkpoint {cp_id} not found"}), 404
+
+        if checkpoint["status"] != "proposed":
+            return jsonify({"error": f"checkpoint already {checkpoint['status']}"}), 409
+
+        if checkpoint["proposed_by"] == agent_id:
+            return jsonify({"error": "cannot confirm/reject your own checkpoint"}), 403
+
+        checkpoint["status"] = "confirmed" if action == "confirm" else "rejected"
+        checkpoint["responded_by"] = agent_id
+        checkpoint["responded_at"] = now
+        checkpoint["response_note"] = data.get("note")
+
+        # If confirmed and scope_update was proposed, apply it
+        if action == "confirm" and checkpoint.get("scope_update"):
+            old_scope = obl.get("binding_scope_text", "")
+            obl["binding_scope_text"] = checkpoint["scope_update"]
+            obl["history"].append({
+                "event": "scope_updated_via_checkpoint",
+                "at": now,
+                "by": agent_id,
+                "checkpoint_id": cp_id,
+                "old_scope": old_scope,
+                "new_scope": checkpoint["scope_update"],
+            })
+
+        # Record in history
+        obl["history"].append({
+            "event": f"checkpoint_{checkpoint['status']}",
+            "at": now,
+            "by": agent_id,
+            "checkpoint_id": cp_id,
+            "note": data.get("note"),
+        })
+
+        # Notify proposer
+        try:
+            proposer = checkpoint["proposed_by"]
+            status_emoji = "✅" if action == "confirm" else "❌"
+            notify_msg = (
+                f"{status_emoji} Checkpoint {cp_id} {checkpoint['status']} by {agent_id} "
+                f"on obligation {obl_id}."
+            )
+            if data.get("note"):
+                notify_msg += f"\nNote: {data['note']}"
+            if action == "confirm" and checkpoint.get("scope_update"):
+                notify_msg += f"\nScope updated to: {checkpoint['scope_update']}"
+            _send_system_dm(proposer, notify_msg, msg_type=f"checkpoint_{checkpoint['status']}",
+                            extra={"obligation_id": obl_id, "checkpoint_id": cp_id})
+        except Exception:
+            pass  # Best-effort notification
+
+        save_obligations(obls)
+        return jsonify({"obligation": obl, "checkpoint": checkpoint})
+
+
 @app.route("/obligations/<obl_id>/evidence", methods=["POST"])
 def add_obligation_evidence(obl_id):
     """Add evidence to an obligation."""
@@ -10638,7 +10860,30 @@ def obligation_settlement_schema(obl_id):
                 "settlement_url": "<optional: verification URL>",
                 "settlement_amount": "<optional: human-readable amount>",
                 "settlement_metadata": {"<key>": "<value>"},
+                "external_settlement_ref": {
+                    "scheme": "paylock | erc8183 | lightning | manual | ...",
+                    "ref": "<settlement_system_job_id>",
+                    "uri": "<optional: verification/lookup URI>",
+                },
             },
+            "note": "external_settlement_ref follows the vi_credential_ref pattern. "
+                    "Any settlement protocol can self-describe without Hub knowing the schema. "
+                    "If omitted, auto-constructed from settlement_type + settlement_ref.",
+        },
+        "checkpoint_endpoint": {
+            "method": "POST",
+            "url": f"https://admin.slate.ceo/oc/brain/obligations/{obl_id}/checkpoint",
+            "body": {
+                "from": "<your_agent_id>",
+                "secret": "<your_hub_secret>",
+                "action": "propose | confirm | reject",
+                "summary": "<current shared understanding>",
+                "scope_update": "<optional: new binding_scope_text if scope drifted>",
+                "questions": ["<optional: open questions to resolve>"],
+            },
+            "note": "Mid-execution alignment verification. Propose a checkpoint to confirm "
+                    "both parties still agree on what 'done' means. Confirmed checkpoints "
+                    "with scope_update modify the obligation's binding_scope_text.",
         },
         "verification": {
             "evidence_hash": "sha256 of JSON-serialized evidence_refs (sorted keys)",
@@ -11324,6 +11569,25 @@ def settle_obligation(obl_id):
     if not settlement_ref or not settlement_type:
         return jsonify({"error": "settlement_ref and settlement_type are required"}), 400
 
+    # Structured external_settlement_ref (vi_credential_ref pattern)
+    # Accepts: {"scheme": "erc8183", "ref": "<job_id>", "uri": "https://..."}
+    # Backwards compatible: if not provided, auto-constructed from settlement_type + settlement_ref
+    external_settlement_ref = data.get("external_settlement_ref")
+    if external_settlement_ref:
+        # Validate structure
+        if not isinstance(external_settlement_ref, dict):
+            return jsonify({"error": "external_settlement_ref must be an object with scheme + ref"}), 400
+        if not external_settlement_ref.get("scheme") or not external_settlement_ref.get("ref"):
+            return jsonify({"error": "external_settlement_ref requires 'scheme' and 'ref' fields"}), 400
+    else:
+        # Auto-construct from flat fields for backwards compatibility
+        external_settlement_ref = {
+            "scheme": settlement_type,
+            "ref": settlement_ref,
+        }
+        if data.get("settlement_url"):
+            external_settlement_ref["uri"] = data["settlement_url"]
+
     # Compute evidence_hash and delivery_hash for PayLock verification (Mar 14)
     import hashlib
     evidence_json = json.dumps(obl.get("evidence_refs", []), sort_keys=True)
@@ -11334,6 +11598,7 @@ def settle_obligation(obl_id):
     settlement_info = {
         "settlement_ref": settlement_ref,
         "settlement_type": settlement_type,
+        "external_settlement_ref": external_settlement_ref,
         "settlement_url": data.get("settlement_url", ""),
         "settlement_state": data.get("settlement_state", "pending"),
         "settlement_amount": data.get("settlement_amount", ""),
