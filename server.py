@@ -1283,6 +1283,8 @@ def get_agent(agent_id):
     }
     if info.get("intent"):
         result["intent"] = info["intent"]
+    if info.get("heartbeat_interval"):
+        result["heartbeat_interval"] = info["heartbeat_interval"]
     return jsonify(result)
 
 @app.route("/agents/<agent_id>/portfolio", methods=["GET"])
@@ -1570,6 +1572,31 @@ def update_agent(agent_id):
             updated.append("intent (cleared)")
         else:
             return jsonify({"ok": False, "error": "intent must be an object with {seeking, deadline, budget, match_criteria}"}), 400
+    if "heartbeat_interval" in data:
+        hb_interval = data["heartbeat_interval"]
+        if isinstance(hb_interval, dict):
+            # Shape: {seconds: int, description: str, last_active_utc: str}
+            allowed_hb_keys = {"seconds", "description", "last_active_utc"}
+            hb_interval = {k: v for k, v in hb_interval.items() if k in allowed_hb_keys}
+            if "seconds" in hb_interval:
+                try:
+                    hb_interval["seconds"] = int(hb_interval["seconds"])
+                except (ValueError, TypeError):
+                    return jsonify({"ok": False, "error": "heartbeat_interval.seconds must be an integer"}), 400
+            hb_interval["updated_at"] = datetime.utcnow().isoformat()
+            agents[agent_id]["heartbeat_interval"] = hb_interval
+            updated.append("heartbeat_interval")
+        elif hb_interval is None or hb_interval == "":
+            agents[agent_id].pop("heartbeat_interval", None)
+            updated.append("heartbeat_interval (cleared)")
+        elif isinstance(hb_interval, (int, float)):
+            agents[agent_id]["heartbeat_interval"] = {
+                "seconds": int(hb_interval),
+                "updated_at": datetime.utcnow().isoformat()
+            }
+            updated.append("heartbeat_interval")
+        else:
+            return jsonify({"ok": False, "error": "heartbeat_interval must be an object {seconds, description, last_active_utc} or an integer (seconds)"}), 400
     if "solana_wallet" in data:
         new_wallet = data["solana_wallet"]
         agents[agent_id]["solana_wallet"] = new_wallet
@@ -10467,7 +10494,18 @@ def create_obligation():
     obls.append(obl)
     save_obligations(obls)
 
-    return jsonify({"obligation": obl}), 201
+    # Include counterparty heartbeat interval in response if available
+    response = {"obligation": obl}
+    cp_info = agents.get(counterparty, {})
+    if cp_info.get("heartbeat_interval"):
+        response["counterparty_heartbeat"] = cp_info["heartbeat_interval"]
+        response["note"] = (
+            f"Counterparty '{counterparty}' declares a heartbeat interval of "
+            f"{cp_info['heartbeat_interval'].get('seconds', '?')}s. "
+            f"Silence shorter than this is normal, not signal."
+        )
+
+    return jsonify(response), 201
 
 
 @app.route("/obligations/propose", methods=["POST"])
