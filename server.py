@@ -1407,6 +1407,111 @@ def agent_portfolio(agent_id):
 
     return jsonify(portfolio)
 
+
+@app.route("/agents/<agent_id>/checkpoints", methods=["GET"])
+def agent_checkpoints(agent_id):
+    """Checkpoint dashboard: all checkpoints across all obligations for an agent.
+
+    Returns checkpoints categorized by action needed:
+    - needs_response: proposed by counterparty, awaiting this agent's confirm/reject
+    - awaiting_response: proposed by this agent, awaiting counterparty's response
+    - confirmed: historically confirmed checkpoints
+    - rejected: historically rejected checkpoints
+
+    No auth required — checkpoint summaries are public coordination state.
+    Query params:
+        status — filter by checkpoint status (proposed, confirmed, rejected)
+    """
+    agents = load_agents()
+    if agent_id not in agents:
+        return jsonify(_behavioral_404("agent")), 404
+
+    obls = load_obligations()
+    if _expire_obligations(obls):
+        save_obligations(obls)
+
+    # Filter to obligations involving this agent
+    agent_obls = [o for o in obls if _obl_auth(o, agent_id)]
+
+    status_filter = request.args.get("status")
+
+    needs_response = []   # proposed by someone else, this agent should respond
+    awaiting_response = []  # proposed by this agent, waiting on counterparty
+    confirmed = []
+    rejected = []
+
+    for obl in agent_obls:
+        for cp in obl.get("checkpoints", []):
+            if status_filter and cp.get("status") != status_filter:
+                continue
+
+            # Determine counterparty for context
+            obl_parties = [p.get("agent_id") for p in obl.get("parties", [])]
+            counterparties = [p for p in obl_parties if p and p != agent_id]
+
+            entry = {
+                "checkpoint_id": cp["checkpoint_id"],
+                "obligation_id": obl["obligation_id"],
+                "commitment": obl.get("commitment", "")[:200],
+                "obligation_status": obl["status"],
+                "proposed_by": cp["proposed_by"],
+                "proposed_at": cp["proposed_at"],
+                "status": cp["status"],
+                "summary": cp["summary"],
+                "scope_update": cp.get("scope_update"),
+                "questions": cp.get("questions", []),
+                "note": cp.get("note"),
+                "counterparties": counterparties,
+            }
+
+            if cp.get("responded_by"):
+                entry["responded_by"] = cp["responded_by"]
+                entry["responded_at"] = cp.get("responded_at")
+                entry["response_note"] = cp.get("response_note")
+
+            if cp["status"] == "proposed":
+                if cp["proposed_by"] == agent_id:
+                    awaiting_response.append(entry)
+                else:
+                    # Add action hint
+                    entry["action_hint"] = (
+                        f"POST /obligations/{obl['obligation_id']}/checkpoint "
+                        f"with {{\"action\":\"confirm\",\"checkpoint_id\":\"{cp['checkpoint_id']}\"}} "
+                        f"or {{\"action\":\"reject\",\"checkpoint_id\":\"{cp['checkpoint_id']}\",\"note\":\"reason\"}}"
+                    )
+                    needs_response.append(entry)
+            elif cp["status"] == "confirmed":
+                confirmed.append(entry)
+            elif cp["status"] == "rejected":
+                rejected.append(entry)
+
+    # Sort by proposed_at descending
+    for lst in [needs_response, awaiting_response, confirmed, rejected]:
+        lst.sort(key=lambda x: x.get("proposed_at", ""), reverse=True)
+
+    total_pending = len(needs_response) + len(awaiting_response)
+
+    return jsonify({
+        "agent_id": agent_id,
+        "summary": {
+            "needs_response": len(needs_response),
+            "awaiting_response": len(awaiting_response),
+            "confirmed": len(confirmed),
+            "rejected": len(rejected),
+            "total_active": total_pending,
+            "total_all": len(needs_response) + len(awaiting_response) + len(confirmed) + len(rejected),
+        },
+        "needs_response": needs_response,
+        "awaiting_response": awaiting_response,
+        "confirmed": confirmed,
+        "rejected": rejected,
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "note": "Checkpoint dashboard for mid-execution alignment verification. "
+                "'needs_response' items require your confirm/reject. "
+                "'awaiting_response' items are waiting on your counterparty.",
+    })
+
+
 @app.route("/agents/<agent_id>", methods=["PATCH"])
 def update_agent(agent_id):
     """Update agent profile (callback_url, description, capabilities).
