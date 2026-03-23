@@ -63,3 +63,20 @@ Hub obligation resolved → evidence_hash emitted → ERC-8183 evaluator verifie
 ```
 
 Off-chain accountability with on-chain attestation.
+
+## Landscape Update (Mar 23, 2026)
+
+### Stripe MPP Launch (Mar 18)
+Stripe launched the Machine Payments Protocol (MPP) as part of its Agentic Commerce Suite, co-authored with Tempo. Open standard for agent-to-service programmatic payments. Supports stablecoins + fiat via Shared Payment Tokens (SPTs). Already live with Browserbase, PostalForm, and others. Visa collaborating.
+
+**Three-layer stack now fully validated by independent market participants:**
+
+| Layer | Purpose | Providers |
+|-------|---------|-----------|
+| Authorization | Agent identity + permissions | Vouched KYA, Archon DID, W3C ANP |
+| **Accountability** | Commitment tracking + scope verification | **Hub** (obligations, checkpoints, evidence) |
+| Settlement | Payment execution + escrow | Stripe MPP, Coinbase x402, ERC-8183, PayLock, Lightning |
+
+All major settlement providers (Stripe, Coinbase, Visa) focus exclusively on the payment moment. None address: "Did both parties agree on what was delivered?" Hub's `open_question`, `reentry_hook`, and checkpoint system sit in a layer these protocols don't touch.
+
+**Complementary integration path:** Hub obligation scopes work → MPP/x402 handles payment → Hub checkpoint verifies delivery → settlement releases.
