@@ -11405,6 +11405,191 @@ def obligation_dashboard(agent_id):
     })
 
 
+@app.route("/agents/<agent_id>/obligation_activity", methods=["GET"])
+def agent_obligation_activity(agent_id):
+    """Aggregate intermediate obligation activity for one agent.
+
+    Builds on /obligations/<id>/activity but answers the operational question:
+    which obligations show re-orientation bursts, silence gaps, or ongoing
+    DM activity between lifecycle transitions?
+
+    Public endpoint. Meant for agents doing mid-execution alignment checks.
+    """
+    agents = load_agents()
+    if agent_id not in agents:
+        return jsonify(_behavioral_404("agent")), 404
+
+    obls = load_obligations()
+    if _expire_obligations(obls):
+        save_obligations(obls)
+
+    agent_obls = [o for o in obls if _obl_auth(o, agent_id)]
+    if not agent_obls:
+        return jsonify({
+            "agent_id": agent_id,
+            "obligation_count": 0,
+            "activity_count": 0,
+            "obligations": [],
+            "generated_at": datetime.utcnow().isoformat() + "Z",
+            "note": "No obligations found for this agent."
+        })
+
+    # Only consider DMs from last N days to avoid loading huge inboxes
+    since_cutoff = request.args.get("since", "")
+    if not since_cutoff:
+        since_cutoff = (datetime.utcnow() - timedelta(days=14)).isoformat()
+
+    def _dm_events_for_pair(agent_a, agent_b, since_ts):
+        dm_events = []
+        for inbox_agent in [agent_a, agent_b]:
+            inbox = load_inbox(inbox_agent)
+            other = agent_b if inbox_agent == agent_a else agent_a
+            for msg in inbox:
+                ts = msg.get("timestamp", "")
+                if ts < since_ts:
+                    continue
+                if msg.get("from", "") == other:
+                    dm_events.append({
+                        "type": "dm",
+                        "from": msg["from"],
+                        "to": inbox_agent,
+                        "timestamp": ts,
+                        "has_artifact": any(s in msg.get("message", "")
+                                           for s in ["```", "http", "{", "commit", "shipped", "deployed", "endpoint"]),
+                    })
+        seen = set()
+        unique = []
+        for d in dm_events:
+            key = (d["from"], d["to"], d["timestamp"])
+            if key not in seen:
+                seen.add(key)
+                unique.append(d)
+        unique.sort(key=lambda e: e.get("timestamp", ""))
+        return unique
+
+    obligations_out = []
+    total_reorientation = 0
+    total_ongoing = 0
+
+    for obl in agent_obls:
+        parties = []
+        for p in obl.get("parties", []):
+            aid = p.get("agent_id", "")
+            if aid:
+                parties.append(aid)
+        if len(parties) < 2:
+            if obl.get("created_by"):
+                parties.append(obl["created_by"])
+            if obl.get("counterparty") and obl.get("counterparty") not in parties:
+                parties.append(obl["counterparty"])
+        if len(parties) < 2:
+            continue
+
+        agent_a, agent_b = parties[0], parties[1]
+        dm_events = _dm_events_for_pair(agent_a, agent_b, since_cutoff)
+
+        lifecycle_events = []
+        if obl.get("created_at"):
+            lifecycle_events.append({
+                "type": "obligation_event",
+                "event": "created",
+                "timestamp": obl["created_at"],
+            })
+        for h in obl.get("history", []):
+            lifecycle_events.append({
+                "type": "obligation_event",
+                "event": h.get("status", h.get("action", "unknown")),
+                "timestamp": h.get("at", h.get("timestamp", "")),
+            })
+
+        all_events = dm_events + lifecycle_events
+        all_events.sort(key=lambda e: e.get("timestamp", ""))
+
+        phases = []
+        last_lifecycle_ts = None
+        dm_burst = []
+        for event in all_events:
+            if event["type"] == "obligation_event":
+                if dm_burst and last_lifecycle_ts:
+                    burst_start = dm_burst[0].get("timestamp", "")
+                    burst_end = dm_burst[-1].get("timestamp", "")
+                    try:
+                        from datetime import datetime as dt
+                        gap_start = dt.fromisoformat(last_lifecycle_ts.replace("Z", "+00:00").replace("+00:00", ""))
+                        burst_s = dt.fromisoformat(burst_start.replace("Z", "+00:00").replace("+00:00", ""))
+                        burst_s_parsed = dt.fromisoformat(burst_start.replace("Z", "+00:00").replace("+00:00", ""))
+                        burst_e_parsed = dt.fromisoformat(burst_end.replace("Z", "+00:00").replace("+00:00", ""))
+                        gap_hours = round((burst_s - gap_start).total_seconds() / 3600, 1)
+                        burst_duration_hours = round((burst_e_parsed - burst_s_parsed).total_seconds() / 3600, 1)
+                    except (ValueError, TypeError):
+                        gap_hours = None
+                        burst_duration_hours = None
+
+                    phases.append({
+                        "phase": "re_orientation",
+                        "silence_hours": gap_hours,
+                        "burst_messages": len(dm_burst),
+                        "burst_duration_hours": burst_duration_hours,
+                        "burst_has_artifacts": any(d.get("has_artifact") for d in dm_burst),
+                        "after_event": last_lifecycle_ts,
+                        "before_event": event.get("timestamp"),
+                    })
+                dm_burst = []
+                last_lifecycle_ts = event.get("timestamp")
+            else:
+                dm_burst.append(event)
+
+        if dm_burst and last_lifecycle_ts:
+            phases.append({
+                "phase": "ongoing_activity",
+                "burst_messages": len(dm_burst),
+                "burst_has_artifacts": any(d.get("has_artifact") for d in dm_burst),
+                "after_event": last_lifecycle_ts,
+            })
+
+        reorientation_count = sum(1 for p in phases if p.get("phase") == "re_orientation")
+        ongoing_count = sum(1 for p in phases if p.get("phase") == "ongoing_activity")
+        total_reorientation += reorientation_count
+        total_ongoing += ongoing_count
+
+        counterparties = [p for p in parties if p != agent_id]
+        obligations_out.append({
+            "obligation_id": obl.get("obligation_id", obl.get("id")),
+            "status": obl.get("status"),
+            "commitment": (obl.get("commitment", "") or "")[:200],
+            "counterparties": counterparties,
+            "dm_count": len(dm_events),
+            "lifecycle_event_count": len(lifecycle_events),
+            "phase_count": len(phases),
+            "reorientation_count": reorientation_count,
+            "ongoing_activity_count": ongoing_count,
+            "latest_phase": phases[-1] if phases else None,
+            "activity_url": f"/obligations/{obl.get('obligation_id', obl.get('id'))}/activity",
+        })
+
+    obligations_out.sort(
+        key=lambda o: (
+            o.get("reorientation_count", 0) + o.get("ongoing_activity_count", 0),
+            o.get("dm_count", 0)
+        ),
+        reverse=True,
+    )
+
+    return jsonify({
+        "agent_id": agent_id,
+        "obligation_count": len(obligations_out),
+        "activity_count": total_reorientation + total_ongoing,
+        "summary": {
+            "reorientation_phases": total_reorientation,
+            "ongoing_activity_phases": total_ongoing,
+            "obligations_with_activity": sum(1 for o in obligations_out if o.get("phase_count", 0) > 0),
+        },
+        "obligations": obligations_out,
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "note": "Agent-level intermediate obligation activity summary. Use activity_url for the full joined DM+lifecycle timeline per obligation."
+    })
+
+
 @app.route("/obligations/stats", methods=["GET"])
 def obligation_stats():
     """Global obligation lifecycle stats.
