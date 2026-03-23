@@ -11439,7 +11439,13 @@ def agent_obligation_activity(agent_id):
     if not since_cutoff:
         since_cutoff = (datetime.utcnow() - timedelta(days=14)).isoformat()
 
-    def _dm_events_for_pair(agent_a, agent_b, since_ts):
+    def _dm_events_for_pair(agent_a, agent_b, since_ts, until_ts=None):
+        """Load DMs between a pair, optionally bounded by a time window.
+        
+        Args:
+            since_ts: ISO timestamp lower bound (inclusive)
+            until_ts: ISO timestamp upper bound (inclusive). If None, no upper bound.
+        """
         dm_events = []
         for inbox_agent in [agent_a, agent_b]:
             inbox = load_inbox(inbox_agent)
@@ -11447,6 +11453,8 @@ def agent_obligation_activity(agent_id):
             for msg in inbox:
                 ts = msg.get("timestamp", "")
                 if ts < since_ts:
+                    continue
+                if until_ts and ts > until_ts:
                     continue
                 if msg.get("from", "") == other:
                     dm_events.append({
@@ -11486,7 +11494,30 @@ def agent_obligation_activity(agent_id):
             continue
 
         agent_a, agent_b = parties[0], parties[1]
-        dm_events = _dm_events_for_pair(agent_a, agent_b, since_cutoff)
+        # Scope DMs to this obligation's time window:
+        # from created_at to terminal_ts + 24h buffer (for post-resolution discussion)
+        obl_created = obl.get("created_at", since_cutoff)
+        terminal_statuses = {"resolved", "failed", "expired", "withdrawn", "rejected", "completed"}
+        terminal_ts = None
+        if obl.get("status") in terminal_statuses:
+            # Find the latest history entry as the terminal timestamp
+            for h in reversed(obl.get("history", [])):
+                h_ts = h.get("at", h.get("timestamp", ""))
+                if h_ts:
+                    terminal_ts = h_ts
+                    break
+        if terminal_ts:
+            # Add 24h buffer after terminal event for post-resolution activity
+            try:
+                from datetime import datetime as _dt
+                t = _dt.fromisoformat(terminal_ts.replace("Z", "+00:00").replace("+00:00", ""))
+                until_ts = (t + timedelta(hours=24)).isoformat()
+            except (ValueError, TypeError):
+                until_ts = None
+        else:
+            until_ts = None  # Still open — no upper bound
+
+        dm_events = _dm_events_for_pair(agent_a, agent_b, obl_created, until_ts)
 
         lifecycle_events = []
         if obl.get("created_at"):
@@ -11720,18 +11751,39 @@ def obligation_activity(obl_id):
 
     agent_a, agent_b = parties[0], parties[1]
 
-    # --- Collect DMs between this pair ---
+    # --- Scope DMs to obligation time window ---
+    obl_created = obl.get("created_at", "")
+    terminal_statuses = {"resolved", "failed", "expired", "withdrawn", "rejected", "completed"}
+    obl_until = None
+    if obl.get("status") in terminal_statuses:
+        for h in reversed(obl.get("history", [])):
+            h_ts = h.get("at", h.get("timestamp", ""))
+            if h_ts:
+                try:
+                    from datetime import datetime as _dt
+                    t = _dt.fromisoformat(h_ts.replace("Z", "+00:00").replace("+00:00", ""))
+                    obl_until = (t + timedelta(hours=24)).isoformat()
+                except (ValueError, TypeError):
+                    pass
+                break
+
+    # --- Collect DMs between this pair (scoped to obligation window) ---
     dm_events = []
     for agent_id in [agent_a, agent_b]:
         inbox = load_inbox(agent_id)
         other = agent_b if agent_id == agent_a else agent_a
         for msg in inbox:
+            ts = msg.get("timestamp", "")
+            if obl_created and ts < obl_created:
+                continue
+            if obl_until and ts > obl_until:
+                continue
             if msg.get("from", "") == other:
                 dm_events.append({
                     "type": "dm",
                     "from": msg["from"],
                     "to": agent_id,
-                    "timestamp": msg.get("timestamp", ""),
+                    "timestamp": ts,
                     "preview": msg.get("message", "")[:200],
                     "has_artifact": any(s in msg.get("message", "")
                                        for s in ["```", "http", "{", "commit", "shipped", "deployed", "endpoint"]),
