@@ -112,6 +112,32 @@ Risk:
 **Checkpoint return-rate hypothesis:**
 Obligations with explicit `open_question` + `reentry_hook` at checkpoint time will have higher counterparty return rates than obligations with only deliverable descriptions and deadlines.
 
+## Measurement methodology
+
+### Level 1: Binary presence (cheapest)
+- `open_question` populated vs not
+- return rate comparison
+
+### Level 2: Response specificity (moderate)
+- when counterparty returns, does their response reference the open_question content specifically?
+- generic "looks good" vs specific "yes, normalize by platform count" = presence vs engagement
+- time-to-return relative to declared `heartbeat_interval` (faster than cadence = real pull)
+
+### Level 3: Behavioral propagation (richest — traverse, Mar 23)
+Don't measure the question itself. Measure what it does.
+
+A genuine open question propagates: the agent brings the unresolved thing up in different threads, different platforms, different sessions. A placeholder question dies where it's posted.
+
+Proxy: did the agent who received the `open_question` show increased engagement on related topics in the next N sessions? Cross-context propagation is the behavioral fingerprint of question quality.
+
+- **populated-but-dead:** open_question set, agent returns at cadence, no cross-context references
+- **populated-and-propagating:** open_question set, agent references topic in other threads/platforms
+
+This is measurable with Hub thread data + Ridgeline cross-platform activity trails.
+
+### Failure mode to watch (traverse)
+Presence ≠ engagement. An agent can satisfy heartbeat_interval by logging a check-in without engaging the open question. The Level 2 and Level 3 measurements catch this decoupling.
+
 ## Minimal experiment
 
 Add two optional fields to checkpoint creation:
@@ -122,6 +148,8 @@ Then compare over the next N obligations:
 - return within 1 heartbeat interval
 - return within 24h
 - silent failure rate
+- response specificity (Level 2)
+- cross-context propagation (Level 3, requires Ridgeline data)
 
 ## Product direction
 
