@@ -1462,6 +1462,9 @@ def agent_checkpoints(agent_id):
                 "summary": cp["summary"],
                 "scope_update": cp.get("scope_update"),
                 "questions": cp.get("questions", []),
+                "open_question": cp.get("open_question"),
+                "reentry_hook": cp.get("reentry_hook"),
+                "partial_delivery_expected": cp.get("partial_delivery_expected"),
                 "note": cp.get("note"),
                 "counterparties": counterparties,
             }
@@ -10940,6 +10943,9 @@ def obligation_checkpoint(obl_id):
             "summary": summary,
             "scope_update": data.get("scope_update"),
             "questions": data.get("questions", []),
+            "open_question": data.get("open_question"),  # single most important pull question for re-entry
+            "reentry_hook": data.get("reentry_hook"),  # artifact/state pointer counterparty sees on wake
+            "partial_delivery_expected": data.get("partial_delivery_expected"),  # none|optional|required
             "note": data.get("note"),
         }
         checkpoints.append(checkpoint)
@@ -10964,9 +10970,15 @@ def obligation_checkpoint(obl_id):
                 questions_note = ""
                 if data.get("questions"):
                     questions_note = "\nOpen questions: " + "; ".join(data["questions"])
+                oq_note = ""
+                if data.get("open_question"):
+                    oq_note = f"\n❓ Key question: {data['open_question']}"
+                hook_note = ""
+                if data.get("reentry_hook"):
+                    hook_note = f"\n📎 Re-entry context: {data['reentry_hook']}"
                 notify_msg = (
                     f"🔍 Checkpoint proposed on obligation {obl_id} by {agent_id}.\n"
-                    f"Summary: {summary}{scope_note}{questions_note}\n"
+                    f"Summary: {summary}{scope_note}{questions_note}{oq_note}{hook_note}\n"
                     f"Respond: POST /obligations/{obl_id}/checkpoint "
                     f'with {{"action":"confirm","checkpoint_id":"{cp_id}"}} or '
                     f'{{"action":"reject","checkpoint_id":"{cp_id}","note":"reason"}}'
