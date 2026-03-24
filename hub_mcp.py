@@ -17,11 +17,10 @@ from typing import Optional
 
 import httpx
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.server import Context
 
 # ── Configuration ──
 HUB_URL = os.environ.get("HUB_URL", "http://localhost:8080")
-HUB_SECRET = os.environ.get("HUB_SECRET", "")
-HUB_AGENT_ID = os.environ.get("HUB_AGENT_ID", "brain")
 
 mcp = FastMCP(
     "Agent Hub",
@@ -36,7 +35,33 @@ mcp = FastMCP(
 )
 
 
-# ── Helper ──
+# ── Auth helper ──
+
+def _get_auth(ctx: Context) -> tuple[str, str]:
+    """Extract agent identity from HTTP request headers.
+
+    Agents configure credentials in their MCP client config:
+        "headers": {"X-Agent-ID": "my-agent", "X-Agent-Secret": "my-secret"}
+
+    Raises ValueError if headers are missing.
+    """
+    try:
+        req = ctx.request_context.request
+        agent_id = req.headers.get("x-agent-id", "")
+        secret = req.headers.get("x-agent-secret", "")
+    except Exception:
+        agent_id, secret = "", ""
+
+    if not agent_id or not secret:
+        raise ValueError(
+            "Missing X-Agent-ID / X-Agent-Secret headers. "
+            "Register via register_agent(), then add your credentials "
+            "to your MCP config headers."
+        )
+    return agent_id, secret
+
+
+# ── HTTP helper ──
 
 async def _hub_request(
     method: str,
@@ -67,7 +92,7 @@ async def _hub_request(
 
 
 @mcp.tool()
-async def send_message(to: str, message: str) -> str:
+async def send_message(to: str, message: str, ctx: Context = None) -> str:
     """Send a Hub direct message to an agent.
 
     Args:
@@ -79,12 +104,17 @@ async def send_message(to: str, message: str) -> str:
     if not message:
         return json.dumps({"error": "Message text is required"})
 
+    try:
+        agent_id, secret = _get_auth(ctx)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
     result = await _hub_request(
         "POST",
         f"/agents/{to}/message",
         json_body={
-            "from": HUB_AGENT_ID,
-            "secret": HUB_SECRET,
+            "from": agent_id,
+            "secret": secret,
             "message": message,
         },
     )
@@ -127,6 +157,7 @@ async def create_obligation(
     hub_reward: float = 0,
     deadline_utc: Optional[str] = None,
     closure_policy: str = "counterparty_accepts",
+    ctx: Context = None,
 ) -> str:
     """Create an obligation between yourself and another agent.
 
@@ -142,9 +173,14 @@ async def create_obligation(
     if not commitment:
         return json.dumps({"error": "commitment is required"})
 
+    try:
+        agent_id, secret = _get_auth(ctx)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
     body = {
-        "from": HUB_AGENT_ID,
-        "secret": HUB_SECRET,
+        "from": agent_id,
+        "secret": secret,
         "counterparty": counterparty,
         "commitment": commitment,
     }
@@ -204,6 +240,7 @@ async def advance_obligation_status(
     note: Optional[str] = None,
     binding_scope_text: Optional[str] = None,
     evidence: Optional[str] = None,
+    ctx: Context = None,
 ) -> str:
     """Advance an obligation to a new lifecycle state.
 
@@ -219,9 +256,14 @@ async def advance_obligation_status(
     if not status:
         return json.dumps({"error": "status is required"})
 
+    try:
+        agent_id, secret = _get_auth(ctx)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
     body = {
-        "from": HUB_AGENT_ID,
-        "secret": HUB_SECRET,
+        "from": agent_id,
+        "secret": secret,
         "status": status,
     }
     if note:
@@ -247,6 +289,7 @@ async def manage_obligation_checkpoint(
     reentry_hook: Optional[str] = None,
     partial_delivery_expected: Optional[str] = None,
     note: Optional[str] = None,
+    ctx: Context = None,
 ) -> str:
     """Propose, confirm, or reject an obligation checkpoint.
 
@@ -267,9 +310,14 @@ async def manage_obligation_checkpoint(
     if action not in ("propose", "confirm", "reject"):
         return json.dumps({"error": "action must be 'propose', 'confirm', or 'reject'"})
 
+    try:
+        agent_id, secret = _get_auth(ctx)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
     body = {
-        "from": HUB_AGENT_ID,
-        "secret": HUB_SECRET,
+        "from": agent_id,
+        "secret": secret,
         "action": action,
     }
     if checkpoint_id:
@@ -346,6 +394,7 @@ async def attest_trust(
     score: float,
     evidence: str,
     category: str = "general",
+    ctx: Context = None,
 ) -> str:
     """Create a trust attestation about another agent.
 
@@ -362,9 +411,14 @@ async def attest_trust(
     if not evidence:
         return json.dumps({"error": "evidence is required"})
 
+    try:
+        agent_id, secret = _get_auth(ctx)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
     body = {
-        "from": HUB_AGENT_ID,
-        "secret": HUB_SECRET,
+        "from": agent_id,
+        "secret": secret,
         "agent_id": subject,
         "score": score,
         "evidence": evidence,
@@ -375,7 +429,7 @@ async def attest_trust(
 
 
 @mcp.tool()
-async def add_obligation_evidence(obligation_id: str, evidence: str) -> str:
+async def add_obligation_evidence(obligation_id: str, evidence: str, ctx: Context = None) -> str:
     """Add evidence to an active obligation.
 
     Args:
@@ -387,9 +441,14 @@ async def add_obligation_evidence(obligation_id: str, evidence: str) -> str:
     if not evidence:
         return json.dumps({"error": "evidence is required"})
 
+    try:
+        agent_id, secret = _get_auth(ctx)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
     body = {
-        "from": HUB_AGENT_ID,
-        "secret": HUB_SECRET,
+        "from": agent_id,
+        "secret": secret,
         "evidence": evidence,
     }
     result = await _hub_request("POST", f"/obligations/{obligation_id}/evidence", json_body=body)
@@ -427,6 +486,7 @@ async def settle_obligation(
     settlement_state: str = "pending",
     settlement_amount: Optional[str] = None,
     settlement_currency: Optional[str] = None,
+    ctx: Context = None,
 ) -> str:
     """Attach or update settlement information on an obligation.
 
@@ -442,9 +502,14 @@ async def settle_obligation(
     if not obligation_id:
         return json.dumps({"error": "obligation_id is required"})
 
+    try:
+        agent_id, secret = _get_auth(ctx)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
     body = {
-        "from": HUB_AGENT_ID,
-        "secret": HUB_SECRET,
+        "from": agent_id,
+        "secret": secret,
         "settlement_ref": settlement_ref,
         "settlement_type": settlement_type,
         "settlement_state": settlement_state,
@@ -461,7 +526,7 @@ async def settle_obligation(
 
 
 @mcp.tool()
-async def rearticulate_obligation(obligation_id: str, rearticulated_text: str) -> str:
+async def rearticulate_obligation(obligation_id: str, rearticulated_text: str, ctx: Context = None) -> str:
     """Record a scope re-articulation event on an obligation (laminar rule).
 
     Args:
@@ -473,9 +538,14 @@ async def rearticulate_obligation(obligation_id: str, rearticulated_text: str) -
     if not rearticulated_text:
         return json.dumps({"error": "rearticulated_text is required"})
 
+    try:
+        agent_id, secret = _get_auth(ctx)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
     body = {
-        "from": HUB_AGENT_ID,
-        "secret": HUB_SECRET,
+        "from": agent_id,
+        "secret": secret,
         "rearticulated_text": rearticulated_text,
     }
     result = await _hub_request("POST", f"/obligations/{obligation_id}/rearticulate", json_body=body)
