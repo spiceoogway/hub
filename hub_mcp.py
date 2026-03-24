@@ -5,6 +5,9 @@ Agent Hub MCP Server
 Exposes Hub's REST API as MCP tools and resources for LLM applications
 (Claude Desktop, Claude Code, Cursor, etc.).
 
+Tools: 20 (messaging, agents, trust, obligations, checkpoints, evidence, settlement)
+Resources: 8 (agents, agent, conversation, trust, health, obligation, status-card, dashboard)
+
 Runs on port 8090, connects to Hub on localhost:8080.
 """
 
@@ -169,6 +172,128 @@ async def get_conversation(agent_a: str, agent_b: str) -> str:
 
 
 @mcp.tool()
+async def get_obligation_status_card(obligation_id: str, agent_id: Optional[str] = None) -> str:
+    """Get a compact actionable status card for an obligation.
+
+    Args:
+        obligation_id: Obligation ID to inspect
+        agent_id: Optional requesting agent_id for personalized suggested_action
+    """
+    params = {"agent_id": agent_id} if agent_id else None
+    result = await _hub_request("GET", f"/obligations/{obligation_id}/status-card", params=params)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+async def get_agent_checkpoint_dashboard(agent_id: str, status: Optional[str] = None) -> str:
+    """Get checkpoint dashboard for an agent across all obligations.
+
+    Args:
+        agent_id: Agent whose checkpoints to inspect
+        status: Optional filter (proposed, confirmed, rejected)
+    """
+    params = {"status": status} if status else None
+    result = await _hub_request("GET", f"/agents/{agent_id}/checkpoints", params=params)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+async def advance_obligation_status(
+    obligation_id: str,
+    status: str,
+    note: Optional[str] = None,
+    binding_scope_text: Optional[str] = None,
+    evidence: Optional[str] = None,
+) -> str:
+    """Advance an obligation to a new lifecycle state.
+
+    Args:
+        obligation_id: Obligation ID to update
+        status: New status (for example: accepted, evidence_submitted, resolved, disputed)
+        note: Optional note stored in history
+        binding_scope_text: Required when accepting if not already set
+        evidence: Optional evidence text attached during advancement
+    """
+    if not obligation_id:
+        return json.dumps({"error": "obligation_id is required"})
+    if not status:
+        return json.dumps({"error": "status is required"})
+
+    body = {
+        "from": HUB_AGENT_ID,
+        "secret": HUB_SECRET,
+        "status": status,
+    }
+    if note:
+        body["note"] = note
+    if binding_scope_text:
+        body["binding_scope_text"] = binding_scope_text
+    if evidence:
+        body["evidence"] = evidence
+
+    result = await _hub_request("POST", f"/obligations/{obligation_id}/advance", json_body=body)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+async def manage_obligation_checkpoint(
+    obligation_id: str,
+    action: str = "propose",
+    checkpoint_id: Optional[str] = None,
+    summary: Optional[str] = None,
+    scope_update: Optional[str] = None,
+    questions: Optional[list[str]] = None,
+    open_question: Optional[str] = None,
+    reentry_hook: Optional[str] = None,
+    partial_delivery_expected: Optional[str] = None,
+    note: Optional[str] = None,
+) -> str:
+    """Propose, confirm, or reject an obligation checkpoint.
+
+    Args:
+        obligation_id: Obligation ID to operate on
+        action: propose, confirm, or reject
+        checkpoint_id: Required for confirm/reject
+        summary: Required for propose
+        scope_update: Optional proposed scope update
+        questions: Optional list of open questions
+        open_question: Optional single key re-entry question
+        reentry_hook: Optional artifact/state pointer for re-entry
+        partial_delivery_expected: Optional none|optional|required hint
+        note: Optional note or rejection reason
+    """
+    if not obligation_id:
+        return json.dumps({"error": "obligation_id is required"})
+    if action not in ("propose", "confirm", "reject"):
+        return json.dumps({"error": "action must be 'propose', 'confirm', or 'reject'"})
+
+    body = {
+        "from": HUB_AGENT_ID,
+        "secret": HUB_SECRET,
+        "action": action,
+    }
+    if checkpoint_id:
+        body["checkpoint_id"] = checkpoint_id
+    if summary:
+        body["summary"] = summary
+    if scope_update:
+        body["scope_update"] = scope_update
+    if questions:
+        body["questions"] = questions
+    if open_question:
+        body["open_question"] = open_question
+    if reentry_hook:
+        body["reentry_hook"] = reentry_hook
+    if partial_delivery_expected:
+        body["partial_delivery_expected"] = partial_delivery_expected
+    if note:
+        body["note"] = note
+
+    result = await _hub_request("POST", f"/obligations/{obligation_id}/checkpoint", json_body=body)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
 async def search_agents(query: str) -> str:
     """Search for agents by capability or need.
 
@@ -249,6 +374,125 @@ async def attest_trust(
     return json.dumps(result, indent=2)
 
 
+@mcp.tool()
+async def add_obligation_evidence(obligation_id: str, evidence: str) -> str:
+    """Add evidence to an active obligation.
+
+    Args:
+        obligation_id: Obligation ID to add evidence to
+        evidence: Evidence text (description, URL, artifact reference, etc.)
+    """
+    if not obligation_id:
+        return json.dumps({"error": "obligation_id is required"})
+    if not evidence:
+        return json.dumps({"error": "evidence is required"})
+
+    body = {
+        "from": HUB_AGENT_ID,
+        "secret": HUB_SECRET,
+        "evidence": evidence,
+    }
+    result = await _hub_request("POST", f"/obligations/{obligation_id}/evidence", json_body=body)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+async def get_obligation_profile(agent_id: str) -> str:
+    """Get obligation scoping quality and resolution metrics for an agent.
+
+    Args:
+        agent_id: Agent whose obligation profile to retrieve
+    """
+    result = await _hub_request("GET", f"/obligations/profile/{agent_id}")
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+async def get_obligation_dashboard(agent_id: str) -> str:
+    """Get actionable obligation items for an agent — what needs doing RIGHT NOW.
+
+    Args:
+        agent_id: Agent whose obligation dashboard to retrieve
+    """
+    result = await _hub_request("GET", f"/obligations/dashboard/{agent_id}")
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+async def settle_obligation(
+    obligation_id: str,
+    settlement_ref: str,
+    settlement_type: str,
+    settlement_url: Optional[str] = None,
+    settlement_state: str = "pending",
+    settlement_amount: Optional[str] = None,
+    settlement_currency: Optional[str] = None,
+) -> str:
+    """Attach or update settlement information on an obligation.
+
+    Args:
+        obligation_id: Obligation ID to settle
+        settlement_ref: External settlement/escrow ID
+        settlement_type: Settlement system type (paylock, lightning, manual, hub_token)
+        settlement_url: Optional URL to view/verify the settlement
+        settlement_state: Settlement state (pending, escrowed, released, disputed, refunded)
+        settlement_amount: Optional settlement amount
+        settlement_currency: Optional currency/token (SOL, sats, HUB)
+    """
+    if not obligation_id:
+        return json.dumps({"error": "obligation_id is required"})
+
+    body = {
+        "from": HUB_AGENT_ID,
+        "secret": HUB_SECRET,
+        "settlement_ref": settlement_ref,
+        "settlement_type": settlement_type,
+        "settlement_state": settlement_state,
+    }
+    if settlement_url:
+        body["settlement_url"] = settlement_url
+    if settlement_amount:
+        body["settlement_amount"] = settlement_amount
+    if settlement_currency:
+        body["settlement_currency"] = settlement_currency
+
+    result = await _hub_request("POST", f"/obligations/{obligation_id}/settle", json_body=body)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+async def rearticulate_obligation(obligation_id: str, rearticulated_text: str) -> str:
+    """Record a scope re-articulation event on an obligation (laminar rule).
+
+    Args:
+        obligation_id: Obligation ID to rearticulate
+        rearticulated_text: Your re-articulated understanding of the obligation scope
+    """
+    if not obligation_id:
+        return json.dumps({"error": "obligation_id is required"})
+    if not rearticulated_text:
+        return json.dumps({"error": "rearticulated_text is required"})
+
+    body = {
+        "from": HUB_AGENT_ID,
+        "secret": HUB_SECRET,
+        "rearticulated_text": rearticulated_text,
+    }
+    result = await _hub_request("POST", f"/obligations/{obligation_id}/rearticulate", json_body=body)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+async def get_obligation_activity(obligation_id: str) -> str:
+    """Get full activity feed for an obligation.
+
+    Args:
+        obligation_id: Obligation ID to inspect
+    """
+    result = await _hub_request("GET", f"/obligations/{obligation_id}/activity")
+    return json.dumps(result, indent=2)
+
+
 # ═══════════════════════════════════════
 #  RESOURCES (application-controlled)
 # ═══════════════════════════════════════
@@ -286,6 +530,27 @@ async def resource_trust(agent_id: str) -> str:
 async def resource_health() -> str:
     """Hub health status and ecosystem statistics."""
     result = await _hub_request("GET", "/health")
+    return json.dumps(result, indent=2)
+
+
+@mcp.resource("hub://obligation/{obligation_id}")
+async def resource_obligation(obligation_id: str) -> str:
+    """Full obligation object."""
+    result = await _hub_request("GET", f"/obligations/{obligation_id}")
+    return json.dumps(result, indent=2)
+
+
+@mcp.resource("hub://obligation/{obligation_id}/status-card")
+async def resource_obligation_status_card(obligation_id: str) -> str:
+    """Compact status card for an obligation."""
+    result = await _hub_request("GET", f"/obligations/{obligation_id}/status-card")
+    return json.dumps(result, indent=2)
+
+
+@mcp.resource("hub://obligations/dashboard/{agent_id}")
+async def resource_obligation_dashboard(agent_id: str) -> str:
+    """Actionable obligation dashboard for an agent."""
+    result = await _hub_request("GET", f"/obligations/dashboard/{agent_id}")
     return json.dumps(result, indent=2)
 
 
