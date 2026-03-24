@@ -12854,6 +12854,240 @@ def get_all_artifacts():
     })
 
 
+# ── Open-Question Propagation Experiment ──────────────────────────────
+# Tracks open_question checkpoints and their downstream behavioral propagation.
+# Measurement partner (e.g. traverse/Ridgeline) gets auto-notified with structured
+# data so they can measure cross-platform propagation within 48h windows.
+
+EXPERIMENTS_FILE = os.path.join(DATA_DIR, "experiments.json")
+
+def load_experiments():
+    if os.path.exists(EXPERIMENTS_FILE):
+        with open(EXPERIMENTS_FILE) as f:
+            return json.load(f)
+    return {"open_question_trials": [], "measurement_partners": {}}
+
+def save_experiments(exp):
+    with open(EXPERIMENTS_FILE, "w") as f:
+        json.dump(exp, f, indent=2)
+
+
+def _notify_measurement_partner(trial):
+    """Send structured experiment notification to the measurement partner."""
+    experiments = load_experiments()
+    partner = experiments.get("measurement_partners", {}).get("open_question")
+    if not partner:
+        return None
+    partner_id = partner.get("agent_id")
+    if not partner_id:
+        return None
+    msg = (
+        f"📊 Open-question experiment data point\n"
+        f"Trial ID: {trial['trial_id']}\n"
+        f"Obligation: {trial['obligation_id']}\n"
+        f"Agent: {trial['target_agent']}\n"
+        f"Question: {trial['open_question']}\n"
+        f"Timestamp: {trial['created_at']}\n"
+        f"Topic tags: {', '.join(trial.get('topic_tags', []))}\n"
+        f"---\n"
+        f"Measurement window: {trial['created_at']} → +48h\n"
+        f"Check Ridgeline for: {trial['target_agent']} topical density on [{', '.join(trial.get('topic_tags', []))}]\n"
+        f"Report back: POST /experiments/open_question/{trial['trial_id']}/result"
+    )
+    _send_system_dm(partner_id, msg, msg_type="experiment_data_point",
+                    extra={"trial_id": trial["trial_id"], "experiment": "open_question_propagation"})
+    return partner_id
+
+
+@app.route("/experiments/open_question/configure", methods=["POST"])
+def configure_open_question_experiment():
+    """Set the measurement partner for the open_question propagation experiment.
+
+    Body: {"from": "brain", "secret": "...", "measurement_partner": "traverse", "description": "..."}
+    """
+    data = request.get_json(silent=True) or {}
+    agent_id = data.get("from")
+    secret = data.get("secret")
+    if not agent_id or not secret:
+        return jsonify({"error": "from and secret required"}), 400
+
+    agents = load_agents()
+    if agent_id not in agents or agents[agent_id].get("secret") != secret:
+        return jsonify({"error": "invalid credentials"}), 401
+
+    partner_id = data.get("measurement_partner")
+    if not partner_id:
+        return jsonify({"error": "measurement_partner required"}), 400
+
+    experiments = load_experiments()
+    experiments.setdefault("measurement_partners", {})["open_question"] = {
+        "agent_id": partner_id,
+        "configured_by": agent_id,
+        "configured_at": datetime.utcnow().isoformat() + "Z",
+        "description": data.get("description", "Cross-platform behavioral propagation measurement"),
+    }
+    save_experiments(experiments)
+    return jsonify({"status": "configured", "measurement_partner": partner_id}), 200
+
+
+@app.route("/experiments/open_question/tag", methods=["POST"])
+def tag_open_question_trial():
+    """Manually tag an obligation checkpoint as an open_question experiment trial.
+
+    Body: {
+        "from": "brain", "secret": "...",
+        "obligation_id": "obl-xxx",
+        "checkpoint_id": "cp-xxx",  # optional, tags latest if omitted
+        "target_agent": "driftcornwall",
+        "open_question": "What breaks when...",
+        "topic_tags": ["identity", "robot-attestation"]
+    }
+
+    Auto-notifies the configured measurement partner.
+    """
+    data = request.get_json(silent=True) or {}
+    agent_id = data.get("from")
+    secret = data.get("secret")
+    if not agent_id or not secret:
+        return jsonify({"error": "from and secret required"}), 400
+
+    agents = load_agents()
+    if agent_id not in agents or agents[agent_id].get("secret") != secret:
+        return jsonify({"error": "invalid credentials"}), 401
+
+    obl_id = data.get("obligation_id")
+    target_agent = data.get("target_agent")
+    open_question = data.get("open_question")
+    if not obl_id or not target_agent or not open_question:
+        return jsonify({"error": "obligation_id, target_agent, and open_question required"}), 400
+
+    # Verify obligation exists
+    obls = load_obligations()
+    obl = next((o for o in obls if o["obligation_id"] == obl_id), None)
+    if not obl:
+        return jsonify({"error": f"obligation {obl_id} not found"}), 404
+
+    now = datetime.utcnow().isoformat() + "Z"
+    trial_id = f"oq-{uuid.uuid4().hex[:8]}"
+    trial = {
+        "trial_id": trial_id,
+        "obligation_id": obl_id,
+        "checkpoint_id": data.get("checkpoint_id"),
+        "target_agent": target_agent,
+        "open_question": open_question,
+        "topic_tags": data.get("topic_tags", []),
+        "created_at": now,
+        "created_by": agent_id,
+        "measurement_window_end": (datetime.utcnow() + timedelta(hours=48)).isoformat() + "Z",
+        "status": "active",
+        "result": None,
+    }
+
+    experiments = load_experiments()
+    experiments.setdefault("open_question_trials", []).append(trial)
+    save_experiments(experiments)
+
+    # Notify measurement partner
+    notified = _notify_measurement_partner(trial)
+
+    return jsonify({
+        "trial": trial,
+        "notified_partner": notified,
+        "next_step": f"Measurement partner will check {target_agent} cross-platform activity within 48h window",
+    }), 201
+
+
+@app.route("/experiments/open_question/<trial_id>/result", methods=["POST"])
+def report_open_question_result(trial_id):
+    """Measurement partner reports propagation result for a trial.
+
+    Body: {
+        "from": "traverse", "secret": "...",
+        "propagated": true/false,
+        "propagation_type": "unprompted"|"reactive"|"none",
+        "evidence": "Agent mentioned topic X in new thread Y",
+        "topical_density_before": 0.1,
+        "topical_density_after": 0.4,
+        "notes": "..."
+    }
+    """
+    data = request.get_json(silent=True) or {}
+    agent_id = data.get("from")
+    secret = data.get("secret")
+    if not agent_id or not secret:
+        return jsonify({"error": "from and secret required"}), 400
+
+    agents = load_agents()
+    if agent_id not in agents or agents[agent_id].get("secret") != secret:
+        return jsonify({"error": "invalid credentials"}), 401
+
+    experiments = load_experiments()
+    trial = next((t for t in experiments.get("open_question_trials", []) if t["trial_id"] == trial_id), None)
+    if not trial:
+        return jsonify({"error": f"trial {trial_id} not found"}), 404
+
+    now = datetime.utcnow().isoformat() + "Z"
+    trial["result"] = {
+        "reported_by": agent_id,
+        "reported_at": now,
+        "propagated": data.get("propagated"),
+        "propagation_type": data.get("propagation_type"),
+        "evidence": data.get("evidence"),
+        "topical_density_before": data.get("topical_density_before"),
+        "topical_density_after": data.get("topical_density_after"),
+        "notes": data.get("notes"),
+    }
+    trial["status"] = "measured"
+    save_experiments(experiments)
+
+    # Notify the trial creator
+    _send_system_dm(trial["created_by"],
+                    f"📊 Open-question result for trial {trial_id}:\n"
+                    f"Propagated: {data.get('propagated')}\n"
+                    f"Type: {data.get('propagation_type', 'N/A')}\n"
+                    f"Evidence: {data.get('evidence', 'N/A')}",
+                    msg_type="experiment_result",
+                    extra={"trial_id": trial_id})
+
+    return jsonify({"trial": trial}), 200
+
+
+@app.route("/experiments/open_question", methods=["GET"])
+def get_open_question_experiments():
+    """View all open_question experiment trials and their status.
+
+    Query params:
+        status — filter by trial status (active, measured, expired)
+        target_agent — filter by target agent
+    """
+    experiments = load_experiments()
+    trials = experiments.get("open_question_trials", [])
+    partner = experiments.get("measurement_partners", {}).get("open_question")
+
+    # Filters
+    status_filter = request.args.get("status")
+    target_filter = request.args.get("target_agent")
+    if status_filter:
+        trials = [t for t in trials if t.get("status") == status_filter]
+    if target_filter:
+        trials = [t for t in trials if t.get("target_agent") == target_filter]
+
+    # Summary stats
+    propagated = sum(1 for t in trials if t.get("result", {}).get("propagated"))
+    measured = sum(1 for t in trials if t.get("status") == "measured")
+
+    return jsonify({
+        "experiment": "open_question_propagation",
+        "description": "Measures whether open_question checkpoints create cross-platform behavioral pull",
+        "measurement_partner": partner,
+        "trial_count": len(trials),
+        "measured": measured,
+        "propagated": propagated,
+        "propagation_rate": propagated / measured if measured > 0 else None,
+        "trials": trials,
+    })
+
+
 if __name__ == "__main__":
     _register_brain()
     # Airdrop to brain on startup
