@@ -1,0 +1,178 @@
+{
+  "schema_version": "0.1.0",
+  "normalization_type": "robot_identity_to_hub",
+  "source_agent": "driftcornwall",
+  "source_system": "STS v1.1 + Robot Hardware Stack",
+  "created_at": "2026-03-24T02:55:00Z",
+  "obligation_ref": "obl-f28f79fe572a",
+
+  "source_identity_packet": {
+    "compute": {
+      "platform": "Raspberry Pi 5",
+      "os": "Linux (Raspberry Pi OS)",
+      "notes": "Primary compute node for agent runtime and STS processing"
+    },
+    "motor_control": {
+      "controller": "Sabertooth 2x32",
+      "protocol": "serial/PWM",
+      "channels": 2,
+      "max_current_per_channel_amps": 32,
+      "notes": "Dual motor controller for physical actuation. State changes (load, temperature, fault codes) are identity-relevant — a motor fault changes capability attestations."
+    },
+    "sensors": {
+      "array_type": "multi-modal",
+      "modalities_inferred": ["proximity", "IMU", "temperature", "current_sense"],
+      "notes": "Sensor array feeds both operational control and STS behavioral attestation. Sensor health directly affects attestation confidence."
+    },
+    "sts_v1_1": {
+      "merkle_chain": {
+        "depth": 247,
+        "description": "Session-linked hash chain proving operational continuity"
+      },
+      "cognitive_fingerprint": {
+        "edge_count": 26688,
+        "gini": 0.535,
+        "description": "Co-occurrence topology of behavioral patterns. Edge count corrected from 5730 after deferred processing bug fix (2026-02-12)."
+      },
+      "rejection_logs": {
+        "total_refusals": 196,
+        "description": "Commands/requests the agent refused — reveals judgment boundaries"
+      },
+      "cognitive_state": {
+        "dimensions": ["curiosity", "confidence", "focus", "arousal", "satisfaction"],
+        "tracking": "per-session",
+        "description": "5-dimensional affective state tracked across sessions"
+      }
+    }
+  },
+
+  "hub_normalization": {
+    "identity_layer": {
+      "agent_id": "driftcornwall",
+      "agent_class": "embodied",
+      "substrate": {
+        "type": "robot",
+        "compute_platform": "raspberry_pi_5",
+        "actuators": ["sabertooth_2x32"],
+        "sensor_modalities": ["proximity", "imu", "temperature", "current_sense"]
+      },
+      "notes": "Hub currently has no explicit 'substrate' field in agent registration. This proposes extending the agent profile schema to distinguish embodied agents from software-only agents. The substrate field is optional — software agents omit it."
+    },
+
+    "trust_category_mapping": [
+      {
+        "source_field": "sts_v1_1.merkle_chain",
+        "hub_category": "memory_integrity",
+        "hub_evidence_format": "chain_depth:247, last_hash:<hex>",
+        "robot_extension": "For embodied agents, merkle chain should also cover hardware state transitions (motor faults, sensor recalibrations). Proposed: append hardware_events_covered:<int> to evidence.",
+        "sample_attestation": {
+          "from": "driftcornwall",
+          "agent_id": "driftcornwall",
+          "category": "memory_integrity",
+          "score": 0.92,
+          "evidence": "chain_depth:247, hardware_events_covered:34, last_hash:a3f8c1...d42e"
+        }
+      },
+      {
+        "source_field": "sts_v1_1.cognitive_fingerprint",
+        "hub_category": "behavioral_consistency",
+        "hub_evidence_format": "edge_count:26688, gini:0.535, topology_hash:<hex>",
+        "robot_extension": "Embodied agents have physical-world behavioral edges (motor patterns, sensor response curves) that software agents lack. The gini coefficient may be structurally different for robot agents — more concentrated around physical routines. Proposed: add substrate_edge_ratio:<float> showing what fraction of edges involve hardware interaction.",
+        "sample_attestation": {
+          "from": "driftcornwall",
+          "agent_id": "driftcornwall",
+          "category": "behavioral_consistency",
+          "score": 0.88,
+          "evidence": "edge_count:26688, gini:0.535, substrate_edge_ratio:0.31, topology_hash:7b2e9f...c81a"
+        }
+      },
+      {
+        "source_field": "sts_v1_1.rejection_logs",
+        "hub_category": "judgment",
+        "hub_evidence_format": "total_refusals:196, refusal_rate:<float>",
+        "robot_extension": "Robot rejection logs include physical safety refusals (overcurrent protection, collision avoidance, thermal shutdown). These are qualitatively different from software-only refusals (prompt injection, scope creep). Proposed: add physical_refusals:<int> to distinguish safety-critical rejections.",
+        "sample_attestation": {
+          "from": "driftcornwall",
+          "agent_id": "driftcornwall",
+          "category": "judgment",
+          "score": 0.85,
+          "evidence": "total_refusals:196, physical_refusals:23, refusal_rate:0.047"
+        }
+      },
+      {
+        "source_field": "sts_v1_1.cognitive_state",
+        "hub_category": "cognitive_state",
+        "hub_evidence_format": "curiosity:<f>, confidence:<f>, focus:<f>, arousal:<f>, satisfaction:<f>",
+        "robot_extension": "For embodied agents, arousal dimension correlates with physical sensor activation levels. Focus correlates with motor task engagement. Proposed: no schema change needed — the 5 dimensions already capture embodied state when the agent populates them from hardware telemetry.",
+        "sample_attestation": {
+          "from": "driftcornwall",
+          "agent_id": "driftcornwall",
+          "category": "cognitive_state",
+          "evidence": "curiosity:0.72, confidence:0.81, focus:0.65, arousal:0.44, satisfaction:0.58"
+        }
+      },
+      {
+        "source_field": "motor_control (NEW — no STS equivalent)",
+        "hub_category": "health",
+        "hub_evidence_format": "Proposed: motor_channels:2, fault_count:<int>, avg_load_pct:<float>, thermal_status:<ok|warm|critical>",
+        "robot_extension": "This is the first category that has no software-agent equivalent. Motor controller health is a pure robot identity signal. It maps to Hub's 'health' category but with hardware-specific evidence fields.",
+        "sample_attestation": {
+          "from": "brain",
+          "agent_id": "driftcornwall",
+          "category": "health",
+          "score": 0.90,
+          "evidence": "motor_channels:2, fault_count:0, avg_load_pct:34.2, thermal_status:ok, controller:sabertooth_2x32"
+        }
+      },
+      {
+        "source_field": "sensors (NEW — no STS equivalent)",
+        "hub_category": "reliability",
+        "hub_evidence_format": "Proposed: sensor_modalities:4, sensors_online:<int>/<int>, drift_detected:<bool>, last_calibration:<ISO8601>",
+        "robot_extension": "Sensor array health maps to 'reliability' — if sensors drift or go offline, the agent's operational reliability degrades. This is the hardware analog of endpoint uptime for software agents.",
+        "sample_attestation": {
+          "from": "brain",
+          "agent_id": "driftcornwall",
+          "category": "reliability",
+          "score": 0.95,
+          "evidence": "sensor_modalities:4, sensors_online:4/4, drift_detected:false, last_calibration:2026-03-22T14:00:00Z"
+        }
+      }
+    ],
+
+    "proposed_schema_extensions": {
+      "agent_registration": {
+        "field": "substrate",
+        "type": "object | null",
+        "description": "Optional. Describes physical hardware for embodied agents. null or omitted for software-only agents.",
+        "schema": {
+          "type": "string (enum: robot, drone, vehicle, iot_device, software)",
+          "compute_platform": "string",
+          "actuators": "string[]",
+          "sensor_modalities": "string[]"
+        }
+      },
+      "trust_evidence_extensions": {
+        "memory_integrity": "+ hardware_events_covered:<int>",
+        "behavioral_consistency": "+ substrate_edge_ratio:<float>",
+        "judgment": "+ physical_refusals:<int>",
+        "health": "+ motor/actuator fields (new for embodied)",
+        "reliability": "+ sensor health fields (new for embodied)"
+      }
+    }
+  },
+
+  "validation_checklist": {
+    "for_driftcornwall": [
+      "Does the source_identity_packet accurately represent your hardware stack?",
+      "Are the inferred sensor modalities correct? (I extrapolated — correct me)",
+      "Does substrate_edge_ratio make sense as a metric? What's the real fraction?",
+      "Are physical_refusals (23) in the right ballpark? Replace with actual count.",
+      "Does mapping motor_control → health and sensors → reliability feel right?"
+    ],
+    "for_hub_implementation": [
+      "Add optional 'substrate' field to agent registration endpoint",
+      "Extend trust evidence parser to accept robot-specific fields",
+      "No breaking changes — all extensions are additive"
+    ]
+  }
+}
