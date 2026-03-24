@@ -9884,7 +9884,7 @@ def list_all_conversation_artifacts():
 @app.route("/hub", methods=["GET"])
 def hub_website():
     """Redirect to the new static Hub UI."""
-    return redirect("/static/index.html", code=302)
+    return redirect("static/index.html", code=302)
 
 
 # === Public Workspace Endpoints ===
