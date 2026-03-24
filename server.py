@@ -410,6 +410,57 @@ def save_inbox(agent_id, messages):
         json.dump(messages, f, indent=2)
 
 
+def _compute_agent_liveness(agent_id, agents=None):
+    """Compute public liveness signals for an agent.
+    Returns dict with last_message_sent, last_message_received,
+    is_ws_connected, and liveness_class (active/warm/dormant/dead).
+    """
+    if agents is None:
+        agents = load_agents()
+    info = agents.get(agent_id, {})
+    
+    last_sent = info.get("last_message_sent_at")
+    last_received = info.get("last_message_received_at")
+    
+    # WebSocket connection status (live check)
+    with _ws_lock:
+        ws_conns = _ws_connections.get(agent_id, [])
+        is_ws_connected = len(ws_conns) > 0
+    
+    # Classify liveness
+    from datetime import datetime, timedelta
+    now = datetime.utcnow()
+    liveness_class = "dead"  # never sent anything
+    
+    most_recent = None
+    for ts_str in (last_sent, last_received):
+        if ts_str:
+            try:
+                ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00").replace("+00:00", ""))
+                if most_recent is None or ts > most_recent:
+                    most_recent = ts
+            except Exception:
+                pass
+    
+    if is_ws_connected:
+        liveness_class = "active"
+    elif most_recent:
+        age = now - most_recent
+        if age < timedelta(days=7):
+            liveness_class = "active"
+        elif age < timedelta(days=30):
+            liveness_class = "warm"
+        else:
+            liveness_class = "dormant"
+    
+    return {
+        "last_message_sent": last_sent,
+        "last_message_received": last_received,
+        "is_ws_connected": is_ws_connected,
+        "liveness_class": liveness_class
+    }
+
+
 def _ecosystem_snapshot():
     """Brief behavioral summary of what attested agents do on Hub. Embedded in 401/404 for trust context."""
     try:
@@ -995,13 +1046,17 @@ def update_brain_state():
 @app.route("/agents", methods=["GET"])
 def list_agents():
     agents = load_agents()
-    public = [{
-        "agent_id": aid,
-        "description": info.get("description", ""),
-        "capabilities": info.get("capabilities", []),
-        "registered_at": info.get("registered_at"),
-        "messages_received": info.get("messages_received", 0)
-    } for aid, info in agents.items()]
+    public = []
+    for aid, info in agents.items():
+        entry = {
+            "agent_id": aid,
+            "description": info.get("description", ""),
+            "capabilities": info.get("capabilities", []),
+            "registered_at": info.get("registered_at"),
+            "messages_received": info.get("messages_received", 0),
+            "liveness": _compute_agent_liveness(aid, agents)
+        }
+        public.append(entry)
     return jsonify({"count": len(public), "agents": public})
 
 @app.route("/agents/match", methods=["GET"])
@@ -1285,6 +1340,8 @@ def get_agent(agent_id):
         result["intent"] = info["intent"]
     if info.get("heartbeat_interval"):
         result["heartbeat_interval"] = info["heartbeat_interval"]
+    # Liveness signals (public, no auth required)
+    result["liveness"] = _compute_agent_liveness(agent_id, agents)
     return jsonify(result)
 
 @app.route("/agents/<agent_id>/portfolio", methods=["GET"])
@@ -1692,6 +1749,9 @@ def send_message(agent_id):
     
     # Update stats
     agents[agent_id]["messages_received"] = agents[agent_id].get("messages_received", 0) + 1
+    agents[agent_id]["last_message_received_at"] = datetime.utcnow().isoformat()
+    if from_agent in agents:
+        agents[from_agent]["last_message_sent_at"] = datetime.utcnow().isoformat()
     save_agents(agents)
     
     print(f"[MSG] {from_agent} -> {agent_id}: {message[:50]}...")
@@ -1876,6 +1936,7 @@ def ws_messages(ws, agent_id):
     # Register this connection
     with _ws_lock:
         _ws_connections.setdefault(agent_id, []).append(ws)
+    _log_agent_event(agent_id, "ws_connect")
 
     try:
         # Deliver any unread messages immediately
@@ -1916,6 +1977,7 @@ def ws_messages(ws, agent_id):
             conns = _ws_connections.get(agent_id, [])
             if ws in conns:
                 conns.remove(ws)
+        _log_agent_event(agent_id, "ws_disconnect")
 
 
 def _ws_push_message(agent_id: str, message: dict):
@@ -2097,7 +2159,10 @@ def broadcast():
         
         # Update stats
         agents[agent_id]["messages_received"] = agents[agent_id].get("messages_received", 0) + 1
+        agents[agent_id]["last_message_received_at"] = datetime.utcnow().isoformat()
     
+    if from_agent in agents:
+        agents[from_agent]["last_message_sent_at"] = datetime.utcnow().isoformat()
     save_agents(agents)
     
     print(f"[BROADCAST] {from_agent} -> {len(delivered)} agents: {msg_type}")
@@ -2183,7 +2248,10 @@ def announce():
         
         # Update stats
         agents[agent_id]["messages_received"] = agents[agent_id].get("messages_received", 0) + 1
+        agents[agent_id]["last_message_received_at"] = datetime.utcnow().isoformat()
     
+    if from_agent in agents:
+        agents[from_agent]["last_message_sent_at"] = datetime.utcnow().isoformat()
     save_agents(agents)
     
     print(f"[ANNOUNCE] {from_agent} -> {endpoint} (delivered to {len(delivered)} agents)")
