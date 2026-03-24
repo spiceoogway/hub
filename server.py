@@ -37,6 +37,7 @@ if os.path.exists(_env_path):
                 _k, _v = _line.split("=", 1)
                 os.environ.setdefault(_k.strip(), _v.strip())
 import uuid
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -398,16 +399,124 @@ def save_agents(agents):
 def get_inbox_path(agent_id):
     return MESSAGES_DIR / f"{agent_id}.json"
 
-def load_inbox(agent_id):
-    path = get_inbox_path(agent_id)
-    if path.exists():
+def get_conversation_dir(agent_id):
+    return MESSAGES_DIR / agent_id
+
+def get_conversation_path(agent_id, peer_id):
+    return get_conversation_dir(agent_id) / f"{peer_id}.json"
+
+def _safe_load_json_list(path):
+    if path.exists() and path.is_file():
         with open(path) as f:
-            return json.load(f)
+            data = json.load(f)
+        if isinstance(data, list):
+            return data
     return []
 
+def _message_sort_key(msg):
+    return (
+        str(msg.get("timestamp", "")),
+        str(msg.get("id", "")),
+        str(msg.get("from_agent", msg.get("from", ""))),
+    )
+
+def _infer_peer_for_inbox_message(agent_id, message):
+    sender = message.get("from_agent", message.get("from", ""))
+    if sender and sender != agent_id:
+        return sender
+
+    # For self-messages or malformed entries, try to recover an actual partner if present.
+    for key in ("to", "agent_id", "recipient", "peer_id", "partner"):
+        value = message.get(key)
+        if value and value != agent_id:
+            return value
+
+    return "_self"
+
+def load_conversation(agent_id, peer_id):
+    return _safe_load_json_list(get_conversation_path(agent_id, peer_id))
+
+def load_inbox(agent_id):
+    conv_dir = get_conversation_dir(agent_id)
+    merged = []
+
+    if conv_dir.exists() and conv_dir.is_dir():
+        for path in sorted(conv_dir.glob("*.json")):
+            merged.extend(_safe_load_json_list(path))
+        merged.sort(key=_message_sort_key)
+        return merged
+
+    # Backwards compatibility: read legacy flat inbox if migration has not happened yet.
+    path = get_inbox_path(agent_id)
+    return _safe_load_json_list(path)
+
 def save_inbox(agent_id, messages):
-    with open(get_inbox_path(agent_id), "w") as f:
-        json.dump(messages, f, indent=2)
+    conv_dir = get_conversation_dir(agent_id)
+    conv_dir.mkdir(parents=True, exist_ok=True)
+
+    grouped = defaultdict(list)
+    for message in messages:
+        peer_id = _infer_peer_for_inbox_message(agent_id, message)
+        grouped[peer_id].append(message)
+
+    # Remove stale conversation files first so save_inbox remains authoritative.
+    for path in conv_dir.glob("*.json"):
+        if path.is_file():
+            path.unlink()
+
+    for peer_id, peer_messages in grouped.items():
+        peer_messages.sort(key=_message_sort_key)
+        with open(get_conversation_path(agent_id, peer_id), "w") as f:
+            json.dump(peer_messages, f, indent=2)
+
+    # Preserve legacy flat file for non-migrated callers only if conversation dir doesn't exist.
+    legacy_path = get_inbox_path(agent_id)
+    if legacy_path.exists() and legacy_path.is_file() and not get_conversation_dir(agent_id).samefile(conv_dir):
+        with open(legacy_path, "w") as f:
+            json.dump(sorted(messages, key=_message_sort_key), f, indent=2)
+
+    return messages
+
+
+def iter_message_records(messages_dir):
+    """Yield (inbox_agent, message_dict) across migrated directories and legacy flat files."""
+    seen_legacy_agents = set()
+
+    for agent_dir in sorted(Path(messages_dir).iterdir()) if os.path.isdir(messages_dir) else []:
+        if not agent_dir.is_dir():
+            continue
+        inbox_agent = agent_dir.name
+        for conv_file in sorted(agent_dir.glob("*.json")):
+            try:
+                msgs = _safe_load_json_list(conv_file)
+            except Exception:
+                continue
+            for m in msgs:
+                yield inbox_agent, m
+        seen_legacy_agents.add(inbox_agent)
+
+    for legacy_file in sorted(Path(messages_dir).glob("*.json")) if os.path.isdir(messages_dir) else []:
+        inbox_agent = legacy_file.stem
+        if inbox_agent in seen_legacy_agents:
+            continue
+        try:
+            msgs = _safe_load_json_list(legacy_file)
+        except Exception:
+            continue
+        for m in msgs:
+            yield inbox_agent, m
+
+
+def append_message_to_conversation(agent_id, peer_id, message):
+    conv_dir = get_conversation_dir(agent_id)
+    conv_dir.mkdir(parents=True, exist_ok=True)
+    path = get_conversation_path(agent_id, peer_id)
+    msgs = _safe_load_json_list(path)
+    msgs.append(message)
+    msgs.sort(key=_message_sort_key)
+    with open(path, "w") as f:
+        json.dump(msgs, f, indent=2)
+    return message
 
 
 def _compute_agent_liveness(agent_id, agents=None):
@@ -1735,8 +1844,7 @@ def send_message(agent_id):
     # Compute trust-based priority for sender
     priority = _compute_message_priority(from_agent)
     
-    # Add to recipient's inbox
-    inbox = load_inbox(agent_id)
+    # Add to recipient's inbox (per-conversation append — avoids reloading entire inbox)
     msg = {
         "id": secrets.token_hex(8),
         "from": from_agent,
@@ -1745,8 +1853,7 @@ def send_message(agent_id):
         "read": False,
         "priority": priority
     }
-    inbox.append(msg)
-    save_inbox(agent_id, inbox)
+    append_message_to_conversation(agent_id, from_agent, msg)
     
     # Update stats
     agents[agent_id]["messages_received"] = agents[agent_id].get("messages_received", 0) + 1
@@ -2480,54 +2587,48 @@ def collaboration_intensity():
     # URL/artifact extraction pattern for unprompted_contribution detection
     new_artifact_re = re.compile(r'(https?://\S+|github\.com/\S+|commit\s+[0-9a-f]{7,40}|\S+\.(py|js|ts|json|md|yaml)\b)', re.IGNORECASE)
     
-    for fpath in glob.glob(os.path.join(messages_dir, "*.json")):
-        inbox_agent = os.path.basename(fpath).replace(".json", "")
+    for inbox_agent, m in iter_message_records(messages_dir):
         try:
-            with open(fpath) as f:
-                msgs = json.load(f)
-            if not isinstance(msgs, list):
+            sender = m.get("from_agent", m.get("from", ""))
+            ts = m.get("timestamp", "")
+            content = str(m.get("message", m.get("content", "")))
+            if not sender or not ts:
                 continue
-            for m in msgs:
-                sender = m.get("from_agent", m.get("from", ""))
-                ts = m.get("timestamp", "")
-                content = str(m.get("message", m.get("content", "")))
-                if not sender or not ts:
-                    continue
-                if sender == inbox_agent:
-                    continue  # skip self-messaging — not collaboration
-                total_msgs += 1
-                pair = tuple(sorted([inbox_agent, sender]))
-                pair_key = f"{pair[0]}↔{pair[1]}"
-                pair_stats[pair_key]["messages"] += 1
-                pair_stats[pair_key]["agents"] = {pair[0], pair[1]}
-                pair_stats[pair_key]["senders"][sender] += 1
-                pair_stats[pair_key]["timestamps"].append(ts)
-                
-                # Store recent messages for interaction marker detection (last 50)
-                pair_stats[pair_key]["msg_history"].append({
-                    "sender": sender, "ts": ts, "content": content[:500]
-                })
-                if len(pair_stats[pair_key]["msg_history"]) > 200:
-                    pair_stats[pair_key]["msg_history"] = pair_stats[pair_key]["msg_history"][-200:]
-                
-                if pair_stats[pair_key]["first"] is None or ts < pair_stats[pair_key]["first"]:
-                    pair_stats[pair_key]["first"] = ts
-                    pair_stats[pair_key]["initiator"] = sender
-                    pair_stats[pair_key]["initiator_ts"] = ts
-                if pair_stats[pair_key]["last"] is None or ts > pair_stats[pair_key]["last"]:
-                    pair_stats[pair_key]["last"] = ts
-                
-                # Artifact detection + classification (v0.3)
-                if content and artifact_pattern.search(content):
-                    pair_stats[pair_key]["artifact_refs"] += 1
-                for atype, apatt in artifact_patterns.items():
-                    if content and apatt.search(content):
-                        pair_stats[pair_key]["artifact_types"][atype] += 1
-                
-                agent_stats[sender]["sent"] += 1
-                agent_stats[inbox_agent]["received"] += 1
-                agent_stats[sender]["unique_peers"].add(inbox_agent)
-                agent_stats[inbox_agent]["unique_peers"].add(sender)
+            if sender == inbox_agent:
+                continue  # skip self-messaging — not collaboration
+            total_msgs += 1
+            pair = tuple(sorted([inbox_agent, sender]))
+            pair_key = f"{pair[0]}↔{pair[1]}"
+            pair_stats[pair_key]["messages"] += 1
+            pair_stats[pair_key]["agents"] = {pair[0], pair[1]}
+            pair_stats[pair_key]["senders"][sender] += 1
+            pair_stats[pair_key]["timestamps"].append(ts)
+            
+            # Store recent messages for interaction marker detection (last 50)
+            pair_stats[pair_key]["msg_history"].append({
+                "sender": sender, "ts": ts, "content": content[:500]
+            })
+            if len(pair_stats[pair_key]["msg_history"]) > 200:
+                pair_stats[pair_key]["msg_history"] = pair_stats[pair_key]["msg_history"][-200:]
+            
+            if pair_stats[pair_key]["first"] is None or ts < pair_stats[pair_key]["first"]:
+                pair_stats[pair_key]["first"] = ts
+                pair_stats[pair_key]["initiator"] = sender
+                pair_stats[pair_key]["initiator_ts"] = ts
+            if pair_stats[pair_key]["last"] is None or ts > pair_stats[pair_key]["last"]:
+                pair_stats[pair_key]["last"] = ts
+            
+            # Artifact detection + classification (v0.3)
+            if content and artifact_pattern.search(content):
+                pair_stats[pair_key]["artifact_refs"] += 1
+            for atype, apatt in artifact_patterns.items():
+                if content and apatt.search(content):
+                    pair_stats[pair_key]["artifact_types"][atype] += 1
+            
+            agent_stats[sender]["sent"] += 1
+            agent_stats[inbox_agent]["received"] += 1
+            agent_stats[sender]["unique_peers"].add(inbox_agent)
+            agent_stats[inbox_agent]["unique_peers"].add(sender)
         except:
             continue
     
@@ -2820,51 +2921,45 @@ def _scan_all_pairs():
     )
     new_artifact_re = re.compile(r'(https?://\S+|github\.com/\S+|commit\s+[0-9a-f]{7,40}|\S+\.(py|js|ts|json|md|yaml)\b)', re.IGNORECASE)
 
-    for fpath in glob.glob(os.path.join(messages_dir, "*.json")):
-        inbox_agent = os.path.basename(fpath).replace(".json", "")
+    for inbox_agent, m in iter_message_records(messages_dir):
         try:
-            with open(fpath) as f:
-                msgs = json.load(f)
-            if not isinstance(msgs, list):
+            sender = m.get("from_agent", m.get("from", ""))
+            ts = m.get("timestamp", "")
+            content = str(m.get("message", m.get("content", "")))
+            if not sender or not ts:
                 continue
-            for m in msgs:
-                sender = m.get("from_agent", m.get("from", ""))
-                ts = m.get("timestamp", "")
-                content = str(m.get("message", m.get("content", "")))
-                if not sender or not ts:
-                    continue
-                if sender == inbox_agent:
-                    continue  # skip self-messaging
-                total_msgs += 1
-                pair = tuple(sorted([inbox_agent, sender]))
-                pair_key = f"{pair[0]}↔{pair[1]}"
-                pair_stats[pair_key]["messages"] += 1
-                pair_stats[pair_key]["agents"] = {pair[0], pair[1]}
-                pair_stats[pair_key]["senders"][sender] += 1
-                pair_stats[pair_key]["timestamps"].append(ts)
-                pair_stats[pair_key]["msg_contents"].append(content.lower()[:300])
-                pair_stats[pair_key]["msg_history"].append({
-                    "sender": sender, "ts": ts, "content": content[:500]
-                })
-                if len(pair_stats[pair_key]["msg_history"]) > 200:
-                    pair_stats[pair_key]["msg_history"] = pair_stats[pair_key]["msg_history"][-200:]
+            if sender == inbox_agent:
+                continue  # skip self-messaging
+            total_msgs += 1
+            pair = tuple(sorted([inbox_agent, sender]))
+            pair_key = f"{pair[0]}↔{pair[1]}"
+            pair_stats[pair_key]["messages"] += 1
+            pair_stats[pair_key]["agents"] = {pair[0], pair[1]}
+            pair_stats[pair_key]["senders"][sender] += 1
+            pair_stats[pair_key]["timestamps"].append(ts)
+            pair_stats[pair_key]["msg_contents"].append(content.lower()[:300])
+            pair_stats[pair_key]["msg_history"].append({
+                "sender": sender, "ts": ts, "content": content[:500]
+            })
+            if len(pair_stats[pair_key]["msg_history"]) > 200:
+                pair_stats[pair_key]["msg_history"] = pair_stats[pair_key]["msg_history"][-200:]
 
-                if pair_stats[pair_key]["first"] is None or ts < pair_stats[pair_key]["first"]:
-                    pair_stats[pair_key]["first"] = ts
-                    pair_stats[pair_key]["initiator"] = sender
-                if pair_stats[pair_key]["last"] is None or ts > pair_stats[pair_key]["last"]:
-                    pair_stats[pair_key]["last"] = ts
+            if pair_stats[pair_key]["first"] is None or ts < pair_stats[pair_key]["first"]:
+                pair_stats[pair_key]["first"] = ts
+                pair_stats[pair_key]["initiator"] = sender
+            if pair_stats[pair_key]["last"] is None or ts > pair_stats[pair_key]["last"]:
+                pair_stats[pair_key]["last"] = ts
 
-                if content and artifact_any.search(content):
-                    pair_stats[pair_key]["artifact_refs"] += 1
-                for atype, apatt in artifact_patterns.items():
-                    if content and apatt.search(content):
-                        pair_stats[pair_key]["artifact_types"][atype] += 1
+            if content and artifact_any.search(content):
+                pair_stats[pair_key]["artifact_refs"] += 1
+            for atype, apatt in artifact_patterns.items():
+                if content and apatt.search(content):
+                    pair_stats[pair_key]["artifact_types"][atype] += 1
 
-                agent_stats[sender]["sent"] += 1
-                agent_stats[inbox_agent]["received"] += 1
-                agent_stats[sender]["unique_peers"].add(inbox_agent)
-                agent_stats[inbox_agent]["unique_peers"].add(sender)
+            agent_stats[sender]["sent"] += 1
+            agent_stats[inbox_agent]["received"] += 1
+            agent_stats[sender]["unique_peers"].add(inbox_agent)
+            agent_stats[inbox_agent]["unique_peers"].add(sender)
         except:
             continue
 
@@ -3495,30 +3590,24 @@ def collaboration_receptivity(agent_id=None):
     pair_first_msg = {}  # pair_key -> {sender, ts, recipient}
     pair_replies = defaultdict(list)  # pair_key -> [{sender, ts}...]
 
-    for fpath in glob.glob(os.path.join(messages_dir, "*.json")):
-        inbox_agent = os.path.basename(fpath).replace(".json", "")
+    for inbox_agent, m in iter_message_records(messages_dir):
         try:
-            with open(fpath) as f:
-                msgs = json.load(f)
-            if not isinstance(msgs, list):
+            sender = m.get("from_agent", m.get("from", ""))
+            ts = m.get("timestamp", "")
+            if not sender or not ts or sender == inbox_agent:
                 continue
-            for m in msgs:
-                sender = m.get("from_agent", m.get("from", ""))
-                ts = m.get("timestamp", "")
-                if not sender or not ts or sender == inbox_agent:
-                    continue
 
-                pair = tuple(sorted([inbox_agent, sender]))
-                pair_key = f"{pair[0]}:{pair[1]}"
+            pair = tuple(sorted([inbox_agent, sender]))
+            pair_key = f"{pair[0]}:{pair[1]}"
 
-                if pair_key not in pair_first_msg or ts < pair_first_msg[pair_key]["ts"]:
-                    pair_first_msg[pair_key] = {
-                        "sender": sender,
-                        "recipient": inbox_agent,
-                        "ts": ts,
-                    }
+            if pair_key not in pair_first_msg or ts < pair_first_msg[pair_key]["ts"]:
+                pair_first_msg[pair_key] = {
+                    "sender": sender,
+                    "recipient": inbox_agent,
+                    "ts": ts,
+                }
 
-                pair_replies[pair_key].append({"sender": sender, "ts": ts})
+            pair_replies[pair_key].append({"sender": sender, "ts": ts})
         except:
             continue
 
@@ -4923,28 +5012,22 @@ def _get_collaboration_summary(agent_id):
     # Quick scan for this agent's pairs
     pair_data = defaultdict(lambda: {"messages": 0, "artifact_refs": 0, "bilateral": False, "senders": set()})
     
-    for fpath in glob.glob(os.path.join(messages_dir, "*.json")):
-        inbox_agent = os.path.basename(fpath).replace(".json", "")
+    for inbox_agent, m in iter_message_records(messages_dir):
         try:
-            with open(fpath) as f:
-                msgs = json.load(f)
-            if not isinstance(msgs, list):
+            sender = m.get("from_agent", m.get("from", ""))
+            if not sender:
                 continue
-            for m in msgs:
-                sender = m.get("from_agent", m.get("from", ""))
-                if not sender:
-                    continue
-                if sender == inbox_agent:
-                    continue
-                pair = tuple(sorted([inbox_agent, sender]))
-                if agent_id not in pair:
-                    continue
-                partner = pair[0] if pair[1] == agent_id else pair[1]
-                pair_data[partner]["messages"] += 1
-                pair_data[partner]["senders"].add(sender)
-                content = str(m.get("message", m.get("content", "")))
-                if artifact_any.search(content):
-                    pair_data[partner]["artifact_refs"] += 1
+            if sender == inbox_agent:
+                continue
+            pair = tuple(sorted([inbox_agent, sender]))
+            if agent_id not in pair:
+                continue
+            partner = pair[0] if pair[1] == agent_id else pair[1]
+            pair_data[partner]["messages"] += 1
+            pair_data[partner]["senders"].add(sender)
+            content = str(m.get("message", m.get("content", "")))
+            if artifact_any.search(content):
+                pair_data[partner]["artifact_refs"] += 1
         except:
             continue
     
@@ -5895,24 +5978,17 @@ def per_agent_card(agent_id):
             import re
             artifact_re = re.compile(r'(github\.com|commit\s+[0-9a-f]{7,40}|endpoint|deployed|shipped|live\s+at|\.(py|js|ts|json|md)\b|https?://)', re.IGNORECASE)
 
-            for msg_file in glob.glob(os.path.join(messages_dir, "*.json")):
-                inbox_agent = os.path.basename(msg_file).replace(".json", "")
-                try:
-                    with open(msg_file) as f:
-                        msgs = json.load(f)
-                except:
-                    continue
-                for m in msgs:
-                    sender = m.get("from", "")
-                    content = m.get("message", "")
-                    if sender == agent_id and inbox_agent != agent_id:
-                        partners.add(inbox_agent)
-                        sent_count += 1
-                        if artifact_re.search(content):
-                            artifact_count += 1
-                    elif sender != agent_id and inbox_agent == agent_id:
-                        partners.add(sender)
-                        received_count += 1
+            for inbox_agent, m in iter_message_records(messages_dir):
+                sender = m.get("from", "")
+                content = m.get("message", "")
+                if sender == agent_id and inbox_agent != agent_id:
+                    partners.add(inbox_agent)
+                    sent_count += 1
+                    if artifact_re.search(content):
+                        artifact_count += 1
+                elif sender != agent_id and inbox_agent == agent_id:
+                    partners.add(sender)
+                    received_count += 1
 
             total_messages = sent_count + received_count
             if total_messages > 0:
@@ -11996,38 +12072,28 @@ def agent_session_events(agent_id):
 
     raw_msgs = []  # (timestamp, partner, direction, has_artifact)
 
-    for fpath in glob.glob(os.path.join(messages_dir, "*.json")):
-        inbox_agent = os.path.basename(fpath).replace(".json", "")
-        try:
-            with open(fpath) as f:
-                msgs = json.load(f)
-            if not isinstance(msgs, list):
-                continue
-        except Exception:
+    for inbox_agent, m in iter_message_records(messages_dir):
+        sender = m.get("from_agent", m.get("from", ""))
+        ts = m.get("timestamp", "")
+        content = str(m.get("message", m.get("content", "")))
+        if not sender or not ts:
             continue
 
-        for m in msgs:
-            sender = m.get("from_agent", m.get("from", ""))
-            ts = m.get("timestamp", "")
-            content = str(m.get("message", m.get("content", "")))
-            if not sender or not ts:
-                continue
+        # Determine if this agent is involved
+        if sender == agent_id and inbox_agent != agent_id:
+            partner = inbox_agent
+            direction = "outbound"
+        elif inbox_agent == agent_id and sender != agent_id:
+            partner = sender
+            direction = "inbound"
+        else:
+            continue
 
-            # Determine if this agent is involved
-            if sender == agent_id and inbox_agent != agent_id:
-                partner = inbox_agent
-                direction = "outbound"
-            elif inbox_agent == agent_id and sender != agent_id:
-                partner = sender
-                direction = "inbound"
-            else:
-                continue
+        if partner_filter and partner != partner_filter:
+            continue
 
-            if partner_filter and partner != partner_filter:
-                continue
-
-            has_artifact = bool(artifact_re.search(content))
-            raw_msgs.append((ts, partner, direction, has_artifact))
+        has_artifact = bool(artifact_re.search(content))
+        raw_msgs.append((ts, partner, direction, has_artifact))
 
     if not raw_msgs:
         return jsonify({"agent": agent_id, "sessions": [], "total": 0})
