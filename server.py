@@ -7741,12 +7741,6 @@ def post_demand():
     for match in matches:
         supplier_id = match["agent_id"]
         try:
-            inbox_file = os.path.join(DATA_DIR, "messages", f"{supplier_id}.json")
-            inbox = []
-            if os.path.exists(inbox_file):
-                with open(inbox_file) as f:
-                    inbox = json.load(f)
-            
             budget_str = f"{budget.get('amount', '?')} {budget.get('currency', '?')}" if budget else "unspecified"
             notification = {
                 "id": secrets.token_hex(8),
@@ -7762,10 +7756,7 @@ def post_demand():
                 "read": False,
                 "type": "demand-match"
             }
-            inbox.append(notification)
-            os.makedirs(os.path.dirname(inbox_file), exist_ok=True)
-            with open(inbox_file, "w") as f:
-                json.dump(inbox, f, indent=2)
+            append_message_to_conversation(supplier_id, "hub-demand-match", notification)
             notified.append(supplier_id)
         except Exception:
             pass
