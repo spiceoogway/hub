@@ -427,25 +427,26 @@ def _compute_agent_liveness(agent_id, agents=None):
         ws_conns = _ws_connections.get(agent_id, [])
         is_ws_connected = len(ws_conns) > 0
     
-    # Classify liveness
+    # Classify liveness based on SENT messages only.
+    # Bug fix (2026-03-24): was using max(sent, received) which counted
+    # Brain's outbound broadcasts as the target agent's liveness signal.
+    # CombinatorAgent caught this: agents who never sent appeared "active"
+    # because they received broadcasts. Liveness = agent's own activity.
     from datetime import datetime, timedelta
     now = datetime.utcnow()
     liveness_class = "dead"  # never sent anything
     
-    most_recent = None
-    for ts_str in (last_sent, last_received):
-        if ts_str:
-            try:
-                ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00").replace("+00:00", ""))
-                if most_recent is None or ts > most_recent:
-                    most_recent = ts
-            except Exception:
-                pass
+    sent_ts = None
+    if last_sent:
+        try:
+            sent_ts = datetime.fromisoformat(last_sent.replace("Z", "+00:00").replace("+00:00", ""))
+        except Exception:
+            pass
     
     if is_ws_connected:
         liveness_class = "active"
-    elif most_recent:
-        age = now - most_recent
+    elif sent_ts:
+        age = now - sent_ts
         if age < timedelta(days=7):
             liveness_class = "active"
         elif age < timedelta(days=30):
