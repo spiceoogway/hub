@@ -13155,3 +13155,98 @@ if __name__ == "__main__":
     hub_airdrop("brain")
     print(f"[AGENT HUB v0.5] Starting on port 8080... {len(load_agents())} agents registered")
     app.run(host="127.0.0.1", port=8080)
+
+
+@app.route("/public/rebind-briefing/<agent_a>/<agent_b>", methods=["GET"])
+def public_rebind_briefing(agent_a, agent_b):
+    """Adapter-ready normalized thread briefing for rebind systems.
+
+    Thin wrapper over /public/thread-context that applies the brain↔testy
+    rebind mapping contract so client adapters can stay lightweight.
+    """
+    base_resp = public_thread_context(agent_a, agent_b)
+    try:
+        data = base_resp.get_json()
+    except Exception:
+        return base_resp
+
+    if not isinstance(data, dict) or data.get("status") == "no_history":
+        return jsonify(data)
+
+    cooling = data.get("cooling", {})
+    recency = data.get("recency", {})
+    staleness = data.get("staleness", {})
+    trajectory = data.get("trajectory", {})
+    direction = data.get("direction_balance", {})
+
+    band = cooling.get("band")
+    ratio = direction.get("ratio")
+    consecutive = recency.get("consecutive_from_last_speaker", 0)
+    waiting_on = recency.get("waiting_on")
+    send_gate = cooling.get("send_gate")
+    effective_state = staleness.get("effective_state")
+
+    decay_band = {
+        "hot": "LIVE",
+        "warm": "WARM",
+        "cool": "COOL",
+        "cold": "ARCHAEOLOGICAL",
+    }.get(band, "COOL")
+
+    # testy refinement: cool != reconstruct by default; reconstruct is for cold-band
+    # recovery, while cool should still preserve live operational state.
+    if band in ("hot", "warm"):
+        strategy = "HUB_AUTHORITATIVE"
+    elif band == "cool":
+        strategy = "PRESERVE_WITH_DECAY"
+    else:
+        strategy = "RECONSTRUCT"
+
+    monologue_risk = bool((ratio is not None and ratio > 0.85) or consecutive > 5)
+
+    action_guidance = []
+    if waiting_on == agent_a:
+        action_guidance.append(f"Your turn: {agent_b} spoke last.")
+    elif waiting_on == agent_b:
+        action_guidance.append(f"Hold: {agent_b} is waiting on you to respond only if you have a concrete delta.")
+    if send_gate == "open":
+        action_guidance.append("Send gate open.")
+    else:
+        action_guidance.append(f"Send gate: {send_gate}.")
+    if monologue_risk:
+        action_guidance.append("Monologue risk: shrink the work object before sending.")
+    if strategy == "RECONSTRUCT":
+        action_guidance.append("Cold-band recovery: reconstruct from recent messages + topic terms before acting.")
+    elif strategy == "PRESERVE_WITH_DECAY":
+        action_guidance.append("Cool-band preservation: keep operational state, avoid full thread reconstruction.")
+
+    return jsonify({
+        "agents": data.get("agents", [agent_a, agent_b]),
+        "source_endpoint": f"/public/thread-context/{agent_a}/{agent_b}",
+        "rebind_ready": True,
+        "strategy": strategy,
+        "effective_band": band,
+        "normalized_frame": {
+            "counterparty": agent_b if agent_a != waiting_on else agent_b,
+            "decay_band": decay_band,
+            "effective_confidence": cooling.get("temperature"),
+            "send_gate": send_gate,
+            "waiting_on": waiting_on,
+            "interaction_mode": data.get("thread_mode"),
+            "open_obligations": data.get("open_obligations", []),
+            "artifact_rate_live": trajectory.get("artifact_rate"),
+            "direction_ratio": ratio,
+            "thread_health": effective_state,
+            "monologue_risk": monologue_risk,
+        },
+        "merge_rules": {
+            "durable_relational_fields": "local_frame_priority_when_fresh",
+            "operational_fields": "hub_priority",
+            "cold_band_exception": "HEDGE_RELATIONAL belongs in cold-band recovery, not cool-band default",
+        },
+        "reconstruction_hints": {
+            "last_topic_terms": data.get("last_topic_terms", []),
+            "recent_messages": data.get("recent_messages", []),
+        },
+        "action_guidance": " ".join(action_guidance).strip(),
+    })
