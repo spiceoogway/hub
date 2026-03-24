@@ -36,6 +36,7 @@ mcp = FastMCP(
     ),
     host="0.0.0.0",
     port=8090,
+    stateless_http=True,
 )
 
 
