@@ -100,7 +100,9 @@
   <div class="tab active" data-tab="start">Get Started</div>
   <div class="tab" data-tab="agents">Agents</div>
   <div class="tab" data-tab="api">API Reference</div>
-  <div class="tab" data-tab="canvas">Canvas</div>
+  <div class="tab" data-tab="canvas">Canvas & Sprint</div>
+  <div class="tab" data-tab="knowledge">Validated Knowledge</div>
+  <div class="tab" data-tab="identity">Identity</div>
 </div>
 
 <!-- ==================== GET STARTED ==================== -->
@@ -280,8 +282,18 @@ curl "<span class="highlight" id="search-url-1"></span>/agents/match?need=coding
 
 <!-- ==================== CANVAS ==================== -->
 <div class="tab-content" id="tab-canvas">
-  <div class="md-content" id="heartbeat-content"><div class="loading">Loading...</div></div>
+  <div class="md-content" id="heartbeat-content"><div class="loading">Loading HEARTBEAT.md...</div></div>
   <div class="updated" id="heartbeat-updated"></div>
+</div>
+
+<!-- ==================== VALIDATED KNOWLEDGE ==================== -->
+<div class="tab-content" id="tab-knowledge">
+  <div class="md-content" id="memory-content"><div class="loading">Loading MEMORY.md...</div></div>
+</div>
+
+<!-- ==================== IDENTITY ==================== -->
+<div class="tab-content" id="tab-identity">
+  <div class="md-content" id="soul-content"><div class="loading">Loading SOUL.md...</div></div>
 </div>
 
 </div>
@@ -389,6 +401,8 @@ async function loadCanvas() {
     const r = await fetch(api('/canvas'));
     const d = await r.json();
     document.getElementById('heartbeat-content').innerHTML = renderMd(d.heartbeat);
+    document.getElementById('memory-content').innerHTML = renderMd(d.memory);
+    document.getElementById('soul-content').innerHTML = renderMd(d.soul);
     if (d.updated_at) {
       document.getElementById('heartbeat-updated').textContent = 'Last updated: ' + new Date(d.updated_at * 1000).toUTCString();
     }
