@@ -10860,6 +10860,198 @@ def export_obligation(obl_id):
     return jsonify({"obligation": export})
 
 
+@app.route("/obligations/<obl_id>/status-card", methods=["GET"])
+def obligation_status_card(obl_id):
+    """Compact actionable status card for an obligation.
+
+    Returns a structured summary designed for agent dashboards and quick decision-making:
+    - Current state and time context (age, deadline proximity)
+    - Checkpoint alignment status (pending, confirmed, overdue)
+    - Communication health (last message, silence duration)
+    - Suggested next action for the requesting agent
+    - Interpretation gap risk assessment
+
+    Query params:
+        agent_id — (optional) requesting agent, personalizes suggested_action
+    """
+    obls = load_obligations()
+    if _expire_obligations(obls):
+        save_obligations(obls)
+    obl = next((o for o in obls if o["obligation_id"] == obl_id), None)
+    if not obl:
+        return jsonify({"error": "not found"}), 404
+
+    now = datetime.utcnow()
+    created = datetime.fromisoformat(obl["created_at"].replace("Z", ""))
+    age_hours = round((now - created).total_seconds() / 3600, 1)
+
+    # Deadline context
+    deadline_info = None
+    if obl.get("deadline_utc"):
+        try:
+            deadline = datetime.fromisoformat(obl["deadline_utc"].replace("Z", ""))
+            remaining_hours = round((deadline - now).total_seconds() / 3600, 1)
+            deadline_info = {
+                "deadline_utc": obl["deadline_utc"],
+                "remaining_hours": remaining_hours,
+                "urgency": "overdue" if remaining_hours < 0 else "critical" if remaining_hours < 6 else "approaching" if remaining_hours < 24 else "comfortable",
+            }
+        except (ValueError, TypeError):
+            pass
+
+    # Checkpoint analysis
+    checkpoints = obl.get("checkpoints", [])
+    pending_cps = [c for c in checkpoints if c.get("status") == "proposed"]
+    confirmed_cps = [c for c in checkpoints if c.get("status") == "confirmed"]
+    rejected_cps = [c for c in checkpoints if c.get("status") == "rejected"]
+
+    # Time since last checkpoint activity
+    last_cp_time = None
+    if checkpoints:
+        cp_times = []
+        for c in checkpoints:
+            for field in ("responded_at", "proposed_at"):
+                if c.get(field):
+                    try:
+                        cp_times.append(datetime.fromisoformat(c[field].replace("Z", "")))
+                    except (ValueError, TypeError):
+                        pass
+        if cp_times:
+            last_cp_time = max(cp_times)
+
+    hours_since_checkpoint = None
+    if last_cp_time:
+        hours_since_checkpoint = round((now - last_cp_time).total_seconds() / 3600, 1)
+
+    # Communication health: last history event
+    last_event = obl.get("history", [{}])[-1] if obl.get("history") else {}
+    last_event_at = last_event.get("at")
+    hours_since_activity = None
+    if last_event_at:
+        try:
+            last_dt = datetime.fromisoformat(last_event_at.replace("Z", ""))
+            hours_since_activity = round((now - last_dt).total_seconds() / 3600, 1)
+        except (ValueError, TypeError):
+            pass
+
+    # Interpretation gap risk
+    # Risk increases with: age, no checkpoints, long silence, pending checkpoints
+    risk_factors = []
+    if age_hours > 24 and not checkpoints:
+        risk_factors.append("no_checkpoints_after_24h")
+    if hours_since_activity and hours_since_activity > 48:
+        risk_factors.append("silence_over_48h")
+    if pending_cps:
+        oldest_pending = min(
+            datetime.fromisoformat(c["proposed_at"].replace("Z", ""))
+            for c in pending_cps
+        )
+        pending_hours = round((now - oldest_pending).total_seconds() / 3600, 1)
+        if pending_hours > 12:
+            risk_factors.append(f"pending_checkpoint_unanswered_{pending_hours}h")
+    if obl.get("status") in ("accepted",) and age_hours > 72 and not confirmed_cps:
+        risk_factors.append("72h_active_no_confirmed_checkpoint")
+
+    gap_risk = "low" if not risk_factors else "medium" if len(risk_factors) <= 1 else "high"
+
+    # Suggested next action (personalized if agent_id provided)
+    requesting_agent = request.args.get("agent_id")
+    suggested_action = _suggest_obligation_action(obl, requesting_agent, pending_cps, gap_risk)
+
+    # Open questions from checkpoints
+    open_questions = []
+    for c in checkpoints:
+        if c.get("open_question") and c.get("status") in ("proposed", "confirmed"):
+            open_questions.append({
+                "question": c["open_question"],
+                "from_checkpoint": c["checkpoint_id"],
+                "status": c["status"],
+            })
+
+    card = {
+        "obligation_id": obl_id,
+        "status": obl["status"],
+        "created_by": obl.get("created_by"),
+        "counterparty": obl.get("counterparty"),
+        "commitment_summary": obl.get("commitment", "")[:200],
+        "scope": obl.get("binding_scope_text"),
+        "age_hours": age_hours,
+        "deadline": deadline_info,
+        "checkpoints": {
+            "total": len(checkpoints),
+            "pending": len(pending_cps),
+            "confirmed": len(confirmed_cps),
+            "rejected": len(rejected_cps),
+            "hours_since_last": hours_since_checkpoint,
+        },
+        "communication": {
+            "last_event": last_event.get("event") if last_event else None,
+            "last_event_by": last_event.get("by") if last_event else None,
+            "hours_since_activity": hours_since_activity,
+        },
+        "interpretation_gap": {
+            "risk": gap_risk,
+            "factors": risk_factors,
+        },
+        "open_questions": open_questions,
+        "suggested_action": suggested_action,
+    }
+
+    return jsonify({"status_card": card})
+
+
+def _suggest_obligation_action(obl, agent_id, pending_cps, gap_risk):
+    """Determine the most useful next action for an agent on an obligation."""
+    status = obl.get("status", "")
+    created_by = obl.get("created_by", "")
+    counterparty = obl.get("counterparty", "")
+
+    if not agent_id:
+        # Generic suggestion
+        if status == "proposed":
+            return {"action": "accept_or_reject", "message": f"Awaiting {counterparty}'s response to the proposal."}
+        if pending_cps:
+            responders = [c["proposed_by"] for c in pending_cps]
+            return {"action": "respond_to_checkpoint", "message": f"Pending checkpoint(s) from: {', '.join(set(responders))}",
+                    "checkpoint_ids": [c["checkpoint_id"] for c in pending_cps]}
+        if status in ("accepted",) and gap_risk in ("medium", "high"):
+            return {"action": "propose_checkpoint", "message": "Consider proposing a checkpoint to verify alignment."}
+        if status == "evidence_submitted":
+            return {"action": "review_evidence", "message": "Evidence submitted. Review and resolve."}
+        return {"action": "monitor", "message": f"Status: {status}. No immediate action needed."}
+
+    # Personalized
+    is_creator = agent_id == created_by
+    is_counterparty = agent_id == counterparty
+
+    if status == "proposed" and is_counterparty:
+        return {"action": "accept_or_reject", "message": "You need to accept or reject this obligation.",
+                "endpoint": f"POST /obligations/{obl['obligation_id']}/advance",
+                "payload_example": {"from": agent_id, "secret": "<your_secret>", "status": "accepted"}}
+    if status == "proposed" and is_creator:
+        return {"action": "wait", "message": f"Waiting for {counterparty} to accept."}
+
+    my_pending = [c for c in pending_cps if c["proposed_by"] != agent_id]
+    if my_pending:
+        return {"action": "respond_to_checkpoint", "message": f"{len(my_pending)} checkpoint(s) awaiting your response.",
+                "checkpoint_ids": [c["checkpoint_id"] for c in my_pending],
+                "endpoint": f"POST /obligations/{obl['obligation_id']}/checkpoint",
+                "payload_example": {"from": agent_id, "secret": "<your_secret>", "action": "confirm", "checkpoint_id": my_pending[0]["checkpoint_id"]}}
+
+    if status in ("accepted",) and gap_risk in ("medium", "high"):
+        return {"action": "propose_checkpoint", "message": "Alignment risk is elevated. Propose a checkpoint.",
+                "endpoint": f"POST /obligations/{obl['obligation_id']}/checkpoint",
+                "payload_example": {"from": agent_id, "secret": "<your_secret>", "action": "propose",
+                                     "summary": "Current understanding: ...",
+                                     "open_question": "What remains unclear?"}}
+
+    if status == "evidence_submitted" and is_counterparty:
+        return {"action": "review_and_resolve", "message": "Evidence submitted. Review and resolve or dispute.",
+                "endpoint": f"POST /obligations/{obl['obligation_id']}/advance"}
+
+    return {"action": "monitor", "message": f"Status: {status}. No immediate action for you."}
+
+
 @app.route("/obligations/<obl_id>/advance", methods=["POST"])
 def advance_obligation(obl_id):
     """Advance obligation status. Enforces reducer rules and closure policy."""
