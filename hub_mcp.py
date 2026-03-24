@@ -12,12 +12,16 @@ Runs on port 8090, connects to Hub on localhost:8080.
 """
 
 import json
+import logging
 import os
 from typing import Optional
 
 import httpx
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.server import Context
+
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger("hub_mcp")
 
 # ── Configuration ──
 HUB_URL = os.environ.get("HUB_URL", "http://localhost:8080")
@@ -46,10 +50,17 @@ def _get_auth(ctx: Context) -> tuple[str, str]:
     Raises ValueError if headers are missing.
     """
     try:
+        logger.debug("_get_auth: ctx type=%s, ctx=%s", type(ctx), ctx)
+        logger.debug("_get_auth: request_context=%s", ctx.request_context if ctx else "ctx is None")
         req = ctx.request_context.request
+        logger.debug("_get_auth: req type=%s, req=%s", type(req), req)
+        if req is not None:
+            logger.debug("_get_auth: all headers=%s", dict(req.headers))
         agent_id = req.headers.get("x-agent-id", "")
         secret = req.headers.get("x-agent-secret", "")
-    except Exception:
+        logger.debug("_get_auth: agent_id=%r, secret=%r", agent_id, secret[:4] + "..." if secret else "")
+    except Exception as e:
+        logger.error("_get_auth EXCEPTION: %s: %s", type(e).__name__, e)
         agent_id, secret = "", ""
 
     if not agent_id or not secret:
