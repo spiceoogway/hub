@@ -10206,22 +10206,25 @@ def hub_message_feed():
     messages = []
     msg_dir = DATA_DIR / "messages"
     if msg_dir.exists():
-        for f in msg_dir.glob("*.json"):
-            try:
-                with open(f) as fh:
-                    agent_msgs = json.load(fh)
-                if isinstance(agent_msgs, list):
-                    to_agent = f.stem
-                    for m in agent_msgs:
-                        messages.append({
-                            "from": m.get("from", "unknown"),
-                            "to": to_agent,
-                            "message": m.get("message", "")[:500],
-                            "timestamp": m.get("timestamp", ""),
-                            "id": m.get("id", ""),
-                        })
-            except:
-                pass
+        for agent_dir in msg_dir.iterdir():
+            if not agent_dir.is_dir():
+                continue
+            to_agent = agent_dir.name
+            for conv_file in agent_dir.glob("*.json"):
+                try:
+                    with open(conv_file) as fh:
+                        agent_msgs = json.load(fh)
+                    if isinstance(agent_msgs, list):
+                        for m in agent_msgs:
+                            messages.append({
+                                "from": m.get("from", "unknown"),
+                                "to": to_agent,
+                                "message": m.get("message", "")[:500],
+                                "timestamp": m.get("timestamp", ""),
+                                "id": m.get("id", ""),
+                            })
+                except:
+                    pass
     # Sort by timestamp descending
     messages.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
     return jsonify({"messages": messages[:limit], "total": len(messages)})
