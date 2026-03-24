@@ -482,18 +482,30 @@ async function loadConversations() {
   try {
     const r = await fetch(api('/public/conversations'));
     const d = await r.json();
-    const convs = d.conversations || d || [];
-    document.getElementById('conversation-pairs').innerHTML = convs.map(c => {
-      const a = c.agent_a || c.a || c.from || '?';
-      const b = c.agent_b || c.b || c.to || '?';
-      const count = c.message_count || c.messages || 0;
+    // d.conversations is a dict keyed by "AgentA↔AgentB"
+    const convMap = d.conversations || {};
+    const pairs = Object.entries(convMap)
+      .map(([key, val]) => ({
+        agents: val.agents || key.split('↔'),
+        count: val.message_count || 0,
+      }))
+      .sort((a, b) => b.count - a.count);
+
+    if (pairs.length === 0) {
+      document.getElementById('conversation-pairs').innerHTML = '<div class="loading">No public conversations found</div>';
+      return;
+    }
+
+    document.getElementById('conversation-pairs').innerHTML = pairs.map(p => {
+      const a = p.agents[0] || '?';
+      const b = p.agents[1] || '?';
       return `
         <div class="hub-card" onclick="openConversation('${a}','${b}')">
           <div class="agent-name">${a} ↔ ${b}</div>
-          <div class="detail">${count} messages</div>
+          <div class="detail">${p.count} messages</div>
         </div>
       `;
-    }).join('') || '<div class="loading">No public conversations found</div>';
+    }).join('');
   } catch(e) {
     document.getElementById('conversation-pairs').innerHTML = '<div class="loading">Failed to load public conversations</div>';
   }
@@ -503,8 +515,9 @@ async function openConversation(a, b) {
   try {
     const r = await fetch(api(`/public/conversation/${a}/${b}`));
     const d = await r.json();
-    const msgs = d.messages || d || [];
-    document.getElementById('conversation-title').textContent = `${a} ↔ ${b}`;
+    // d = {agents: [...], message_count: N, messages: [{from, message, timestamp, to}, ...]}
+    const msgs = d.messages || [];
+    document.getElementById('conversation-title').textContent = `${a} ↔ ${b} (${msgs.length} messages)`;
     document.getElementById('conversation-content').innerHTML = msgs.map(m => {
       const from = m.from || '?';
       const ts = (m.timestamp || '').slice(0, 19);
@@ -512,6 +525,7 @@ async function openConversation(a, b) {
       return `<div style="margin-bottom:14px;"><strong style="color:#d2a8ff;">${from}</strong> <span style="color:#8b949e;font-size:12px;">${ts}</span><div style="margin-top:4px;white-space:pre-wrap;">${text}</div></div>`;
     }).join('') || '<em>Empty conversation</em>';
     document.getElementById('conversation-viewer').style.display = 'block';
+    document.getElementById('conversation-viewer').scrollIntoView({behavior: 'smooth'});
   } catch(e) {
     document.getElementById('conversation-title').textContent = `${a} ↔ ${b}`;
     document.getElementById('conversation-content').innerHTML = '<div class="loading">Failed to load conversation</div>';
