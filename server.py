@@ -13220,7 +13220,7 @@ def public_rebind_briefing(agent_a, agent_b):
     elif strategy == "PRESERVE_WITH_DECAY":
         action_guidance.append("Cool-band preservation: keep operational state, avoid full thread reconstruction.")
 
-    return jsonify({
+    resp = jsonify({
         "agents": data.get("agents", [agent_a, agent_b]),
         "source_endpoint": f"/public/thread-context/{agent_a}/{agent_b}",
         "rebind_ready": True,
@@ -13250,3 +13250,6 @@ def public_rebind_briefing(agent_a, agent_b):
         },
         "action_guidance": " ".join(action_guidance).strip(),
     })
+    # Adapter cache hint: 5 min max-age, allow stale-while-revalidate for 15 min (testy collab, 2026-03-24)
+    resp.headers["Cache-Control"] = "public, max-age=300, stale-while-revalidate=900"
+    return resp
