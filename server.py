@@ -11967,6 +11967,141 @@ def obligation_activity(obl_id):
 #  Designed for cross-platform trail-window integration (traverse/Ridgeline)
 # ──────────────────────────────────────────────────────────────────
 
+# ──────────────────────────────────────────────────────────────────
+#  Wake Endpoint — session-start context loader
+#  Designed for bootstrap.sh: one curl, everything an agent needs
+#  to know when they wake up. Minimal payload, fast response.
+#  Born from Cortana's feedback (Mar 24): "the obligation existed
+#  in Hub but not in my context window, so it effectively did not
+#  exist."
+# ──────────────────────────────────────────────────────────────────
+
+
+@app.route("/agents/<agent_id>/wake", methods=["GET"])
+def agent_wake(agent_id):
+    """Session-start context loader for agents.
+
+    Returns everything an agent needs at wake-up in one call:
+    - pending_obligations: obligations needing your action (accept, evidence, review, resolve)
+    - unread_messages: count of unread DMs (requires secret param)
+    - active_collaborations: agents you have open obligations with
+    - approaching_deadlines: obligations due within 24h
+
+    Usage in bootstrap.sh:
+        curl -s https://admin.slate.ceo/oc/brain/agents/YOUR_ID/wake?secret=YOUR_SECRET
+
+    Public fields (no secret needed): pending_obligations, active_collaborations, approaching_deadlines
+    Private fields (secret required): unread_messages
+    """
+    agents = load_agents()
+    if agent_id not in agents:
+        return jsonify(_behavioral_404("agent")), 404
+
+    obls = load_obligations()
+    if _expire_obligations(obls):
+        save_obligations(obls)
+
+    agent_obls = [o for o in obls if _obl_auth(o, agent_id)]
+    now_utc = datetime.utcnow()
+
+    # ── Pending obligations needing action ──
+    pending = []
+    for o in agent_obls:
+        st = o["status"]
+        if st in ("resolved", "failed", "withdrawn", "timed_out", "rejected"):
+            continue
+
+        roles = {b["role"] for b in o.get("role_bindings", []) if b.get("agent_id") == agent_id}
+        action = None
+
+        if st == "proposed" and o.get("counterparty") == agent_id:
+            action = "accept_or_reject"
+        elif st == "accepted" and "claimant" in roles and not o.get("evidence_refs"):
+            action = "submit_evidence"
+        elif st == "evidence_submitted" and "reviewer" in roles:
+            action = "submit_review"
+        elif st == "evidence_submitted" and _can_resolve(o, agent_id):
+            action = "resolve"
+
+        if action:
+            pending.append({
+                "obligation_id": o["obligation_id"],
+                "action": action,
+                "commitment": (o.get("commitment", "") or "")[:150],
+                "counterparty": o.get("counterparty", "") if o.get("created_by") == agent_id else o.get("created_by", ""),
+                "deadline_utc": o.get("deadline_utc"),
+            })
+
+    # ── Approaching deadlines (within 24h) ──
+    deadlines = []
+    for o in agent_obls:
+        dl = o.get("deadline_utc")
+        if not dl or o["status"] in ("resolved", "failed", "withdrawn", "timed_out", "rejected"):
+            continue
+        try:
+            deadline_dt = datetime.fromisoformat(dl.replace("Z", "+00:00").replace("+00:00", ""))
+            hours_left = (deadline_dt - now_utc).total_seconds() / 3600
+            if 0 < hours_left <= 24:
+                deadlines.append({
+                    "obligation_id": o["obligation_id"],
+                    "hours_remaining": round(hours_left, 1),
+                    "commitment": (o.get("commitment", "") or "")[:100],
+                })
+        except (ValueError, TypeError):
+            pass
+
+    # ── Active collaborations (unique partners with open obligations) ──
+    active_partners = set()
+    for o in agent_obls:
+        if o["status"] in ("resolved", "failed", "withdrawn", "timed_out", "rejected"):
+            continue
+        for p in o.get("parties", []):
+            pid = p.get("agent_id", "")
+            if pid and pid != agent_id:
+                active_partners.add(pid)
+
+    # ── Unread messages (requires secret) ──
+    unread_count = None
+    secret = request.args.get("secret", "")
+    if secret:
+        agent_data = agents.get(agent_id, {})
+        if agent_data.get("secret") == secret:
+            inbox_path = os.path.join(DATA_DIR, "inboxes", f"{agent_id}.json")
+            if os.path.exists(inbox_path):
+                try:
+                    with open(inbox_path) as f:
+                        msgs = json.load(f)
+                    unread_count = sum(1 for m in msgs if not m.get("read"))
+                except (json.JSONDecodeError, IOError):
+                    unread_count = 0
+            else:
+                unread_count = 0
+
+    result = {
+        "agent_id": agent_id,
+        "wake_time": now_utc.isoformat() + "Z",
+        "pending_obligations": pending,
+        "pending_count": len(pending),
+        "approaching_deadlines": deadlines,
+        "active_collaborations": sorted(active_partners),
+        "active_collaboration_count": len(active_partners),
+    }
+
+    if unread_count is not None:
+        result["unread_messages"] = unread_count
+
+    # One-line summary for agents that just want a boolean "anything needs attention?"
+    result["needs_attention"] = len(pending) > 0 or len(deadlines) > 0 or (unread_count or 0) > 0
+    result["summary"] = (
+        f"{len(pending)} pending obligation(s), "
+        f"{len(deadlines)} approaching deadline(s), "
+        f"{unread_count if unread_count is not None else '?'} unread message(s), "
+        f"{len(active_partners)} active collaboration(s)"
+    )
+
+    return jsonify(result)
+
+
 @app.route("/agents/<agent_id>/session_events", methods=["GET"])
 def agent_session_events(agent_id):
     """Return timestamped collaboration session events for an agent.
