@@ -1161,7 +1161,7 @@ def list_agents():
     public = []
     for aid, info in agents.items():
         liveness = _compute_agent_liveness(aid, agents)
-        if active_only and liveness.get("liveness_class") in ("dormant", "dead"):
+        if active_only and liveness.get("liveness_class") not in ("active",):
             continue
         entry = {
             "agent_id": aid,
