@@ -36,6 +36,7 @@ if os.path.exists(_env_path):
             if _line and not _line.startswith("#") and "=" in _line:
                 _k, _v = _line.split("=", 1)
                 os.environ.setdefault(_k.strip(), _v.strip())
+import threading
 import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -10219,9 +10220,17 @@ def _obl_roles(obl):
     return claimant, counterparty, reviewer
 
 
-def _obl_last_activity_iso(obl):
+def _obl_last_activity_iso(obl, exclude_system=False):
+    """Return ISO timestamp of last activity on an obligation.
+    
+    If exclude_system=True, ignores system/watchdog-generated history entries
+    so that watchdog tiers measure counterparty silence, not system silence.
+    """
     latest = None
+    _SYSTEM_EVENTS = {"watchdog_nudge", "watchdog_escalate", "watchdog_default"}
     for h in obl.get("history", []):
+        if exclude_system and (h.get("by") == "system" or h.get("event") in _SYSTEM_EVENTS):
+            continue
         at = h.get("at")
         if at and (latest is None or at > latest):
             latest = at
@@ -10261,7 +10270,7 @@ def _check_ghost_watchdog(obl):
     if not silent_party:
         return False
 
-    hours_silent = _hours_since_iso(_obl_last_activity_iso(obl))
+    hours_silent = _hours_since_iso(_obl_last_activity_iso(obl, exclude_system=True))
     if hours_silent is None:
         return False
 
@@ -13744,6 +13753,35 @@ def identity_divergence_data_package():
             "pair_analysis": "GET /collaboration/feed",
         },
     })
+
+
+def _watchdog_background_loop(interval_seconds=300):
+    """Background thread that runs _expire_obligations every `interval_seconds`.
+    
+    Ensures watchdog tiers fire on schedule regardless of API traffic.
+    Without this, watchdog only fires on request-driven calls to _expire_obligations.
+    """
+    import time
+    while True:
+        time.sleep(interval_seconds)
+        try:
+            obls = load_obligations()
+            if _expire_obligations(obls):
+                save_obligations(obls)
+                print(f"[WATCHDOG] Background tick: obligations updated at {datetime.utcnow().isoformat()}Z")
+        except Exception as e:
+            print(f"[WATCHDOG] Background tick error: {e}")
+
+
+def _start_watchdog_timer():
+    """Start the background watchdog timer in a daemon thread."""
+    t = threading.Thread(target=_watchdog_background_loop, args=(300,), daemon=True)
+    t.start()
+    print("[WATCHDOG] Background timer started (5-min interval)")
+
+
+# Start watchdog timer when module loads (works under gunicorn)
+_start_watchdog_timer()
 
 
 if __name__ == "__main__":
