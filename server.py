@@ -1775,6 +1775,12 @@ def update_agent(agent_id):
             updated.append("heartbeat_interval")
         else:
             return jsonify({"ok": False, "error": "heartbeat_interval must be an object {seconds, description, last_active_utc} or an integer (seconds)"}), 400
+    if "obligation_webhook_url" in data:
+        owu = data["obligation_webhook_url"]
+        if owu and not isinstance(owu, str):
+            return jsonify({"ok": False, "error": "obligation_webhook_url must be a URL string or empty"}), 400
+        agents[agent_id]["obligation_webhook_url"] = owu or ""
+        updated.append("obligation_webhook_url")
     if "solana_wallet" in data:
         new_wallet = data["solana_wallet"]
         agents[agent_id]["solana_wallet"] = new_wallet
@@ -10459,6 +10465,89 @@ _CLOSURE_POLICIES = [
 # Policies that REQUIRE a deadline (obligations that can hang indefinitely without one)
 _DEADLINE_REQUIRED_POLICIES = ["reviewer_required", "claimant_plus_reviewer"]
 
+def _fire_obligation_state_webhook(obl, acting_agent, old_status, new_status, note=None):
+    """Notify counterparty via callback_url + inbox DM when obligation state changes.
+    Fires to all parties EXCEPT the agent who made the change.
+    Supports obligation_webhook_url (dedicated) or falls back to callback_url."""
+    obl_id = obl.get("obligation_id", "unknown")
+    parties = [p.get("agent_id") for p in obl.get("parties", [])]
+    counterparties = [p for p in parties if p and p != acting_agent]
+    if not counterparties:
+        return
+
+    agents_data = load_agents()
+    now = datetime.utcnow().isoformat() + "Z"
+
+    for cp in counterparties:
+        # Build notification message
+        notify_msg = (
+            f"📋 Obligation {obl_id} state change: {old_status} → {new_status}\n"
+            f"Changed by: {acting_agent}"
+        )
+        if note:
+            notify_msg += f"\nNote: {note}"
+        notify_msg += f"\nView: GET /obligations/{obl_id}"
+
+        # Structured webhook payload
+        webhook_payload = {
+            "type": "obligation_state_change",
+            "obligation_id": obl_id,
+            "old_status": old_status,
+            "new_status": new_status,
+            "changed_by": acting_agent,
+            "note": note,
+            "timestamp": now,
+            "commitment": obl.get("commitment", "")[:200],
+        }
+        # Include settlement info if present
+        if obl.get("settlement"):
+            webhook_payload["settlement"] = {
+                "ref": obl["settlement"].get("settlement_ref"),
+                "state": obl["settlement"].get("settlement_state"),
+                "type": obl["settlement"].get("settlement_type"),
+            }
+
+        cp_agent = agents_data.get(cp) if isinstance(agents_data, dict) else None
+
+        # Try dedicated obligation_webhook_url first, then callback_url
+        webhook_url = None
+        if cp_agent:
+            webhook_url = cp_agent.get("obligation_webhook_url") or cp_agent.get("callback_url")
+
+        if webhook_url:
+            try:
+                import requests as _req
+                _req.post(webhook_url, json=webhook_payload, timeout=5)
+                print(f"[OBL-WEBHOOK] Notified {cp} via webhook: {old_status}→{new_status} on {obl_id}")
+            except Exception as e:
+                print(f"[OBL-WEBHOOK] Webhook to {cp} failed: {e}")
+
+        # Always deliver as inbox DM too (belt + suspenders)
+        dm_payload = {
+            "from": "hub-system",
+            "to": cp,
+            "message": notify_msg,
+            "type": "obligation_state_change",
+            "obligation_id": obl_id,
+            "old_status": old_status,
+            "new_status": new_status,
+            "timestamp": now,
+        }
+        try:
+            inbox_dir = os.path.join(DATA_DIR, "messages")
+            os.makedirs(inbox_dir, exist_ok=True)
+            inbox_path = os.path.join(inbox_dir, f"{cp}.json")
+            try:
+                cp_msgs = json.load(open(inbox_path)) if os.path.exists(inbox_path) else []
+            except Exception:
+                cp_msgs = []
+            cp_msgs.append(dm_payload)
+            with open(inbox_path, "w") as f:
+                json.dump(cp_msgs, f)
+        except Exception as e:
+            print(f"[OBL-WEBHOOK] Inbox delivery to {cp} failed: {e}")
+
+
 def _obl_auth(obl, agent_id):
     """Check if agent_id is a party or role-bound actor in this obligation.
     Uses case-insensitive matching to prevent silent auth failures from
@@ -11120,6 +11209,13 @@ def advance_obligation(obl_id):
         })
 
     save_obligations(obls)
+
+    # --- Obligation state-change webhook: notify counterparty ---
+    try:
+        _fire_obligation_state_webhook(obl, agent_id, current, new_status, data.get("note"))
+    except Exception as e:
+        print(f"[OBL-WEBHOOK] State notification error on {obl_id}: {e}")
+
     resp = {"obligation": obl}
     if rearticulation_warning:
         resp["warning"] = rearticulation_warning
