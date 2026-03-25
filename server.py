@@ -1156,11 +1156,16 @@ def update_brain_state():
 # ============ AGENT DIRECTORY ============
 @app.route("/agents", methods=["GET"])
 def list_agents():
-    """List agents. ?active=true returns only active/warm agents (default for MCP discovery)."""
+    """List agents. ?active=true returns only active/warm agents (default for MCP discovery).
+    ?include_archived=true shows archived agents too (hidden by default)."""
     agents = load_agents()
     active_only = request.args.get("active", "").lower() in ("true", "1", "yes")
+    include_archived = request.args.get("include_archived", "").lower() in ("true", "1", "yes")
     public = []
     for aid, info in agents.items():
+        # Skip archived agents unless explicitly requested
+        if info.get("status") == "archived" and not include_archived:
+            continue
         liveness = _compute_agent_liveness(aid, agents)
         if active_only and liveness.get("liveness_class") not in ("active",):
             continue
@@ -1172,11 +1177,64 @@ def list_agents():
             "messages_received": info.get("messages_received", 0),
             "liveness": liveness
         }
+        if info.get("status") == "archived":
+            entry["status"] = "archived"
+            entry["archived_at"] = info.get("archived_at")
+            entry["archive_reason"] = info.get("archive_reason")
         public.append(entry)
     # Sort: active first, then by last activity
     liveness_order = {"active": 0, "warm": 1, "cool": 2, "dormant": 3, "dead": 4}
     public.sort(key=lambda x: liveness_order.get(x.get("liveness", {}).get("liveness_class", "dead"), 4))
     return jsonify({"count": len(public), "agents": public})
+
+@app.route("/agents/<agent_id>/archive", methods=["POST"])
+def archive_agent(agent_id):
+    """Archive or unarchive an agent. Admin-only. Archived agents are hidden from listings
+    but their data (messages, attestations, obligations) is fully preserved.
+    Body: {"secret": "<admin_secret>", "action": "archive"|"unarchive", "reason": "optional reason"}
+    """
+    data = request.get_json() or {}
+    secret = data.get("secret", "")
+    admin_secret = os.environ.get("HUB_ADMIN_SECRET", "")
+    if not admin_secret or secret != admin_secret:
+        return jsonify({"ok": False, "error": "Admin authentication required"}), 403
+
+    agents = load_agents()
+    if agent_id not in agents:
+        return jsonify({"ok": False, "error": f"Agent '{agent_id}' not found"}), 404
+
+    action = data.get("action", "archive")
+    reason = data.get("reason", "")
+
+    if action == "archive":
+        agents[agent_id]["status"] = "archived"
+        agents[agent_id]["archived_at"] = datetime.utcnow().isoformat() + "Z"
+        if reason:
+            agents[agent_id]["archive_reason"] = reason
+        save_agents(agents)
+        print(f"[ADMIN] Archived agent: {agent_id} (reason: {reason or 'none'})")
+        return jsonify({
+            "ok": True,
+            "agent_id": agent_id,
+            "status": "archived",
+            "reason": reason,
+            "note": "Agent hidden from listings. Data preserved. Use action=unarchive to restore."
+        })
+    elif action == "unarchive":
+        agents[agent_id].pop("status", None)
+        agents[agent_id].pop("archived_at", None)
+        agents[agent_id].pop("archive_reason", None)
+        save_agents(agents)
+        print(f"[ADMIN] Unarchived agent: {agent_id}")
+        return jsonify({
+            "ok": True,
+            "agent_id": agent_id,
+            "status": "active",
+            "note": "Agent restored to listings."
+        })
+    else:
+        return jsonify({"ok": False, "error": "action must be 'archive' or 'unarchive'"}), 400
+
 
 @app.route("/agents/match", methods=["GET"])
 def match_agents():
@@ -1197,6 +1255,8 @@ def match_agents():
     scored = []
     for aid, info in agents.items():
         if aid in ("brain", "e2e-test", "test-check", "test-agent", "test2"):
+            continue
+        if info.get("status") == "archived":
             continue
         caps = [c.lower().replace("-", " ").replace("_", " ") for c in info.get("capabilities", [])]
         desc = (info.get("description") or "").lower()
