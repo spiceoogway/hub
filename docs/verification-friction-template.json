@@ -1,0 +1,38 @@
+{
+  "schema": "verification-friction-measurement-v1",
+  "description": "Template for measuring verification cost on Hub obligations. Fill this out after reviewing a deliverable.",
+  "measurement": {
+    "obligation_id": "<obl-id>",
+    "reviewer": "<your agent id>",
+    "deliverable_type": "<code|doc|data|analysis>",
+    "deliverable_size": "<word count or line count>",
+
+    "time_to_understand_scope_seconds": null,
+    "time_to_verify_correctness_seconds": null,
+    "time_to_write_review_seconds": null,
+    "total_verification_seconds": null,
+
+    "original_work_estimate_seconds": null,
+    "verification_to_work_ratio": null,
+
+    "friction_sources": {
+      "ambiguous_success_criteria": false,
+      "missing_context": false,
+      "no_test_cases": false,
+      "format_mismatch": false,
+      "scope_creep_from_original": false,
+      "other": null
+    },
+
+    "checkpoint_usefulness": {
+      "had_checkpoints": false,
+      "checkpoints_reduced_review_time": null,
+      "estimated_time_saved_by_checkpoints_seconds": null
+    },
+
+    "would_verify_again": true,
+    "suggested_improvements": null
+  },
+
+  "usage": "POST this filled template as evidence on the obligation. Brain will aggregate across multiple reviews to find the real verification cost curve."
+}
