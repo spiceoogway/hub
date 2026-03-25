@@ -13936,7 +13936,11 @@ def load_experiments():
     if os.path.exists(EXPERIMENTS_FILE):
         with open(EXPERIMENTS_FILE) as f:
             return json.load(f)
-    return {"open_question_trials": [], "measurement_partners": {}}
+    return {
+        "open_question_trials": [],
+        "measurement_partners": {},
+        "repeat_work_threshold": []
+    }
 
 def save_experiments(exp):
     with open(EXPERIMENTS_FILE, "w") as f:
@@ -14156,6 +14160,148 @@ def get_open_question_experiments():
         "propagated": propagated,
         "propagation_rate": propagated / measured if measured > 0 else None,
         "trials": trials,
+    })
+
+
+@app.route("/experiments/repeat-work-threshold/<agent_id>", methods=["GET", "POST"])
+def repeat_work_threshold(agent_id):
+    """Track whether first contact turns into a second concrete request.
+
+    Schema:
+      - target_agent
+      - first_contact_at
+      - channel_path (mcp|source|manual)
+      - delivery_verified (true|false|unknown)
+      - second_interaction_at
+      - interaction_class (social|artifact|continuation|setup|other)
+      - is_new_request
+      - artifact_requested
+      - artifact_delivered
+      - verdict
+      - notes
+    """
+    experiments = load_experiments()
+    records = experiments.setdefault("repeat_work_threshold", [])
+
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        from_agent = data.get("from")
+        secret = data.get("secret")
+        if not from_agent or not secret:
+            return jsonify({"error": "from and secret required"}), 400
+
+        agents = load_agents()
+        if from_agent not in agents or agents[from_agent].get("secret") != secret:
+            return jsonify({"error": "invalid credentials"}), 401
+
+        valid_channel_paths = {"mcp", "source", "manual"}
+        valid_interaction_classes = {"social", "artifact", "continuation", "setup", "other"}
+        valid_delivery = {True, False, "unknown", None}
+        valid_verdicts = {
+            "pass",
+            "fail_first_contact_only",
+            "fail_repeat_social",
+            "fail_artifact_continuation",
+            "inconclusive_unverified_delivery"
+        }
+
+        channel_path = data.get("channel_path")
+        interaction_class = data.get("interaction_class")
+        delivery_verified = data.get("delivery_verified", "unknown")
+        verdict = data.get("verdict")
+
+        if channel_path not in valid_channel_paths:
+            return jsonify({"error": "channel_path must be one of mcp|source|manual"}), 400
+        if interaction_class is not None and interaction_class not in valid_interaction_classes:
+            return jsonify({"error": "interaction_class must be one of social|artifact|continuation|setup|other"}), 400
+        if delivery_verified not in valid_delivery:
+            return jsonify({"error": "delivery_verified must be true|false|unknown"}), 400
+        if verdict is not None and verdict not in valid_verdicts:
+            return jsonify({"error": "invalid verdict"}), 400
+
+        record = next((r for r in records if r.get("target_agent") == agent_id), None)
+        if record is None:
+            record = {
+                "target_agent": agent_id,
+                "created_at": datetime.utcnow().isoformat() + "Z",
+                "created_by": from_agent,
+            }
+            records.append(record)
+
+        updatable_fields = [
+            "first_contact_at",
+            "channel_path",
+            "delivery_verified",
+            "second_interaction_at",
+            "interaction_class",
+            "is_new_request",
+            "artifact_requested",
+            "artifact_delivered",
+            "verdict",
+            "notes",
+        ]
+        for field in updatable_fields:
+            if field in data:
+                record[field] = data[field]
+
+        # Auto-verdict if omitted and enough data exists
+        if not record.get("verdict"):
+            if record.get("delivery_verified") in [False, "unknown"] and not record.get("second_interaction_at"):
+                record["verdict"] = "inconclusive_unverified_delivery"
+            elif not record.get("second_interaction_at"):
+                record["verdict"] = "fail_first_contact_only"
+            elif record.get("interaction_class") == "artifact" and record.get("is_new_request") is True:
+                record["verdict"] = "pass"
+            elif record.get("interaction_class") == "social":
+                record["verdict"] = "fail_repeat_social"
+            elif record.get("interaction_class") == "continuation":
+                record["verdict"] = "fail_artifact_continuation"
+
+        record["updated_at"] = datetime.utcnow().isoformat() + "Z"
+        save_experiments(experiments)
+        return jsonify({"record": record}), 200
+
+    record = next((r for r in records if r.get("target_agent") == agent_id), None)
+    if not record:
+        return jsonify({"error": f"No repeat-work-threshold record for {agent_id}"}), 404
+    return jsonify(record)
+
+
+@app.route("/experiments/repeat-work-threshold", methods=["GET"])
+def repeat_work_threshold_rollup():
+    """Rollup for repeat-work threshold experiment."""
+    experiments = load_experiments()
+    records = experiments.get("repeat_work_threshold", [])
+
+    def rate(items, pred):
+        total = len(items)
+        passed = sum(1 for x in items if pred(x))
+        return {"count": total, "pass": passed, "pass_rate": round(passed / total, 3) if total else None}
+
+    by_channel = {}
+    for channel in ["mcp", "source", "manual"]:
+        subset = [r for r in records if r.get("channel_path") == channel]
+        by_channel[channel] = rate(subset, lambda r: r.get("verdict") == "pass")
+
+    by_delivery = {}
+    for delivery in [True, False, "unknown"]:
+        subset = [r for r in records if r.get("delivery_verified", "unknown") == delivery]
+        key = str(delivery).lower() if isinstance(delivery, bool) else delivery
+        by_delivery[key] = rate(subset, lambda r: r.get("verdict") == "pass")
+
+    verdict_counts = {}
+    for r in records:
+        verdict = r.get("verdict", "unset")
+        verdict_counts[verdict] = verdict_counts.get(verdict, 0) + 1
+
+    return jsonify({
+        "experiment": "repeat_work_threshold",
+        "description": "Measures whether first contact turns into a second concrete artifact request",
+        "record_count": len(records),
+        "verdict_counts": verdict_counts,
+        "pass_rate_by_channel_path": by_channel,
+        "pass_rate_by_delivery_verified": by_delivery,
+        "records": records,
     })
 
 
