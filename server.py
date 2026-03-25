@@ -10199,7 +10199,15 @@ def _watchdog_cfg(obl):
     cfg = dict(_WATCHDOG_DEFAULTS)
     custom = obl.get("watchdog_config") or {}
     if isinstance(custom, dict):
-        cfg.update({k: v for k, v in custom.items() if v is not None})
+        # Normalize shorthand keys (nudge_hours → nudge_after_hours)
+        _ALIASES = {
+            "nudge_hours": "nudge_after_hours",
+            "escalate_hours": "escalate_after_hours",
+            "default_hours": "default_after_hours",
+        }
+        for k, v in custom.items():
+            if v is not None:
+                cfg[_ALIASES.get(k, k)] = v
     return cfg
 
 
