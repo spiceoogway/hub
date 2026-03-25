@@ -144,10 +144,12 @@ MESSAGES_DIR = DATA_DIR / "messages"
 EMAIL_DIR = DATA_DIR / "emails"
 
 ANALYTICS_DIR = DATA_DIR / "analytics"
+SENT_DIR = DATA_DIR / "sent"  # Sender-side delivery records
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
 EMAIL_DIR.mkdir(parents=True, exist_ok=True)
 ANALYTICS_DIR.mkdir(parents=True, exist_ok=True)
+SENT_DIR.mkdir(parents=True, exist_ok=True)
 
 def _log_agent_event(agent_id, event_type, metadata=None):
     """Append timestamped event to analytics log."""
@@ -566,6 +568,42 @@ def append_message_to_conversation(agent_id, peer_id, message):
     with open(path, "w") as f:
         json.dump(msgs, f, indent=2)
     return message
+
+
+def _get_sent_dir(sender_id):
+    """Return the sender-side delivery records directory for an agent."""
+    d = SENT_DIR / sender_id
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _get_sent_path(sender_id, recipient_id):
+    """Return path to sender-side delivery records for a specific recipient."""
+    return _get_sent_dir(sender_id) / f"{recipient_id}.json"
+
+
+def _append_sent_record(sender_id, recipient_id, record):
+    """Append a delivery record to the sender's sent log for a recipient."""
+    path = _get_sent_path(sender_id, recipient_id)
+    records = _safe_load_json_list(path)
+    records.append(record)
+    with open(path, "w") as f:
+        json.dump(records, f, indent=2)
+
+
+def _load_sent_records(sender_id, recipient_id=None):
+    """Load sent delivery records. If recipient_id given, load just that conversation.
+    Otherwise load all sent records across all recipients."""
+    if recipient_id:
+        return _safe_load_json_list(_get_sent_path(sender_id, recipient_id))
+    sent_dir = SENT_DIR / sender_id
+    if not sent_dir.exists():
+        return []
+    records = []
+    for path in sorted(sent_dir.glob("*.json")):
+        records.extend(_safe_load_json_list(path))
+    records.sort(key=lambda r: r.get("timestamp", ""))
+    return records
 
 
 def _compute_agent_liveness(agent_id, agents=None):
@@ -2056,6 +2094,22 @@ def send_message(agent_id):
     else:
         delivery_state = "callback_failed_inbox_delivered"
 
+    # Persist sender-side delivery record
+    sent_record = {
+        "message_id": msg["id"],
+        "to": agent_id,
+        "message_preview": message[:100] + ("..." if len(message) > 100 else ""),
+        "timestamp": msg["timestamp"],
+        "delivery_state": delivery_state,
+        "callback_status": callback_status,
+        "callback_url_configured": bool(callback_url),
+        "read": False,  # Updated when recipient marks as read
+    }
+    try:
+        _append_sent_record(from_agent, agent_id, sent_record)
+    except Exception as e:
+        print(f"[SENT] Failed to persist sent record for {from_agent}->{agent_id}: {e}")
+
     return jsonify({
         "ok": True,
         "message_id": msg["id"],
@@ -2284,13 +2338,34 @@ def get_messages(agent_id):
 
     if should_mark_read and messages:
         message_ids = {m.get("id") for m in messages}
+        read_at = datetime.utcnow().isoformat() + "Z"
         changed = False
+        # Collect sender->message_ids for read receipt propagation
+        read_receipts = {}  # sender_id -> [message_id, ...]
         for m in full_inbox:
             if m.get("id") in message_ids and not m.get("read"):
                 m["read"] = True
+                m["read_at"] = read_at
+                sender = m.get("from")
+                if sender:
+                    read_receipts.setdefault(sender, []).append(m["id"])
                 changed = True
         if changed:
             save_inbox(agent_id, full_inbox)
+            # Propagate read receipts to senders' sent logs
+            for sender_id, msg_ids in read_receipts.items():
+                try:
+                    sent_path = _get_sent_path(sender_id, agent_id)
+                    sent_records = _safe_load_json_list(sent_path)
+                    msg_id_set = set(msg_ids)
+                    for sr in sent_records:
+                        if sr.get("message_id") in msg_id_set:
+                            sr["read"] = True
+                            sr["read_at"] = read_at
+                    with open(sent_path, "w") as f:
+                        json.dump(sent_records, f, indent=2)
+                except Exception as e:
+                    print(f"[SENT] Failed to propagate bulk read receipts to {sender_id}: {e}")
 
         # Reflect read status in response payload as well
         for m in messages:
@@ -2317,16 +2392,86 @@ def mark_message_read(agent_id, message_id):
 
     inbox = load_inbox(agent_id)
     found = False
+    sender_id = None
     for m in inbox:
         if m.get("id") == message_id:
             m["read"] = True
+            m["read_at"] = datetime.utcnow().isoformat() + "Z"
+            sender_id = m.get("from")
             found = True
             break
     if not found:
         return jsonify({"ok": False, "error": "Message not found"}), 404
 
     save_inbox(agent_id, inbox)
+
+    # Propagate read receipt to sender's sent log
+    if sender_id:
+        try:
+            sent_path = _get_sent_path(sender_id, agent_id)
+            sent_records = _safe_load_json_list(sent_path)
+            for sr in sent_records:
+                if sr.get("message_id") == message_id:
+                    sr["read"] = True
+                    sr["read_at"] = datetime.utcnow().isoformat() + "Z"
+                    break
+            with open(sent_path, "w") as f:
+                json.dump(sent_records, f, indent=2)
+        except Exception as e:
+            print(f"[SENT] Failed to propagate read receipt for {message_id}: {e}")
+
     return jsonify({"ok": True, "message_id": message_id, "read": True})
+
+@app.route("/agents/<agent_id>/messages/sent", methods=["GET"])
+def get_sent_messages(agent_id):
+    """View delivery status of messages sent by this agent.
+    Auth: agent's secret (query param or X-Agent-Secret header).
+    Query params:
+        to: filter by recipient agent_id
+        delivery_status: filter by delivery_state (inbox_delivered_no_callback,
+                         callback_ok_inbox_delivered, callback_failed_inbox_delivered)
+        since: ISO timestamp — only messages after this time
+        limit: max results (default 50, max 200)
+    Returns: list of sent message records with delivery metadata.
+    """
+    secret = request.args.get("secret") or request.headers.get("X-Agent-Secret")
+    agents = load_agents()
+    if agent_id not in agents:
+        return jsonify({"ok": False, "error": "Agent not found"}), 404
+    if agents[agent_id].get("secret") != secret:
+        return jsonify({"ok": False, "error": "Invalid secret"}), 403
+
+    to_filter = request.args.get("to")
+    delivery_filter = request.args.get("delivery_status")
+    since_filter = request.args.get("since")
+    limit = min(int(request.args.get("limit", 50)), 200)
+
+    records = _load_sent_records(agent_id, recipient_id=to_filter)
+
+    # Apply filters
+    if delivery_filter:
+        records = [r for r in records if r.get("delivery_state") == delivery_filter]
+    if since_filter:
+        records = [r for r in records if r.get("timestamp", "") >= since_filter]
+
+    # Sort newest first, apply limit
+    records.sort(key=lambda r: r.get("timestamp", ""), reverse=True)
+    records = records[:limit]
+
+    # Enrich with recipient liveness and delivery capability
+    for r in records:
+        to_agent = r.get("to", "")
+        if to_agent in agents:
+            liveness = _compute_agent_liveness(to_agent, agents)
+            r["recipient_liveness"] = liveness.get("liveness_class", "unknown")
+            r["recipient_delivery_capability"] = _agent_delivery_capability(agents[to_agent])
+
+    return jsonify({
+        "ok": True,
+        "agent_id": agent_id,
+        "count": len(records),
+        "messages": records
+    })
 
 @app.route("/agents/<agent_id>/messages", methods=["DELETE"])
 def clear_messages(agent_id):
