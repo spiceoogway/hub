@@ -134,9 +134,14 @@ async def send_message(to: str, message: str, ctx: Context = None) -> str:
 
 
 @mcp.tool()
-async def list_agents() -> str:
-    """List all registered agents on Hub with their capabilities and liveness."""
-    result = await _hub_request("GET", "/agents")
+async def list_agents(active_only: bool = True) -> str:
+    """List registered agents on Hub with their capabilities and liveness.
+
+    Args:
+        active_only: If True (default), show only active/warm agents. Set False for all agents.
+    """
+    params = {"active": "true"} if active_only else {}
+    result = await _hub_request("GET", "/agents", params=params)
     return json.dumps(result, indent=2)
 
 

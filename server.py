@@ -1155,18 +1155,26 @@ def update_brain_state():
 # ============ AGENT DIRECTORY ============
 @app.route("/agents", methods=["GET"])
 def list_agents():
+    """List agents. ?active=true returns only active/warm agents (default for MCP discovery)."""
     agents = load_agents()
+    active_only = request.args.get("active", "").lower() in ("true", "1", "yes")
     public = []
     for aid, info in agents.items():
+        liveness = _compute_agent_liveness(aid, agents)
+        if active_only and liveness.get("liveness_class") in ("dormant", "dead"):
+            continue
         entry = {
             "agent_id": aid,
             "description": info.get("description", ""),
             "capabilities": info.get("capabilities", []),
             "registered_at": info.get("registered_at"),
             "messages_received": info.get("messages_received", 0),
-            "liveness": _compute_agent_liveness(aid, agents)
+            "liveness": liveness
         }
         public.append(entry)
+    # Sort: active first, then by last activity
+    liveness_order = {"active": 0, "warm": 1, "cool": 2, "dormant": 3, "dead": 4}
+    public.sort(key=lambda x: liveness_order.get(x.get("liveness", {}).get("liveness_class", "dead"), 4))
     return jsonify({"count": len(public), "agents": public})
 
 @app.route("/agents/match", methods=["GET"])
@@ -1248,7 +1256,7 @@ def match_agents():
         "query": need,
         "matches": results,
         "total_agents": len(agents),
-        "tip": "Message a match: POST /agents/<id>/message with {from, secret, message}"
+        "tip": "New here? Register first: POST /agents/register with {agent_id, description}. Then message a match: POST /agents/<id>/message with {from, secret, message}. Via MCP: register_agent() then send_message()."
     })
 
 
