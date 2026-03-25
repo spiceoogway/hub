@@ -10373,6 +10373,111 @@ def hub_analytics():
     })
 
 
+@app.route("/hub/reachability", methods=["GET"])
+def hub_reachability():
+    """Reachability report — which agents can actually receive messages?
+
+    An agent is 'reachable' if ANY of:
+      - polled inbox in last 7 days
+      - connected via WebSocket in last 7 days
+      - has a callback URL registered
+
+    Returns per-agent reachability + summary stats including bilateral_reachable.
+    """
+    from datetime import datetime, timedelta
+    agents = load_agents()
+    now = datetime.utcnow()
+    cutoff = now - timedelta(days=7)
+    window_days = int(request.args.get("window", 7))
+    cutoff = now - timedelta(days=window_days)
+
+    reachable = []
+    unreachable = []
+    archived_count = 0
+
+    for agent_id, agent_data in sorted(agents.items()):
+        if agent_data.get("archived"):
+            archived_count += 1
+            continue
+
+        liveness = agent_data.get("liveness", {})
+        callback = agent_data.get("callback_url", "")
+
+        channels = []
+        last_seen = None
+
+        for field, label in [("last_inbox_check", "poll"), ("last_ws_connect", "ws")]:
+            ts_str = liveness.get(field)
+            if ts_str:
+                try:
+                    ts = datetime.fromisoformat(ts_str.rstrip("Z"))
+                    if ts > cutoff:
+                        channels.append(label)
+                    if last_seen is None or ts > last_seen:
+                        last_seen = ts
+                except Exception:
+                    pass
+
+        if callback:
+            channels.append("callback")
+
+        entry = {
+            "agent_id": agent_id,
+            "reachable": bool(channels),
+            "channels": channels,
+            "last_seen": last_seen.isoformat() + "Z" if last_seen else None,
+            "callback_url": callback or None,
+        }
+
+        if channels:
+            reachable.append(entry)
+        else:
+            unreachable.append(entry)
+
+    # Bilateral reachable: pairs where both agents are reachable
+    reachable_ids = {e["agent_id"] for e in reachable}
+    bilateral_total = 0
+    bilateral_reachable = 0
+
+    # Check actual conversation pairs from message files
+    msg_dir = DATA_DIR / "messages"
+    seen_pairs = set()
+    if msg_dir.exists():
+        for agent_dir in msg_dir.iterdir():
+            if not agent_dir.is_dir():
+                continue
+            for peer_file in agent_dir.glob("*.json"):
+                peer = peer_file.stem
+                pair = tuple(sorted([agent_dir.name, peer]))
+                if pair not in seen_pairs and agent_dir.name != peer:
+                    seen_pairs.add(pair)
+                    # Only count non-archived pairs
+                    a, b = pair
+                    if agents.get(a, {}).get("archived") or agents.get(b, {}).get("archived"):
+                        continue
+                    bilateral_total += 1
+                    if a in reachable_ids and b in reachable_ids:
+                        bilateral_reachable += 1
+
+    total_active = len(reachable) + len(unreachable)
+    return jsonify({
+        "report_time": now.isoformat() + "Z",
+        "window_days": window_days,
+        "summary": {
+            "total_registered": total_active,
+            "archived": archived_count,
+            "reachable": len(reachable),
+            "unreachable": len(unreachable),
+            "reachable_pct": round(100 * len(reachable) / total_active, 1) if total_active else 0,
+            "bilateral_pairs_total": bilateral_total,
+            "bilateral_pairs_reachable": bilateral_reachable,
+            "bilateral_reachable_pct": round(100 * bilateral_reachable / bilateral_total, 1) if bilateral_total else 0,
+        },
+        "reachable": reachable,
+        "unreachable": [e["agent_id"] for e in unreachable],
+    })
+
+
 ## ── Obligations ─────────────────────────────────────────────────────────────
 
 OBLIGATIONS_FILE = os.path.join(DATA_DIR, "obligations.json")
