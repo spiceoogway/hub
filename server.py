@@ -10658,11 +10658,23 @@ def _can_resolve(obl, agent_id):
         if _match("reviewer"):
             return True
 
-    # After ghost default, counterparty gets unilateral resolution authority
-    # (the non-silent party — typically the proposer who's been waiting)
+    # After ghost default, the NON-SILENT party gets unilateral resolution authority.
+    # Identify who was silent from the watchdog history, grant authority to the other.
     if obl.get("status") == "ghost_defaulted":
-        if _match("counterparty", "counterparty"):
-            return True
+        silent_party = None
+        for h in reversed(obl.get("history", [])):
+            if h.get("event") == "watchdog_default" or h.get("status") == "ghost_defaulted":
+                silent_party = h.get("silent_party")
+                break
+        if silent_party:
+            # Grant authority to whichever party is NOT the silent one
+            if agent_id.lower() != silent_party.lower():
+                if _match("claimant", "created_by") or _match("counterparty", "counterparty"):
+                    return True
+        else:
+            # Fallback: both claimant and counterparty can resolve
+            if _match("claimant", "created_by") or _match("counterparty", "counterparty"):
+                return True
 
     policy = obl.get("closure_policy", "counterparty_accepts")
     if policy == "claimant_self_attests":
@@ -13816,14 +13828,17 @@ def identity_divergence_data_package():
 
 
 def _watchdog_background_loop(interval_seconds=300):
-    """Background thread that runs _expire_obligations every `interval_seconds`.
+    """Background loop that runs _expire_obligations periodically.
     
     Ensures watchdog tiers fire on schedule regardless of API traffic.
-    Without this, watchdog only fires on request-driven calls to _expire_obligations.
+    Uses gevent.sleep when available (gunicorn+gevent), falls back to time.sleep.
     """
-    import time
+    try:
+        from gevent import sleep as _sleep
+    except ImportError:
+        from time import sleep as _sleep
     while True:
-        time.sleep(interval_seconds)
+        _sleep(interval_seconds)
         try:
             obls = load_obligations()
             if _expire_obligations(obls):
@@ -13834,13 +13849,18 @@ def _watchdog_background_loop(interval_seconds=300):
 
 
 def _start_watchdog_timer():
-    """Start the background watchdog timer in a daemon thread."""
-    t = threading.Thread(target=_watchdog_background_loop, args=(300,), daemon=True)
-    t.start()
-    print("[WATCHDOG] Background timer started (5-min interval)")
+    """Start the background watchdog timer. Uses gevent.spawn if available, else threading."""
+    try:
+        import gevent
+        gevent.spawn(_watchdog_background_loop, 300)
+        print("[WATCHDOG] Background timer started (gevent, 5-min interval)")
+    except ImportError:
+        t = threading.Thread(target=_watchdog_background_loop, args=(300,), daemon=True)
+        t.start()
+        print("[WATCHDOG] Background timer started (thread, 5-min interval)")
 
 
-# Start watchdog timer when module loads (works under gunicorn)
+# Start watchdog timer when module loads (works under gunicorn+gevent)
 _start_watchdog_timer()
 
 
