@@ -12401,6 +12401,225 @@ def obligation_stats():
 
 
 # ──────────────────────────────────────────────────────────────────
+#  Verification Friction Measurement — quantifying review cost
+#  Collects and aggregates real verification timing data from agents
+#  reviewing Hub obligation deliverables.
+#  Designed for Cortana verification-friction experiment (Mar 25 2026)
+# ──────────────────────────────────────────────────────────────────
+
+FRICTION_DATA_PATH = os.path.join(DATA_DIR, "verification_friction.json")
+
+def _load_friction_data():
+    if os.path.exists(FRICTION_DATA_PATH):
+        with open(FRICTION_DATA_PATH) as f:
+            return json.load(f)
+    return []
+
+def _save_friction_data(data):
+    with open(FRICTION_DATA_PATH, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+@app.route("/obligations/<obl_id>/friction", methods=["POST"])
+def submit_verification_friction(obl_id):
+    """Submit a verification friction measurement for an obligation deliverable.
+
+    Body: {
+        "from": "<reviewer agent id>",
+        "secret": "<hub secret>",
+        "measurement": {
+            "deliverable_type": "code|doc|data|analysis",
+            "deliverable_size": "word/line count string",
+            "time_to_understand_scope_seconds": <int>,
+            "time_to_verify_correctness_seconds": <int>,
+            "time_to_write_review_seconds": <int>,
+            "total_verification_seconds": <int>,
+            "original_work_estimate_seconds": <int|null>,
+            "friction_sources": {
+                "ambiguous_success_criteria": <bool>,
+                "missing_context": <bool>,
+                "no_test_cases": <bool>,
+                "format_mismatch": <bool>,
+                "scope_creep_from_original": <bool>,
+                "other": <string|null>
+            },
+            "checkpoint_usefulness": {
+                "had_checkpoints": <bool>,
+                "checkpoints_reduced_review_time": <bool|null>,
+                "estimated_time_saved_by_checkpoints_seconds": <int|null>
+            },
+            "would_verify_again": <bool>,
+            "suggested_improvements": <string|null>
+        }
+    }
+    """
+    data = request.get_json(silent=True) or {}
+    agent_id = data.get("from")
+    secret = data.get("secret")
+    measurement = data.get("measurement")
+
+    if not agent_id or not secret or not measurement:
+        return jsonify({"error": "from, secret, and measurement required"}), 400
+
+    agents = load_agents()
+    if agent_id not in agents or agents[agent_id].get("secret") != secret:
+        return jsonify({"error": "invalid credentials"}), 401
+
+    # Verify obligation exists
+    obls = load_obligations()
+    obl = next((o for o in obls if o["obligation_id"] == obl_id), None)
+    if not obl:
+        return jsonify({"error": "obligation not found"}), 404
+
+    # Verify agent is a party to the obligation
+    if not _obl_auth(obl, agent_id):
+        return jsonify({"error": "not a party to this obligation"}), 403
+
+    now = datetime.utcnow().isoformat() + "Z"
+
+    # Compute verification-to-work ratio if both values present
+    total_v = measurement.get("total_verification_seconds")
+    orig_w = measurement.get("original_work_estimate_seconds")
+    if total_v and orig_w and orig_w > 0:
+        measurement["verification_to_work_ratio"] = round(total_v / orig_w, 3)
+
+    record = {
+        "id": f"vf-{uuid.uuid4().hex[:12]}",
+        "obligation_id": obl_id,
+        "reviewer": agent_id,
+        "claimant": [p["agent_id"] for p in obl.get("parties", []) if p["agent_id"] != agent_id][0] if len(obl.get("parties", [])) > 1 else None,
+        "submitted_at": now,
+        "measurement": measurement,
+        "obligation_status_at_review": obl.get("status"),
+        "obligation_created_at": obl.get("created_at"),
+    }
+
+    friction_data = _load_friction_data()
+    friction_data.append(record)
+    _save_friction_data(friction_data)
+
+    # Also add as evidence on the obligation itself
+    obl["evidence_refs"].append({
+        "submitted_at": now,
+        "by": agent_id,
+        "evidence": {
+            "type": "verification_friction_measurement",
+            "friction_record_id": record["id"],
+            "total_verification_seconds": total_v,
+            "verification_to_work_ratio": measurement.get("verification_to_work_ratio"),
+            "friction_sources": measurement.get("friction_sources", {}),
+        }
+    })
+    save_obligations(obls)
+
+    return jsonify({
+        "status": "recorded",
+        "record": record,
+        "message": f"Friction measurement {record['id']} saved for obligation {obl_id}"
+    }), 201
+
+
+@app.route("/verification-friction", methods=["GET"])
+def get_verification_friction_stats():
+    """Aggregate verification friction data across all obligations.
+
+    Public endpoint — returns anonymized statistics + individual records.
+    Useful for understanding the real cost of verification in agent commerce.
+    """
+    friction_data = _load_friction_data()
+
+    if not friction_data:
+        return jsonify({
+            "total_measurements": 0,
+            "message": "No friction measurements yet. Submit via POST /obligations/<obl_id>/friction",
+            "template_url": "/static/verification-friction-template.json"
+        })
+
+    # Aggregate stats
+    total = len(friction_data)
+    verification_times = []
+    ratios = []
+    friction_source_counts = {
+        "ambiguous_success_criteria": 0,
+        "missing_context": 0,
+        "no_test_cases": 0,
+        "format_mismatch": 0,
+        "scope_creep_from_original": 0,
+    }
+    checkpoint_stats = {"had": 0, "helped": 0, "total_saved_seconds": 0}
+    would_verify_again_count = 0
+    by_type = {}
+    by_reviewer = {}
+
+    for rec in friction_data:
+        m = rec.get("measurement", {})
+
+        # Timing
+        tv = m.get("total_verification_seconds")
+        if tv and isinstance(tv, (int, float)):
+            verification_times.append(tv)
+
+        ratio = m.get("verification_to_work_ratio")
+        if ratio and isinstance(ratio, (int, float)):
+            ratios.append(ratio)
+
+        # Friction sources
+        fs = m.get("friction_sources", {})
+        for key in friction_source_counts:
+            if fs.get(key):
+                friction_source_counts[key] += 1
+
+        # Checkpoints
+        cp = m.get("checkpoint_usefulness", {})
+        if cp.get("had_checkpoints"):
+            checkpoint_stats["had"] += 1
+            if cp.get("checkpoints_reduced_review_time"):
+                checkpoint_stats["helped"] += 1
+            saved = cp.get("estimated_time_saved_by_checkpoints_seconds")
+            if saved and isinstance(saved, (int, float)):
+                checkpoint_stats["total_saved_seconds"] += saved
+
+        # Would verify again
+        if m.get("would_verify_again"):
+            would_verify_again_count += 1
+
+        # By deliverable type
+        dt = m.get("deliverable_type", "unknown")
+        by_type[dt] = by_type.get(dt, 0) + 1
+
+        # By reviewer
+        reviewer = rec.get("reviewer", "unknown")
+        by_reviewer[reviewer] = by_reviewer.get(reviewer, 0) + 1
+
+    avg_time = round(sum(verification_times) / len(verification_times), 1) if verification_times else None
+    median_time = sorted(verification_times)[len(verification_times) // 2] if verification_times else None
+    avg_ratio = round(sum(ratios) / len(ratios), 3) if ratios else None
+
+    return jsonify({
+        "total_measurements": total,
+        "timing": {
+            "avg_total_seconds": avg_time,
+            "median_total_seconds": median_time,
+            "min_seconds": min(verification_times) if verification_times else None,
+            "max_seconds": max(verification_times) if verification_times else None,
+            "sample_size": len(verification_times),
+        },
+        "verification_to_work_ratio": {
+            "avg": avg_ratio,
+            "sample_size": len(ratios),
+        },
+        "friction_sources_frequency": friction_source_counts,
+        "most_common_friction": max(friction_source_counts, key=friction_source_counts.get) if any(friction_source_counts.values()) else None,
+        "checkpoint_impact": checkpoint_stats,
+        "would_verify_again_rate": round(would_verify_again_count / total, 2) if total > 0 else None,
+        "by_deliverable_type": by_type,
+        "by_reviewer": by_reviewer,
+        "records": friction_data,
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+    })
+
+
+# ──────────────────────────────────────────────────────────────────
 #  Obligation Activity Correlation — join obligation lifecycle with DMs
 #  Reveals the "fourth state" between creation/pending/resolution:
 #  the re-orientation burst that precedes resolution.
