@@ -10154,7 +10154,10 @@ def save_obligations(obls):
 # Valid status transitions (reducer rules from the spec)
 _OBL_TRANSITIONS = {
     "proposed":           ["accepted", "rejected", "withdrawn", "failed"],
-    "accepted":           ["evidence_submitted", "failed"],
+    "accepted":           ["evidence_submitted", "failed", "ghost_nudged"],
+    "ghost_nudged":       ["accepted", "evidence_submitted", "failed", "ghost_escalated"],
+    "ghost_escalated":    ["accepted", "evidence_submitted", "failed", "ghost_defaulted"],
+    "ghost_defaulted":    ["resolved", "failed"],
     "evidence_submitted": ["resolved", "disputed", "failed"],
     "disputed":           ["evidence_submitted", "resolved", "failed"],
     # deadline_elapsed: claimant_self_resolve policy allows resolution from here
@@ -10168,6 +10171,207 @@ _OBL_TRANSITIONS = {
 }
 
 _TIMEOUT_POLICIES = ["claimant_self_resolve", "auto_expire", "escalate"]
+
+_WATCHDOG_DEFAULTS = {
+    "enabled": True,
+    "nudge_after_hours": 24,
+    "escalate_after_hours": 48,
+    "default_after_hours": 72,
+    "notify_parties": True,
+}
+
+
+def _watchdog_cfg(obl):
+    cfg = dict(_WATCHDOG_DEFAULTS)
+    custom = obl.get("watchdog_config") or {}
+    if isinstance(custom, dict):
+        cfg.update({k: v for k, v in custom.items() if v is not None})
+    return cfg
+
+
+def _obl_roles(obl):
+    bindings = {b.get("role"): b.get("agent_id") for b in obl.get("role_bindings", [])}
+    claimant = bindings.get("claimant") or obl.get("created_by")
+    counterparty = bindings.get("counterparty") or obl.get("counterparty")
+    reviewer = bindings.get("reviewer")
+    return claimant, counterparty, reviewer
+
+
+def _obl_last_activity_iso(obl):
+    latest = None
+    for h in obl.get("history", []):
+        at = h.get("at")
+        if at and (latest is None or at > latest):
+            latest = at
+    for c in obl.get("checkpoints", []):
+        for field in ("responded_at", "proposed_at"):
+            at = c.get(field)
+            if at and (latest is None or at > latest):
+                latest = at
+    for e in obl.get("evidence_refs", []):
+        at = e.get("submitted_at")
+        if at and (latest is None or at > latest):
+            latest = at
+    return latest
+
+
+def _hours_since_iso(iso_ts):
+    if not iso_ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(iso_ts.replace("Z", ""))
+        return round((datetime.utcnow() - dt).total_seconds() / 3600, 1)
+    except (ValueError, TypeError):
+        return None
+
+
+def _check_ghost_watchdog(obl):
+    cfg = _watchdog_cfg(obl)
+    if not cfg.get("enabled", True):
+        return False
+
+    status = obl.get("status", "")
+    if status in ("resolved", "rejected", "withdrawn", "failed", "timed_out", "deadline_elapsed", "ghost_defaulted"):
+        return False
+
+    claimant, counterparty, reviewer = _obl_roles(obl)
+    silent_party = counterparty if status in ("accepted", "ghost_nudged", "ghost_escalated") else None
+    if not silent_party:
+        return False
+
+    hours_silent = _hours_since_iso(_obl_last_activity_iso(obl))
+    if hours_silent is None:
+        return False
+
+    now_iso = datetime.utcnow().isoformat() + "Z"
+    changed = False
+
+    if status == "accepted" and hours_silent >= cfg["nudge_after_hours"]:
+        obl["status"] = "ghost_nudged"
+        obl.setdefault("history", []).append({
+            "status": "ghost_nudged",
+            "event": "watchdog_nudge",
+            "tier": 1,
+            "at": now_iso,
+            "by": "system",
+            "silent_party": silent_party,
+            "hours_silent": hours_silent,
+        })
+        if cfg.get("notify_parties", True):
+            try:
+                _send_system_dm(silent_party,
+                    f"⏰ Obligation {obl.get('obligation_id')} has been inactive for {hours_silent}h. Post a checkpoint or status update to continue.",
+                    msg_type="watchdog_nudge",
+                    extra={"obligation_id": obl.get("obligation_id")})
+            except Exception:
+                pass
+        changed = True
+    elif status == "ghost_nudged" and hours_silent >= cfg["escalate_after_hours"]:
+        obl["status"] = "ghost_escalated"
+        notified = [p for p in (claimant, reviewer) if p]
+        obl.setdefault("history", []).append({
+            "status": "ghost_escalated",
+            "event": "watchdog_escalate",
+            "tier": 2,
+            "at": now_iso,
+            "by": "system",
+            "silent_party": silent_party,
+            "hours_silent": hours_silent,
+            "notified_parties": notified,
+        })
+        if cfg.get("notify_parties", True):
+            for party in notified:
+                try:
+                    _send_system_dm(party,
+                        f"⚠️ Obligation {obl.get('obligation_id')} partner {silent_party} has been silent for {hours_silent}h.",
+                        msg_type="watchdog_escalate",
+                        extra={"obligation_id": obl.get("obligation_id")})
+                except Exception:
+                    pass
+        changed = True
+    elif status == "ghost_escalated" and hours_silent >= cfg["default_after_hours"]:
+        checkpoints = obl.get("checkpoints", [])
+        confirmed_ids = [c.get("checkpoint_id") for c in checkpoints if c.get("status") == "confirmed"]
+        total_cps = len(checkpoints)
+        partial_fraction = round(len(confirmed_ids) / total_cps, 3) if total_cps else 0.0
+        obl["status"] = "ghost_defaulted"
+        obl.setdefault("history", []).append({
+            "status": "ghost_defaulted",
+            "event": "watchdog_default",
+            "tier": 3,
+            "at": now_iso,
+            "by": "system",
+            "silent_party": silent_party,
+            "hours_silent": hours_silent,
+            "partial_delivery_fraction": partial_fraction,
+            "confirmed_checkpoints": confirmed_ids,
+            "authority_granted_to": counterparty,
+        })
+        if cfg.get("notify_parties", True):
+            obl_id = obl.get("obligation_id")
+            if counterparty:
+                try:
+                    _send_system_dm(counterparty,
+                        f"🧭 Obligation {obl_id} entered ghost_defaulted after {hours_silent}h of silence. "
+                        f"You have counterparty-only resolve authority. Confirmed checkpoints: {len(confirmed_ids)}. "
+                        f"POST /obligations/{obl_id}/advance with status=resolved (or failed). "
+                        f"If no action in 48h, obligation auto-fails.",
+                        msg_type="watchdog_default",
+                        extra={"obligation_id": obl_id})
+                except Exception:
+                    pass
+            if silent_party:
+                try:
+                    _send_system_dm(silent_party,
+                        f"🧭 Obligation {obl_id} entered ghost_defaulted after {hours_silent}h of silence. "
+                        f"Your counterparty now has resolve authority. You may still submit late evidence.",
+                        msg_type="watchdog_default",
+                        extra={"obligation_id": obl_id})
+                except Exception:
+                    pass
+        changed = True
+    return changed
+
+
+def _check_ghost_timeout(obl):
+    """Auto-fail obligations stuck in ghost_defaulted for >48h with no counterparty action."""
+    if obl.get("status") != "ghost_defaulted":
+        return False
+    defaulted_at = None
+    for h in reversed(obl.get("history", [])):
+        if h.get("status") == "ghost_defaulted" or h.get("event") == "watchdog_default":
+            defaulted_at = h.get("at")
+            break
+    if not defaulted_at:
+        return False
+    hours_in_default = _hours_since_iso(defaulted_at)
+    if hours_in_default is None or hours_in_default < 48:
+        return False
+    now_iso = datetime.utcnow().isoformat() + "Z"
+    obl["status"] = "failed"
+    obl.setdefault("history", []).append({
+        "status": "failed",
+        "event": "ghost_timeout_auto_fail",
+        "at": now_iso,
+        "by": "system",
+        "reason": f"ghost_defaulted for {hours_in_default}h with no counterparty resolution. Auto-failed.",
+        "hours_in_default": hours_in_default,
+    })
+    return True
+
+
+def _maybe_watchdog_reentry(obl, agent_id):
+    if obl.get("status") not in ("ghost_nudged", "ghost_escalated"):
+        return False
+    now_iso = datetime.utcnow().isoformat() + "Z"
+    obl["status"] = "accepted"
+    obl.setdefault("history", []).append({
+        "status": "accepted",
+        "event": "watchdog_reentry",
+        "at": now_iso,
+        "by": agent_id,
+    })
+    return True
 
 def _check_deadline_expiry(obl):
     """Check if an obligation has passed its deadline_utc.
@@ -10225,10 +10429,14 @@ def _check_deadline_expiry(obl):
     return False
 
 def _expire_obligations(obls):
-    """Check all obligations for deadline expiry. Returns True if any were expired."""
+    """Check all obligations for deadline expiry, watchdog state changes, and ghost timeouts."""
     changed = False
     for obl in obls:
         if _check_deadline_expiry(obl):
+            changed = True
+        if _check_ghost_watchdog(obl):
+            changed = True
+        if _check_ghost_timeout(obl):
             changed = True
     return changed
 
@@ -10274,6 +10482,12 @@ def _can_resolve(obl, agent_id):
             return True
         # Reviewer can still resolve too (advisory becomes authoritative if they show up)
         if _match("reviewer"):
+            return True
+
+    # After ghost default, counterparty gets unilateral resolution authority
+    # (the non-silent party — typically the proposer who's been waiting)
+    if obl.get("status") == "ghost_defaulted":
+        if _match("counterparty", "counterparty"):
             return True
 
     policy = obl.get("closure_policy", "counterparty_accepts")
@@ -10374,6 +10588,7 @@ def create_obligation():
         "timeout_policy": timeout_policy,
         "binding_scope_text": data.get("binding_scope_text"),
         "vi_credential_ref": data.get("vi_credential_ref"),
+        "watchdog_config": data.get("watchdog_config"),
         "evidence_refs": [],
         "artifact_refs": [],
         "history": [
