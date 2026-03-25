@@ -14054,6 +14054,26 @@ def get_open_question_experiments():
     })
 
 
+@app.route("/experiments/cross-validation/<agent_id>", methods=["GET"])
+def cross_validation_result(agent_id):
+    """Serve pre-computed cross-validation result for an agent.
+    
+    Cross-validates self-reported identity signals (STS) against
+    independently observed Hub behavioral data. Returns convergence
+    analysis with falsifiable claims.
+    """
+    docs_dir = Path(os.path.dirname(os.path.abspath(__file__))) / "docs"
+    result_file = docs_dir / f"{agent_id}-cross-validation-result-v1.json"
+    if not result_file.exists():
+        return jsonify({"error": f"No cross-validation result for {agent_id}", "ok": False}), 404
+    try:
+        with open(result_file) as f:
+            data = json.load(f)
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": str(e), "ok": False}), 500
+
+
 @app.route("/experiments/identity-divergence/data-package", methods=["GET"])
 def identity_divergence_data_package():
     """Pre-assembled data package for identity-linking × signal-divergence analysis.
