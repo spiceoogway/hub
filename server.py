@@ -158,6 +158,54 @@ def _log_agent_event(agent_id, event_type, metadata=None):
     log_file = ANALYTICS_DIR / "events.jsonl"
     with open(log_file, "a") as f:
         f.write(json.dumps(event) + "\n")
+    # Update liveness timestamps on agent record
+    _LIVENESS_EVENTS = {"inbox_poll": "last_inbox_check", "ws_connect": "last_ws_connect"}
+    if event_type in _LIVENESS_EVENTS:
+        _update_agent_liveness(agent_id, _LIVENESS_EVENTS[event_type])
+
+
+def _update_agent_liveness(agent_id, field):
+    """Update a liveness timestamp field on the agent record."""
+    try:
+        agents = load_agents()
+        if agent_id in agents:
+            agents[agent_id].setdefault("liveness", {})[field] = datetime.utcnow().isoformat() + "Z"
+            save_agents(agents)
+    except Exception:
+        pass  # Non-critical — don't break the request on liveness tracking failure
+
+
+def _agent_delivery_capability(agent_info):
+    """Compute delivery capability from agent config and liveness data.
+    
+    Returns: "callback" | "websocket" | "poll_active" | "poll_stale" | "none"
+    """
+    # Has callback URL configured?
+    if agent_info.get("callback_url"):
+        return "callback"
+    # Active WebSocket?
+    liveness = agent_info.get("liveness", {})
+    ws_ts = liveness.get("last_ws_connect")
+    if ws_ts:
+        try:
+            ws_dt = datetime.fromisoformat(ws_ts.replace("Z", ""))
+            if (datetime.utcnow() - ws_dt).total_seconds() < 3600:  # connected within 1h
+                return "websocket"
+        except (ValueError, TypeError):
+            pass
+    # Polls inbox?
+    poll_ts = liveness.get("last_inbox_check")
+    if poll_ts:
+        try:
+            poll_dt = datetime.fromisoformat(poll_ts.replace("Z", ""))
+            hours_since = (datetime.utcnow() - poll_dt).total_seconds() / 3600
+            if hours_since < 1:
+                return "poll_active"
+            elif hours_since < 24:
+                return "poll_stale"
+        except (ValueError, TypeError):
+            pass
+    return "none"
 
 
 def _log_discovery_event(event_type, target_record, viewer_agent=None, source_surface=None, follow_on_action=None, metadata=None):
@@ -564,11 +612,20 @@ def _compute_agent_liveness(agent_id, agents=None):
         else:
             liveness_class = "dormant"
     
+    # Delivery capability (how messages can reach this agent)
+    delivery_cap = _agent_delivery_capability(info)
+    
+    # Inbox poll tracking
+    liveness_data = info.get("liveness", {})
+    
     return {
         "last_message_sent": last_sent,
         "last_message_received": last_received,
         "is_ws_connected": is_ws_connected,
-        "liveness_class": liveness_class
+        "liveness_class": liveness_class,
+        "delivery_capability": delivery_cap,
+        "last_inbox_check": liveness_data.get("last_inbox_check"),
+        "last_ws_connect": liveness_data.get("last_ws_connect"),
     }
 
 
