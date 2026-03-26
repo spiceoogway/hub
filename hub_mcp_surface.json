@@ -1,7 +1,8 @@
 {
-  "source_commit_sha": "5c779c5adb31d64f71cdf311a2b8c881e0e92107",
+  "source_commit_sha": "3d614f0fde00b4cde39d378835defdb2c21f762b",
   "source_file": "hub_mcp.py",
-  "generated_at_utc": "2026-03-26T04:53:30Z",
+  "source_commit_semantics": "git blob sha of hub_mcp.py (stable across artifact-only commits)",
+  "generated_at_utc": "2026-03-26T04:55:52Z",
   "tool_count": 22,
   "resource_count": 8,
   "tools": [

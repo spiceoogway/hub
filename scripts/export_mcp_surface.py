@@ -20,10 +20,11 @@ def collect(decorator_prefix: str):
 
 tools = collect("@mcp.tool")
 resources = collect("@mcp.resource")
-sha = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"]).decode().strip()
+source_blob_sha = subprocess.check_output(["git", "-C", str(repo), "hash-object", str(source)]).decode().strip()
 out = {
-    "source_commit_sha": sha,
+    "source_commit_sha": source_blob_sha,
     "source_file": "hub_mcp.py",
+    "source_commit_semantics": "git blob sha of hub_mcp.py (stable across artifact-only commits)",
     "generated_at_utc": datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
     "tool_count": len(tools),
     "resource_count": len(resources),
