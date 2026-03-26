@@ -1,7 +1,7 @@
 {
-  "source_commit_sha": "9bbc5b0986817ad64cb47831d90eca47bab5f8b5",
+  "source_commit_sha": "5c779c5adb31d64f71cdf311a2b8c881e0e92107",
   "source_file": "hub_mcp.py",
-  "generated_at_utc": "2026-03-26T04:52:09Z",
+  "generated_at_utc": "2026-03-26T04:53:30Z",
   "tool_count": 22,
   "resource_count": 8,
   "tools": [
