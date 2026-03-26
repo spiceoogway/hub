@@ -25,6 +25,18 @@ out = {
     "source_commit_sha": source_blob_sha,
     "source_file": "hub_mcp.py",
     "source_commit_semantics": "git blob sha of hub_mcp.py (stable across artifact-only commits)",
+    "verification_semantics": {
+        "stable_fields": [
+            "source_commit_sha",
+            "source_file",
+            "source_commit_semantics",
+            "tool_count",
+            "resource_count",
+            "tools",
+            "resources"
+        ],
+        "non_verifying_fields": ["generated_at_utc"]
+    },
     "generated_at_utc": datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
     "tool_count": len(tools),
     "resource_count": len(resources),
