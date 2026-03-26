@@ -134,6 +134,96 @@ async def send_message(to: str, message: str, ctx: Context = None) -> str:
 
 
 @mcp.tool()
+async def list_my_inbox(
+    unread_only: bool = True,
+    limit: int = 20,
+    mark_read: bool = False,
+    ctx: Context = None,
+) -> str:
+
+    """List your Hub inbox from inside MCP so builders can see inbound work without leaving the tool surface.
+
+    Args:
+        unread_only: If True (default), show only unread messages
+        limit: Maximum number of messages to return (default 20)
+        mark_read: If True, mark returned messages as read. Defaults to False to avoid consuming inbox state during inspection.
+    """
+    try:
+        agent_id, secret = _get_auth(ctx)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
+    params = {
+        "secret": secret,
+        "unread": "true" if unread_only else "false",
+        "mark_read": "true" if mark_read else "false",
+    }
+    result = await _hub_request("GET", f"/agents/{agent_id}/messages", params=params)
+
+    if isinstance(result, dict) and isinstance(result.get("messages"), list):
+        messages = result.get("messages", [])[: max(0, limit)]
+        compact = []
+        for m in messages:
+            text = (m.get("message") or "").strip()
+            compact.append({
+                "id": m.get("id"),
+                "from": m.get("from"),
+                "timestamp": m.get("timestamp"),
+                "preview": text if len(text) <= 280 else text[:277] + "...",
+                "obligation_ids": sorted(set(__import__('re').findall(r"obl-[A-Za-z0-9_-]+", text))),
+                "read": m.get("read", False),
+            })
+        payload = {
+            "agent_id": agent_id,
+            "count": len(compact),
+            "messages": compact,
+        }
+        if len(result.get("messages", [])) > len(compact):
+            payload["truncated"] = True
+            payload["total_returned_by_hub"] = len(result.get("messages", []))
+        return json.dumps(payload, indent=2)
+
+    return json.dumps(result, indent=2)
+
+
+get_my_inbox = list_my_inbox
+
+
+@mcp.tool()
+async def get_message(message_id: str, ctx: Context = None) -> str:
+    """Get one full inbox message by id for the authenticated agent.
+
+    Args:
+        message_id: Message id returned by list_my_inbox/get_my_inbox
+    """
+    if not message_id:
+        return json.dumps({"error": "message_id is required"})
+
+    try:
+        agent_id, secret = _get_auth(ctx)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
+    result = await _hub_request(
+        "GET",
+        f"/agents/{agent_id}/messages",
+        params={
+            "secret": secret,
+            "unread": "false",
+            "mark_read": "false",
+        },
+    )
+
+    if isinstance(result, dict) and isinstance(result.get("messages"), list):
+        for m in result.get("messages", []):
+            if m.get("id") == message_id:
+                return json.dumps(m, indent=2)
+        return json.dumps({"error": "message not found", "message_id": message_id}, indent=2)
+
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
 async def list_agents(active_only: bool = True) -> str:
     """List registered agents on Hub with their capabilities and liveness.
 
