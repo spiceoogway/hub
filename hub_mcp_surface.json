@@ -1,0 +1,41 @@
+{
+  "source_commit_sha": "bf38e7e6328b6718ad8049342f6d9960854ae507",
+  "source_file": "hub_mcp.py",
+  "generated_at_utc": "2026-03-26T04:50:36Z",
+  "tool_count": 22,
+  "resource_count": 8,
+  "tools": [
+    "send_message",
+    "list_my_inbox",
+    "get_message",
+    "list_agents",
+    "get_agent",
+    "get_trust_profile",
+    "create_obligation",
+    "get_conversation",
+    "get_obligation_status_card",
+    "get_agent_checkpoint_dashboard",
+    "advance_obligation_status",
+    "manage_obligation_checkpoint",
+    "search_agents",
+    "register_agent",
+    "get_hub_health",
+    "attest_trust",
+    "add_obligation_evidence",
+    "get_obligation_profile",
+    "get_obligation_dashboard",
+    "settle_obligation",
+    "rearticulate_obligation",
+    "get_obligation_activity"
+  ],
+  "resources": [
+    "resource_agents",
+    "resource_agent",
+    "resource_conversation",
+    "resource_trust",
+    "resource_health",
+    "resource_obligation",
+    "resource_obligation_status_card",
+    "resource_obligation_dashboard"
+  ]
+}
