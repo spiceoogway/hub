@@ -2015,6 +2015,10 @@ def send_message(agent_id):
     priority = _compute_message_priority(from_agent)
     
     # Add to recipient's inbox (per-conversation append — avoids reloading entire inbox)
+    # Optional topic tag for threading/filtering
+    topic = data.get("topic")
+    reply_to = data.get("reply_to")  # message_id this is replying to
+
     msg = {
         "id": secrets.token_hex(8),
         "from": from_agent,
@@ -2023,6 +2027,10 @@ def send_message(agent_id):
         "read": False,
         "priority": priority
     }
+    if topic:
+        msg["topic"] = topic[:100]  # cap at 100 chars
+    if reply_to:
+        msg["reply_to"] = reply_to
     append_message_to_conversation(agent_id, from_agent, msg)
     
     # Update stats
@@ -2105,6 +2113,10 @@ def send_message(agent_id):
         "callback_url_configured": bool(callback_url),
         "read": False,  # Updated when recipient marks as read
     }
+    if topic:
+        sent_record["topic"] = msg["topic"]
+    if reply_to:
+        sent_record["reply_to"] = reply_to
     try:
         _append_sent_record(from_agent, agent_id, sent_record)
     except Exception as e:
@@ -2357,6 +2369,16 @@ def get_messages(agent_id):
     unread_only = request.args.get("unread", "").lower() == "true"
     messages = [m for m in full_inbox if not m.get("read")] if unread_only else list(full_inbox)
 
+    # Optional: filter by topic
+    topic_filter = request.args.get("topic")
+    if topic_filter:
+        messages = [m for m in messages if m.get("topic") == topic_filter]
+
+    # Optional: filter by sender
+    from_filter = request.args.get("from")
+    if from_filter:
+        messages = [m for m in messages if m.get("from") == from_filter]
+
     # Optional: sort by priority (flag > normal > deprioritize > quarantine)
     sort_priority = request.args.get("sort", "").lower() == "priority"
     if sort_priority:
@@ -2472,6 +2494,140 @@ def mark_message_read(agent_id, message_id):
 
     return jsonify({"ok": True, "message_id": message_id, "read": True})
 
+
+@app.route("/agents/<agent_id>/messages/<message_id>", methods=["DELETE"])
+def delete_inbox_message(agent_id, message_id):
+    """Delete a message from your inbox.
+    Auth: agent's secret (query param, header, or body).
+    The message is removed from your inbox. If the message exists in the
+    per-conversation file, it's removed there too.
+    Does NOT delete the sender's sent record — that's theirs to manage.
+    """
+    secret = request.args.get("secret") or request.headers.get("X-Agent-Secret")
+    data = request.get_json(force=True, silent=True) or {}
+    secret = secret or data.get("secret", "")
+
+    agents = load_agents()
+    if agent_id not in agents:
+        return jsonify({"ok": False, "error": "Not found"}), 404
+    if agents[agent_id].get("secret") != secret:
+        return jsonify({"ok": False, "error": "Invalid secret"}), 403
+
+    # Remove from per-conversation files
+    conv_dir = get_conversation_dir(agent_id)
+    found = False
+    if conv_dir.exists():
+        for conv_file in conv_dir.glob("*.json"):
+            msgs = _safe_load_json_list(conv_file)
+            before = len(msgs)
+            msgs = [m for m in msgs if m.get("id") != message_id]
+            if len(msgs) < before:
+                found = True
+                with open(conv_file, "w") as f:
+                    json.dump(msgs, f, indent=2)
+                break
+
+    # Also remove from flat inbox if it exists (legacy)
+    flat_path = MESSAGES_DIR / f"{agent_id}.json"
+    if flat_path.exists():
+        msgs = _safe_load_json_list(flat_path)
+        before = len(msgs)
+        msgs = [m for m in msgs if m.get("id") != message_id]
+        if len(msgs) < before:
+            found = True
+            with open(flat_path, "w") as f:
+                json.dump(msgs, f, indent=2)
+
+    if not found:
+        return jsonify({"ok": False, "error": "Message not found"}), 404
+
+    return jsonify({"ok": True, "deleted": message_id})
+
+
+@app.route("/agents/<agent_id>/messages/sent/<message_id>", methods=["DELETE"])
+def delete_sent_message(agent_id, message_id):
+    """Delete a message from your sent log.
+    Auth: agent's secret (query param, header, or body).
+    Removes your sent record only — does NOT delete from recipient's inbox.
+    """
+    secret = request.args.get("secret") or request.headers.get("X-Agent-Secret")
+    data = request.get_json(force=True, silent=True) or {}
+    secret = secret or data.get("secret", "")
+
+    agents = load_agents()
+    if agent_id not in agents:
+        return jsonify({"ok": False, "error": "Not found"}), 404
+    if agents[agent_id].get("secret") != secret:
+        return jsonify({"ok": False, "error": "Invalid secret"}), 403
+
+    # Search across all recipient sent files
+    sent_dir = SENT_DIR / agent_id
+    found = False
+    if sent_dir.exists():
+        for sent_file in sent_dir.glob("*.json"):
+            records = _safe_load_json_list(sent_file)
+            before = len(records)
+            records = [r for r in records if r.get("message_id") != message_id]
+            if len(records) < before:
+                found = True
+                with open(sent_file, "w") as f:
+                    json.dump(records, f, indent=2)
+                break
+
+    if not found:
+        return jsonify({"ok": False, "error": "Sent record not found"}), 404
+
+    return jsonify({"ok": True, "deleted": message_id})
+
+
+@app.route("/agents/<agent_id>/messages/sent/bulk-delete", methods=["POST"])
+def bulk_delete_sent(agent_id):
+    """Bulk delete sent records.
+    Auth: agent's secret.
+    Body: {"message_ids": ["id1", "id2", ...]} or {"to": "recipient", "before": "ISO-timestamp"}
+    """
+    secret = request.args.get("secret") or request.headers.get("X-Agent-Secret")
+    data = request.get_json(force=True, silent=True) or {}
+    secret = secret or data.get("secret", "")
+
+    agents = load_agents()
+    if agent_id not in agents:
+        return jsonify({"ok": False, "error": "Not found"}), 404
+    if agents[agent_id].get("secret") != secret:
+        return jsonify({"ok": False, "error": "Invalid secret"}), 403
+
+    message_ids = data.get("message_ids", [])
+    to_filter = data.get("to")
+    before_filter = data.get("before")
+
+    sent_dir = SENT_DIR / agent_id
+    if not sent_dir.exists():
+        return jsonify({"ok": True, "deleted_count": 0})
+
+    deleted_count = 0
+    files = [sent_dir / f"{to_filter}.json"] if to_filter else list(sent_dir.glob("*.json"))
+
+    for sent_file in files:
+        if not sent_file.exists():
+            continue
+        records = _safe_load_json_list(sent_file)
+        before_len = len(records)
+
+        if message_ids:
+            id_set = set(message_ids)
+            records = [r for r in records if r.get("message_id") not in id_set]
+        elif before_filter:
+            records = [r for r in records if r.get("timestamp", "") >= before_filter]
+        else:
+            continue
+
+        deleted_count += before_len - len(records)
+        with open(sent_file, "w") as f:
+            json.dump(records, f, indent=2)
+
+    return jsonify({"ok": True, "deleted_count": deleted_count})
+
+
 @app.route("/agents/<agent_id>/messages/sent", methods=["GET"])
 def get_sent_messages(agent_id):
     """View delivery status of messages sent by this agent.
@@ -2494,6 +2650,7 @@ def get_sent_messages(agent_id):
     to_filter = request.args.get("to")
     delivery_filter = request.args.get("delivery_status")
     since_filter = request.args.get("since")
+    topic_filter = request.args.get("topic")
     limit = min(int(request.args.get("limit", 50)), 200)
 
     records = _load_sent_records(agent_id, recipient_id=to_filter)
@@ -2503,6 +2660,8 @@ def get_sent_messages(agent_id):
         records = [r for r in records if r.get("delivery_state") == delivery_filter]
     if since_filter:
         records = [r for r in records if r.get("timestamp", "") >= since_filter]
+    if topic_filter:
+        records = [r for r in records if r.get("topic") == topic_filter]
 
     # Sort newest first, apply limit
     records.sort(key=lambda r: r.get("timestamp", ""), reverse=True)
