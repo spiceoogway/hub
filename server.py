@@ -2171,12 +2171,32 @@ def poll_messages(agent_id):
                 unread = [m for m in unread if inbox.index(m) > last_offset]
             
             if unread:
-                # Mark delivered messages as read
+                # Mark delivered messages as read + propagate read receipts
                 unread_ids = {m.get("id") for m in unread}
+                read_at = datetime.utcnow().isoformat() + "Z"
+                read_receipts = {}  # sender_id -> [message_id, ...]
                 for m in inbox:
-                    if m.get("id") in unread_ids:
+                    if m.get("id") in unread_ids and not m.get("read"):
                         m["read"] = True
+                        m["read_at"] = read_at
+                        sender = m.get("from")
+                        if sender:
+                            read_receipts.setdefault(sender, []).append(m["id"])
                 save_inbox(agent_id, inbox)
+                # Propagate read receipts to senders' sent logs
+                for sender_id, msg_ids in read_receipts.items():
+                    try:
+                        sent_path = _get_sent_path(sender_id, agent_id)
+                        sent_records = _safe_load_json_list(sent_path)
+                        msg_id_set = set(msg_ids)
+                        for sr in sent_records:
+                            if sr.get("message_id") in msg_id_set:
+                                sr["read"] = True
+                                sr["read_at"] = read_at
+                        with open(sent_path, "w") as f:
+                            json.dump(sent_records, f, indent=2)
+                    except Exception as e:
+                        print(f"[SENT] Failed to propagate poll read receipts to {sender_id}: {e}")
                 
                 # Map fields for channel adapter compatibility
                 adapted = []
@@ -2248,11 +2268,30 @@ def ws_messages(ws, agent_id):
                         "timestamp": m.get("timestamp", ""),
                     }
                 }))
-            # Mark as read
+            # Mark as read + propagate read receipts
+            read_at_ws = datetime.utcnow().isoformat() + "Z"
+            ws_read_receipts = {}
             for m in inbox:
-                if m.get("id") in unread_ids:
+                if m.get("id") in unread_ids and not m.get("read"):
                     m["read"] = True
+                    m["read_at"] = read_at_ws
+                    sender = m.get("from")
+                    if sender:
+                        ws_read_receipts.setdefault(sender, []).append(m["id"])
             save_inbox(agent_id, inbox)
+            for sender_id, msg_ids in ws_read_receipts.items():
+                try:
+                    sent_path = _get_sent_path(sender_id, agent_id)
+                    sent_records = _safe_load_json_list(sent_path)
+                    msg_id_set = set(msg_ids)
+                    for sr in sent_records:
+                        if sr.get("message_id") in msg_id_set:
+                            sr["read"] = True
+                            sr["read_at"] = read_at_ws
+                    with open(sent_path, "w") as f:
+                        json.dump(sent_records, f, indent=2)
+                except Exception as e:
+                    print(f"[SENT] Failed to propagate WS read receipts to {sender_id}: {e}")
 
         # Keep connection alive, wait for close or ping
         while True:
@@ -14170,7 +14209,7 @@ def repeat_work_threshold(agent_id):
     Schema:
       - target_agent
       - first_contact_at
-      - channel_path (mcp|source|manual)
+      - channel_path (mcp|source|manual|hub_thread)
       - delivery_verified (true|false|unknown)
       - second_interaction_at
       - interaction_class (social|artifact|continuation|setup|other)
@@ -14194,11 +14233,12 @@ def repeat_work_threshold(agent_id):
         if from_agent not in agents or agents[from_agent].get("secret") != secret:
             return jsonify({"error": "invalid credentials"}), 401
 
-        valid_channel_paths = {"mcp", "source", "manual"}
+        valid_channel_paths = {"mcp", "source", "manual", "hub_thread"}
         valid_interaction_classes = {"social", "artifact", "continuation", "setup", "other"}
         valid_delivery = {True, False, "unknown", None}
         valid_verdicts = {
             "pass",
+            "pending_request_sent",
             "fail_first_contact_only",
             "fail_repeat_social",
             "fail_artifact_continuation",
@@ -14211,7 +14251,7 @@ def repeat_work_threshold(agent_id):
         verdict = data.get("verdict")
 
         if channel_path not in valid_channel_paths:
-            return jsonify({"error": "channel_path must be one of mcp|source|manual"}), 400
+            return jsonify({"error": "channel_path must be one of mcp|source|manual|hub_thread"}), 400
         if interaction_class is not None and interaction_class not in valid_interaction_classes:
             return jsonify({"error": "interaction_class must be one of social|artifact|continuation|setup|other"}), 400
         if delivery_verified not in valid_delivery:
@@ -14250,8 +14290,14 @@ def repeat_work_threshold(agent_id):
                 record["verdict"] = "inconclusive_unverified_delivery"
             elif not record.get("second_interaction_at"):
                 record["verdict"] = "fail_first_contact_only"
-            elif record.get("interaction_class") == "artifact" and record.get("is_new_request") is True:
+            elif (
+                record.get("interaction_class") == "artifact"
+                and record.get("is_new_request") is True
+                and record.get("artifact_delivered") is True
+            ):
                 record["verdict"] = "pass"
+            elif record.get("interaction_class") == "artifact" and record.get("is_new_request") is True:
+                record["verdict"] = "pending_request_sent"
             elif record.get("interaction_class") == "social":
                 record["verdict"] = "fail_repeat_social"
             elif record.get("interaction_class") == "continuation":
@@ -14279,7 +14325,7 @@ def repeat_work_threshold_rollup():
         return {"count": total, "pass": passed, "pass_rate": round(passed / total, 3) if total else None}
 
     by_channel = {}
-    for channel in ["mcp", "source", "manual"]:
+    for channel in ["mcp", "source", "manual", "hub_thread"]:
         subset = [r for r in records if r.get("channel_path") == channel]
         by_channel[channel] = rate(subset, lambda r: r.get("verdict") == "pass")
 
