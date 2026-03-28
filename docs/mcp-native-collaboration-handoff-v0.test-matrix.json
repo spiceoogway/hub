@@ -1,0 +1,192 @@
+{
+  "artifact": "mcp-native-collaboration-handoff-v0.test-matrix",
+  "version": "0.1.0",
+  "derived_from": [
+    "hub/docs/mcp-native-collaboration-handoff-v0.schema.json",
+    "hub/docs/mcp-native-collaboration-handoff-gap-2026-03-26.md",
+    "testy conversation continuity/rebind notes"
+  ],
+  "evaluation_principle": "A rebind frame is good if it restores the right next move and the right shape of that move, not merely the right facts.",
+  "secondary_metrics": [
+    "wrong_mode",
+    "missed_obligation",
+    "actionability_error",
+    "silence_error",
+    "response_shape_error",
+    "unnecessary_recap",
+    "genericity",
+    "stale_frame_use",
+    "overbinding",
+    "frame_underuse",
+    "cross_thread_bleed",
+    "frame_thrash",
+    "hesitation"
+  ],
+  "cases": [
+    {
+      "id": "success_iterative_refinement",
+      "class": "success_path",
+      "description": "Resume an iterative drafting/refinement thread and continue without unnecessary recap.",
+      "frame_state": "valid",
+      "read_decision": "RESPOND_USING_FRAME",
+      "response_form": "proposal",
+      "frame_write_decision": "REFRESH_IF_CONTROL_STATE_CHANGED",
+      "must_preserve": [
+        "interaction_mode",
+        "expected_next_move",
+        "response_shape",
+        "actionability"
+      ],
+      "fail_if": [
+        "unnecessary_recap",
+        "wrong_mode",
+        "genericity"
+      ],
+      "invalidation_strength": "none"
+    },
+    {
+      "id": "success_obligation_follow_up",
+      "class": "success_path",
+      "description": "Resume a thread where a follow-up artifact is owed and produce the next concrete move.",
+      "frame_state": "valid",
+      "must_preserve": [
+        "obligations",
+        "open_loops",
+        "expected_next_move"
+      ],
+      "fail_if": [
+        "missed_obligation",
+        "silence_error"
+      ],
+      "read_decision": "RESPOND_USING_FRAME",
+      "response_form": "proposal",
+      "frame_write_decision": "REFRESH_IF_CONTROL_STATE_CHANGED",
+      "invalidation_strength": "none"
+    },
+    {
+      "id": "invalidation_mode_shift",
+      "class": "invalidation",
+      "description": "New turn strongly changes the interaction mode (for example, exploration to decision).",
+      "frame_state": "invalidated_strong",
+      "must_preserve": [
+        "source_refs"
+      ],
+      "fail_if": [
+        "overbinding",
+        "wrong_mode"
+      ],
+      "read_decision": "RECONSTRUCT_HEAVY",
+      "response_form": "proposal",
+      "frame_write_decision": "REBUILD_FRAME",
+      "invalidation_strength": "strong"
+    },
+    {
+      "id": "invalidation_surface_constraint_change",
+      "class": "invalidation",
+      "description": "New information makes the saved action path invalid on the current surface.",
+      "frame_state": "invalidated_weak",
+      "must_preserve": [
+        "surface_constraints",
+        "actionability"
+      ],
+      "fail_if": [
+        "actionability_error",
+        "overbinding"
+      ],
+      "read_decision": "REROUTE",
+      "response_form": "reroute",
+      "frame_write_decision": "REFRESH_IF_CONTROL_STATE_CHANGED",
+      "invalidation_strength": "weak"
+    },
+    {
+      "id": "silence_policy_correct",
+      "class": "silence_policy",
+      "description": "Silence remains correct until expiry and the system should not emit a follow-up.",
+      "frame_state": "valid",
+      "must_preserve": [
+        "silence_policy"
+      ],
+      "fail_if": [
+        "silence_error"
+      ],
+      "read_decision": "SILENT",
+      "response_form": "none",
+      "frame_write_decision": "REFRESH_IF_CONTROL_STATE_CHANGED",
+      "invalidation_strength": "none"
+    },
+    {
+      "id": "wrong_surface_reroute",
+      "class": "routing",
+      "description": "A response is technically possible but should be rerouted because the current surface cannot complete the loop well.",
+      "frame_state": "valid",
+      "must_preserve": [
+        "surface_constraints",
+        "actionability",
+        "expected_next_move"
+      ],
+      "fail_if": [
+        "actionability_error"
+      ],
+      "read_decision": "REROUTE",
+      "response_form": "reroute",
+      "frame_write_decision": "REFRESH_IF_CONTROL_STATE_CHANGED",
+      "invalidation_strength": "none"
+    },
+    {
+      "id": "trivial_turn_ignore",
+      "class": "ignore",
+      "description": "A low-information acknowledgment should not mutate the frame or trigger rebuild.",
+      "frame_state": "valid",
+      "must_preserve": [
+        "all_control_state"
+      ],
+      "fail_if": [
+        "overbinding"
+      ],
+      "read_decision": "IGNORE_FRAME_UPDATE",
+      "response_form": "ack_or_none",
+      "frame_write_decision": "IGNORE_FRAME_UPDATE",
+      "invalidation_strength": "none"
+    },
+    {
+      "id": "cross_thread_confusion",
+      "class": "boundary",
+      "description": "Same counterparty and surface, but a different concurrent thread. The system must not import adjacent obligations or mode.",
+      "frame_state": "wrong_thread",
+      "must_preserve": [
+        "thread.id",
+        "thread.surface"
+      ],
+      "fail_if": [
+        "overbinding",
+        "missed_obligation",
+        "wrong_mode"
+      ],
+      "read_decision": "RECONSTRUCT_LIGHT",
+      "response_form": "clarifying_question",
+      "frame_write_decision": "REBUILD_FRAME",
+      "invalidation_strength": "none"
+    },
+    {
+      "id": "queued_turn_continuity",
+      "class": "queued_turn",
+      "description": "Multiple queued turns arrive after interruption; the system should still recover the correct next move and response shape.",
+      "frame_state": "valid_but_aged",
+      "must_preserve": [
+        "interaction_mode",
+        "response_shape",
+        "expected_next_move",
+        "confidence"
+      ],
+      "fail_if": [
+        "genericity",
+        "unnecessary_recap",
+        "wrong_mode"
+      ],
+      "read_decision": "RESPOND_CAUTIOUSLY_USING_FRAME",
+      "response_form": "proposal",
+      "frame_write_decision": "REFRESH_IF_CONTROL_STATE_CHANGED",
+      "invalidation_strength": "none"
+    }
+  ]
+}

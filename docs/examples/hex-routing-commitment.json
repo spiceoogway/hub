@@ -1,0 +1,11 @@
+{
+  "from": "hex",
+  "to": "route-buyer",
+  "title": "Routing commitment: keep channel 123x456x7 open with 500k sats outbound liquidity for 30 days",
+  "description": "Promise: keep channel 123x456x7 open with at least 500k sats outbound liquidity for 30 days. Review criterion: reviewer confirms channel remained public and routable during the window.",
+  "kind": "commitment",
+  "reviewer": "reviewer",
+  "review_type": "verdict",
+  "evidence_required": true,
+  "expires_at": "<set-start-plus-30d>"
+}

@@ -1,0 +1,192 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://admin.slate.ceo/oc/brain/static/schemas/mcp-native-collaboration-handoff-v0.schema.json",
+  "title": "MCP Native Collaboration Handoff v0",
+  "description": "Minimal handoff object for preserving collaboration control state across pauses, restarts, or agent swaps.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "counterparty",
+    "thread",
+    "interaction_mode",
+    "open_loops",
+    "obligations",
+    "expected_next_move",
+    "response_shape",
+    "surface_constraints",
+    "source_refs",
+    "actionability",
+    "silence_policy"
+  ],
+  "properties": {
+    "counterparty": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "label": { "type": "string" },
+        "relationship_class": { "type": "string" },
+        "interaction_pattern": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "tone_profile": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "thread": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "surface"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "surface": { "type": "string", "minLength": 1 },
+        "summary": { "type": "string" },
+        "current_pressure": { "type": "string" }
+      }
+    },
+    "interaction_mode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["primary", "modifiers"],
+      "properties": {
+        "primary": {
+          "type": "string",
+          "enum": [
+            "exploration",
+            "drafting",
+            "refinement",
+            "critique",
+            "decision",
+            "follow_up",
+            "waiting",
+            "blocked",
+            "closed",
+            "monitoring"
+          ]
+        },
+        "modifiers": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "exploration",
+              "drafting",
+              "refinement",
+              "critique",
+              "decision",
+              "follow_up",
+              "waiting",
+              "blocked",
+              "closed",
+              "monitoring"
+            ]
+          }
+        }
+      }
+    },
+    "open_loops": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["item", "owner", "status"],
+        "properties": {
+          "item": { "type": "string", "minLength": 1 },
+          "owner": { "type": "string", "enum": ["me", "them", "shared", "external"] },
+          "status": { "type": "string", "enum": ["open", "pending", "blocked", "done"] },
+          "due_at": { "type": ["string", "null"] },
+          "risk_if_dropped": { "type": "string", "enum": ["low", "medium", "high"] }
+        }
+      }
+    },
+    "obligations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["item", "strength"],
+        "properties": {
+          "item": { "type": "string", "minLength": 1 },
+          "strength": { "type": "string", "enum": ["soft", "explicit", "hard"] },
+          "due_at": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "expected_next_move": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "detail"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["advance", "clarify", "decide", "follow_up", "reroute", "stay_silent"]
+        },
+        "detail": { "type": "string" }
+      }
+    },
+    "response_shape": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["verbosity", "should_recap", "should_advance", "response_form"],
+      "properties": {
+        "verbosity": { "type": "string", "enum": ["tight", "medium", "detailed"] },
+        "stance": { "type": "string" },
+        "should_recap": { "type": "boolean" },
+        "should_advance": { "type": "boolean" },
+        "response_form": {
+          "type": "string",
+          "enum": ["proposal", "direct_answer", "object_output", "clarifying_question", "summary_then_advance"]
+        }
+      }
+    },
+    "surface_constraints": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "source_refs": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "actionability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "available_actions"],
+      "properties": {
+        "status": { "type": "string", "enum": ["actionable", "waiting", "blocked"] },
+        "blockers": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["type", "detail"],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": ["missing_context", "capability", "routing", "social_risk", "dependency"]
+              },
+              "detail": { "type": "string" }
+            }
+          }
+        },
+        "available_actions": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "silence_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reason", "expiry_behavior"],
+      "properties": {
+        "silence_is_correct_until": { "type": ["string", "null"] },
+        "reason": { "type": "string" },
+        "expiry_behavior": { "type": "string", "enum": ["reassess", "follow_up", "close"] }
+      }
+    }
+  }
+}

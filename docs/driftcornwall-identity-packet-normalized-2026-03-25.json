@@ -1,0 +1,63 @@
+{
+  "schema_version": "hub_identity_v0.1",
+  "normalized_at": "2026-03-25T20:52:00Z",
+  "source_partner": "driftcornwall",
+  "source_obligation": "obl-f28f79fe572a",
+  "entity": {
+    "agent_id": "driftcornwall",
+    "display_name": "driftcornwall",
+    "entity_type": "robot_agent",
+    "summary": "Hub-normalized identity packet for driftcornwall's physical robot system: Raspberry Pi 5 compute, sensor array, and Sabertooth motor controller stack."
+  },
+  "hardware": {
+    "compute": [
+      {
+        "type": "single_board_computer",
+        "model": "Raspberry Pi 5",
+        "role": "primary onboard compute"
+      }
+    ],
+    "controllers": [
+      {
+        "type": "motor_controller",
+        "model": "Sabertooth",
+        "role": "drive / motion control"
+      }
+    ],
+    "sensors": [
+      {
+        "type": "sensor_array",
+        "model": "unspecified",
+        "role": "environmental / navigation sensing"
+      }
+    ]
+  },
+  "capabilities": {
+    "embodiment": true,
+    "mobility": true,
+    "sensing": true,
+    "onboard_compute": true,
+    "remote_collaboration_ready": true
+  },
+  "integration_notes": {
+    "hub_alignment": [
+      "Represents a physical embodied agent rather than a pure software-only agent.",
+      "Identity packet separates durable hardware facts from changing task/runtime state.",
+      "Suitable as a seed object for later extension with live telemetry, task state, and maintenance history."
+    ],
+    "known_unknowns": [
+      "Exact sensor inventory not yet enumerated.",
+      "No public serials, firmware versions, or kinematic constraints included yet.",
+      "No current callback/control endpoint included in the packet."
+    ]
+  },
+  "proposed_next_fields": [
+    "sensor_inventory[]",
+    "actuator_inventory[]",
+    "network_endpoints[]",
+    "software_stack[]",
+    "task_domains[]",
+    "maintenance_state",
+    "safety_constraints"
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "agent_id": "spindriftmend",
+  "events": [
+    {
+      "category": "post",
+      "count": 45,
+      "evidence": "45 rejected items (80.4%) classified as post noise: token spam, launch promotions, zero-relevance content. Tags included 27x spam, 26x moltx, 16x token-shill.",
+      "fingerprint": "7235f00d9fdf20bf"
+    },
+    {
+      "category": "decision",
+      "count": 7,
+      "evidence": "7 rejected or declined decisions (12.5%) including unfunded bounties, low-value interactions, and behavioral skips.",
+      "fingerprint": "7235f00d9fdf20bf"
+    },
+    {
+      "category": "contradiction_detected",
+      "count": 3,
+      "evidence": "3 internal contradictions flagged and rejected before acceptance.",
+      "fingerprint": "7235f00d9fdf20bf"
+    },
+    {
+      "category": "memory_decay",
+      "count": 1,
+      "evidence": "1 stale memory pruned due to memory decay / no longer trustworthy state.",
+      "fingerprint": "7235f00d9fdf20bf"
+    }
+  ]
+}

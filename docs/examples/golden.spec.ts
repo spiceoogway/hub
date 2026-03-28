@@ -8,6 +8,8 @@ import {
   type NormalizerProfile,
   type RawGitHubSnapshot,
   type ReviewStatePacket,
+  buildNotificationTuple,
+  notificationDecision,
   reducer,
   runGoldenScenario,
 } from "./review-state.ts";
@@ -47,6 +49,7 @@ function packet(overrides: Partial<ReviewStatePacket>): ReviewStatePacket {
 
 interface ReducerOrderInvariantFixture {
   name: string;
+  previous: ReviewStatePacket;
   firstRaw: RawGitHubSnapshot;
   secondRaw: RawGitHubSnapshot;
   profile: NormalizerProfile;
@@ -55,6 +58,8 @@ interface ReducerOrderInvariantFixture {
     blockerIds: string[];
     actionKey: string;
     riskPhase: NonNullable<ReviewStatePacket["riskPhase"]>;
+    emit: boolean;
+    notificationReason?: "state-change" | "blocker-set-change" | "action-line-change" | "confidence-drop" | "mergeable-flip" | "no-op";
   };
 }
 
@@ -330,7 +335,126 @@ export const daclGoldenScenarios: GoldenScenario[] = [
 
 export const reducerOrderInvariantFixtures: ReducerOrderInvariantFixture[] = [
   {
-    name: "blocker ids are stable under artifact order changes",
+    name: "force-push after approval drops reviewed fix -> needs-human, no carry-forward approval",
+    previous: packet({
+      state: "mergeable",
+      confidencePct: 96,
+      headSha: "444dddd",
+      blockers: [],
+      actionLine: "To merge: merge current head 444dddd now.",
+      actionKey: "merge.now",
+      riskPhase: "steady",
+    }),
+    firstRaw: {
+      repo: "alexjaniak/DACL",
+      prNumber: 8,
+      prUrl: "https://github.com/alexjaniak/DACL/pull/8",
+      headSha: "555eeee",
+      baseBranch: "main",
+      profileId: daclProfile.profileId,
+      profileVersion: daclProfile.version,
+      requiredChecks: [
+        { name: "dashboard-verify", status: "success" },
+        { name: "solana-bootstrap-sdk", status: "success" },
+      ],
+      latestValidApproval: { author: "alexjaniak", commitId: "444dddd" },
+      derivedSignals: {
+        headShaChangedAfterLastApproval: true,
+        approvalAppliesToHeadSha: false,
+        reaffirmedOnCurrentHead: false,
+        resolvedSemanticallyOnCurrentHead: null,
+      },
+      blockingArtifacts: [
+        {
+          id: "thread-901",
+          sourceKind: "review_thread",
+          author: "alexjaniak",
+          semanticBlocking: true,
+          intentConfidencePct: 92,
+          appliesToHeadSha: "444dddd",
+          resolvedInUi: true,
+          resolvedSemantically: null,
+          evidenceExcerpt: "must fix: auth guard missing on admin route",
+        },
+      ],
+    },
+    secondRaw: {
+      repo: "alexjaniak/DACL",
+      prNumber: 8,
+      prUrl: "https://github.com/alexjaniak/DACL/pull/8",
+      headSha: "555eeee",
+      baseBranch: "main",
+      profileId: daclProfile.profileId,
+      profileVersion: daclProfile.version,
+      requiredChecks: [
+        { name: "dashboard-verify", status: "success" },
+        { name: "solana-bootstrap-sdk", status: "success" },
+      ],
+      latestValidApproval: { author: "alexjaniak", commitId: "444dddd" },
+      derivedSignals: {
+        headShaChangedAfterLastApproval: true,
+        approvalAppliesToHeadSha: false,
+        reaffirmedOnCurrentHead: false,
+        resolvedSemanticallyOnCurrentHead: null,
+      },
+      blockingArtifacts: [
+        {
+          id: "thread-901",
+          sourceKind: "review_thread",
+          author: "alexjaniak",
+          semanticBlocking: true,
+          intentConfidencePct: 92,
+          appliesToHeadSha: "444dddd",
+          resolvedInUi: true,
+          resolvedSemantically: null,
+          evidenceExcerpt: "must fix: auth guard missing on admin route",
+        },
+      ],
+    },
+    profile: daclProfile,
+    expected: {
+      state: "needs-human",
+      blockerIds: ["ambiguous-state:thread:901"],
+      actionKey: "reconfirm.intent.thread-901.head.555eeee",
+      riskPhase: "ambiguous",
+      emit: true,
+      notificationReason: "mergeable-flip",
+    },
+  },
+  {
+    name: "same semantic blocker under reordered artifacts -> no fake delta, no emit",
+    previous: packet({
+      state: "needs-human",
+      confidencePct: 58,
+      headSha: "888aaaa",
+      blockers: [
+        {
+          id: "ambiguous-state:thread:12",
+          type: "ambiguous-state",
+          summary: "Semantic blocker references superseded head; intent on current head is ambiguous.",
+          owner: "alexjaniak",
+          resolutionCondition: "Reconfirm reviewer intent on current head 888aaaa.",
+          confidencePct: 92,
+          evidenceIds: ["thread-12", "head:888aaaa"],
+          requiresHumanJudgment: true,
+          appliesToHeadSha: "888aaaa",
+        },
+        {
+          id: "ambiguous-state:thread:19",
+          type: "ambiguous-state",
+          summary: "Semantic blocker references superseded head; intent on current head is ambiguous.",
+          owner: "alexjaniak",
+          resolutionCondition: "Reconfirm reviewer intent on current head 888aaaa.",
+          confidencePct: 90,
+          evidenceIds: ["thread-19", "head:888aaaa"],
+          requiresHumanJudgment: true,
+          appliesToHeadSha: "888aaaa",
+        },
+      ],
+      actionLine: "Do not merge because prior approval was for superseded SHA; reconfirm reviewer intent on current head 888aaaa.",
+      actionKey: "reconfirm.intent.thread-12.head.888aaaa",
+      riskPhase: "ambiguous",
+    }),
     firstRaw: {
       repo: "alexjaniak/DACL",
       prNumber: 7,
@@ -425,6 +549,116 @@ export const reducerOrderInvariantFixtures: ReducerOrderInvariantFixture[] = [
       blockerIds: ["ambiguous-state:thread:12", "ambiguous-state:thread:19"],
       actionKey: "reconfirm.intent.thread-12.head.888aaaa",
       riskPhase: "ambiguous",
+      emit: false,
+      notificationReason: "no-op",
+    },
+  },
+  {
+    name: "approval on current head does not override separate open blocker/policy failure",
+    previous: packet({
+      state: "blocked",
+      confidencePct: 82,
+      headSha: "999aaaa",
+      blockers: [
+        {
+          id: "policy-failure:policy:required_docs_missing",
+          type: "policy-failure",
+          summary: "Policy failure: required_docs_missing",
+          resolutionCondition: 'Satisfy policy rule "required_docs_missing".',
+          evidenceIds: ["policy:required_docs_missing"],
+          appliesToHeadSha: "999aaaa",
+        },
+        {
+          id: "blocking-comment:artifact:thread-777",
+          type: "blocking-comment",
+          summary: "must fix: replay protection missing",
+          owner: "reviewer2",
+          resolutionCondition: "Resolve semantic blocker on current head.",
+          confidencePct: 96,
+          evidenceIds: ["thread-777"],
+          appliesToHeadSha: "999aaaa",
+        },
+      ],
+      actionLine: 'Satisfy policy rule "required_docs_missing".',
+      actionKey: "policy.required_docs_missing",
+      riskPhase: "explicit-blocking",
+    }),
+    firstRaw: {
+      repo: "alexjaniak/DACL",
+      prNumber: 9,
+      prUrl: "https://github.com/alexjaniak/DACL/pull/9",
+      headSha: "999aaaa",
+      baseBranch: "main",
+      profileId: daclProfile.profileId,
+      profileVersion: daclProfile.version,
+      requiredChecks: [
+        { name: "dashboard-verify", status: "success" },
+        { name: "solana-bootstrap-sdk", status: "success" },
+      ],
+      latestValidApproval: { author: "alexjaniak", commitId: "999aaaa" },
+      derivedSignals: {
+        headShaChangedAfterLastApproval: false,
+        approvalAppliesToHeadSha: true,
+        reaffirmedOnCurrentHead: true,
+        resolvedSemanticallyOnCurrentHead: false,
+      },
+      blockingArtifacts: [
+        {
+          id: "thread-777",
+          sourceKind: "review_thread",
+          author: "reviewer2",
+          semanticBlocking: true,
+          intentConfidencePct: 96,
+          appliesToHeadSha: "999aaaa",
+          resolvedInUi: false,
+          resolvedSemantically: false,
+          evidenceExcerpt: "must fix: replay protection missing",
+        },
+      ],
+      policyFailures: ["required_docs_missing"],
+    },
+    secondRaw: {
+      repo: "alexjaniak/DACL",
+      prNumber: 9,
+      prUrl: "https://github.com/alexjaniak/DACL/pull/9",
+      headSha: "999aaaa",
+      baseBranch: "main",
+      profileId: daclProfile.profileId,
+      profileVersion: daclProfile.version,
+      requiredChecks: [
+        { name: "dashboard-verify", status: "success" },
+        { name: "solana-bootstrap-sdk", status: "success" },
+      ],
+      latestValidApproval: { author: "alexjaniak", commitId: "999aaaa" },
+      derivedSignals: {
+        headShaChangedAfterLastApproval: false,
+        approvalAppliesToHeadSha: true,
+        reaffirmedOnCurrentHead: true,
+        resolvedSemanticallyOnCurrentHead: false,
+      },
+      blockingArtifacts: [
+        {
+          id: "thread-777",
+          sourceKind: "review_thread",
+          author: "reviewer2",
+          semanticBlocking: true,
+          intentConfidencePct: 96,
+          appliesToHeadSha: "999aaaa",
+          resolvedInUi: false,
+          resolvedSemantically: false,
+          evidenceExcerpt: "must fix: replay protection missing",
+        },
+      ],
+      policyFailures: ["required_docs_missing"],
+    },
+    profile: daclProfile,
+    expected: {
+      state: "blocked",
+      blockerIds: ["blocking-comment:artifact:thread-777", "policy-failure:policy:required_docs_missing"],
+      actionKey: "policy.required_docs_missing",
+      riskPhase: "explicit-blocking",
+      emit: false,
+      notificationReason: "no-op",
     },
   },
 ];
@@ -440,6 +674,8 @@ export function runReducerOrderInvariantFixtures(reduce = reducer) {
   return reducerOrderInvariantFixtures.map((fixture) => {
     const first = reduce(fixture.firstRaw, fixture.profile);
     const second = reduce(fixture.secondRaw, fixture.profile);
+    const firstNotify = notificationDecision(buildNotificationTuple(fixture.previous, first));
+    const secondNotify = notificationDecision(buildNotificationTuple(fixture.previous, second));
     const diffs: string[] = [];
 
     const firstIds = [...first.blockers.map((blocker) => blocker.id)].sort();
@@ -470,12 +706,27 @@ export function runReducerOrderInvariantFixtures(reduce = reducer) {
       diffs.push(`riskPhase mismatch: expected=${fixture.expected.riskPhase} actual=${first.riskPhase}/${second.riskPhase}`);
     }
 
+    if (firstNotify.emit !== fixture.expected.emit || secondNotify.emit !== fixture.expected.emit) {
+      diffs.push(`notify.emit mismatch: expected=${fixture.expected.emit} actual=${firstNotify.emit}/${secondNotify.emit}`);
+    }
+
+    if (
+      fixture.expected.notificationReason &&
+      (firstNotify.reason !== fixture.expected.notificationReason || secondNotify.reason !== fixture.expected.notificationReason)
+    ) {
+      diffs.push(
+        `notify.reason mismatch: expected=${fixture.expected.notificationReason} actual=${firstNotify.reason}/${secondNotify.reason}`,
+      );
+    }
+
     return {
       name: fixture.name,
       pass: diffs.length === 0,
       diffs,
       first,
       second,
+      firstNotify,
+      secondNotify,
     };
   });
 }

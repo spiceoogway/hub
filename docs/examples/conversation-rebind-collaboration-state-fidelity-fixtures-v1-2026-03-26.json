@@ -1,0 +1,110 @@
+[
+  {
+    "id": 1,
+    "scenario": "straightforward_frame_use_in_stable_thread",
+    "pass": "Recovers the obvious next move in the same live thread and resumes work without requiring narrative replay.",
+    "fail": "Fails to recover the live next move even though the thread, counterparty, and work lane are stable.",
+    "primary_axis": "work_advancement_fidelity",
+    "secondary_axis": "none",
+    "failure_label": "missed_stable_next_move"
+  },
+  {
+    "id": 2,
+    "scenario": "obligation_continuity_across_pause",
+    "pass": "Preserves what is still owed or in flight across a pause and resumes from that obligation state.",
+    "fail": "Resumes the thread while omitting still-live owed work or treating it as resolved without basis.",
+    "primary_axis": "obligation_continuity",
+    "secondary_axis": "work_advancement_fidelity",
+    "failure_label": "obligation_amnesia_after_pause"
+  },
+  {
+    "id": 3,
+    "scenario": "weak_invalidation_but_still_locally_usable",
+    "pass": "Detects mild staleness, updates cautiously, and still uses the frame where it remains locally safe.",
+    "fail": "Either over-trusts a mildly stale frame as fully current or over-invalidates a still-usable frame and loses usable local continuity.",
+    "primary_axis": "mode_fidelity",
+    "secondary_axis": "none",
+    "failure_label": "weak_invalidation_miscalibration"
+  },
+  {
+    "id": 4,
+    "scenario": "strong_invalidation_of_unsafe_frame",
+    "pass": "Recognizes that the prior frame is unsafe to act from and refuses confident continuation from it.",
+    "fail": "Continues acting from a frame whose purpose, assumptions, or state have changed enough to make it unsafe.",
+    "primary_axis": "mode_fidelity",
+    "secondary_axis": "none",
+    "failure_label": "unsafe_frame_reuse"
+  },
+  {
+    "id": 5,
+    "scenario": "silence_waiting_state_preservation",
+    "pass": "Correctly represents a waiting state where the right move is no action yet, without fabricating progress or rewriting the collaboration state.",
+    "fail": "Invents action, escalates prematurely, or treats silence as a cue to collapse the waiting state into a different work state.",
+    "primary_axis": "mode_fidelity",
+    "secondary_axis": "none",
+    "failure_label": "waiting_state_corruption"
+  },
+  {
+    "id": 6,
+    "scenario": "reroute_to_different_thread_or_surface",
+    "pass": "Detects that the active work moved elsewhere and stops using the old local frame as if it were still governing the interaction.",
+    "fail": "Reuses the old frame after the work has clearly shifted threads or surfaces, causing routing or context smearing.",
+    "primary_axis": "mode_fidelity",
+    "secondary_axis": "none",
+    "failure_label": "missed_reroute_after_context_shift"
+  },
+  {
+    "id": 7,
+    "scenario": "valid_frame_irrelevant_to_current_task",
+    "pass": "Leaves a valid historical frame unloaded because it is irrelevant to the present task.",
+    "fail": "Loads and applies a valid but irrelevant frame, contaminating the current task with the wrong local context.",
+    "primary_axis": "mode_fidelity",
+    "secondary_axis": "none",
+    "failure_label": "irrelevant_frame_intrusion"
+  },
+  {
+    "id": 8,
+    "scenario": "cross_surface_divergence_without_smearing",
+    "pass": "Keeps separate local frames for the same counterparty across different surfaces and uses the one that matches the current work surface.",
+    "fail": "Collapses distinct surface-local contexts into one blended frame and acts as if they were the same interaction state.",
+    "primary_axis": "mode_fidelity",
+    "secondary_axis": "none",
+    "failure_label": "cross_surface_frame_smearing"
+  },
+  {
+    "id": 9,
+    "scenario": "interaction_mode_recovery_after_rebind",
+    "pass": "Restores the correct relationship stance for the resumed thread, such as spec iteration vs bug triage vs negotiation.",
+    "fail": "Sounds continuous but adopts the wrong conversational or decision posture for the actual resumed collaboration mode.",
+    "primary_axis": "mode_fidelity",
+    "secondary_axis": "none",
+    "failure_label": "wrong_interaction_mode_after_rebind"
+  },
+  {
+    "id": 10,
+    "scenario": "response_shape_matches_work_state",
+    "pass": "Produces the right kind of move for the work state, not just plausible content, brevity, or tone.",
+    "fail": "Gives a stylistically plausible response whose shape is wrong for the live collaboration state.",
+    "primary_axis": "work_advancement_fidelity",
+    "secondary_axis": "shipment_inference",
+    "failure_label": "response_shape_without_work_state_fit"
+  },
+  {
+    "id": 11,
+    "scenario": "live_subtopic_response_with_prior_obligation_carry_forward",
+    "pass": "Addresses the current subtopic, briefly surfaces the still-open prior obligation, and either ships it if cheap or explicitly marks it as still owed.",
+    "fail": "Responds coherently to the live subtopic while silently dropping still-active owed work from the earlier branch.",
+    "primary_axis": "obligation_continuity",
+    "secondary_axis": "work_advancement_fidelity",
+    "failure_label": "subtopic_continuity_with_obligation_amnesia"
+  },
+  {
+    "id": 12,
+    "scenario": "commentary_vs_shipment_transition",
+    "pass": "Recognizes that the brief affirming turn closes deliberation and that the next correct move is artifact delivery or shipment rather than more analysis.",
+    "fail": "Continues analytical or agreeable commentary even though prior context already established that the right next move is to ship.",
+    "primary_axis": "shipment_inference",
+    "secondary_axis": "work_advancement_fidelity",
+    "failure_label": "missed_shipment_transition"
+  }
+]

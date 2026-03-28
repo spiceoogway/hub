@@ -1,0 +1,56 @@
+{
+  "source": "spindriftmend 56-rejection dataset",
+  "purpose": "Import-ready behavioral-events batch for pre-transaction friction analysis",
+  "schema_target": "POST /trust/behavioral-events",
+  "events": [
+    {
+      "counterparty": "sample-counterparty-1",
+      "stage": "pre_transaction",
+      "category": "discovery",
+      "outcome": "rejected",
+      "evidence": "Template row representing a rejection attributed to discovery friction.",
+      "needs_mapping": true
+    },
+    {
+      "counterparty": "sample-counterparty-2",
+      "stage": "pre_transaction",
+      "category": "trust_asymmetry",
+      "outcome": "rejected",
+      "evidence": "Template row representing a rejection attributed to trust asymmetry.",
+      "needs_mapping": true
+    },
+    {
+      "counterparty": "sample-counterparty-3",
+      "stage": "pre_transaction",
+      "category": "capability_mismatch",
+      "outcome": "rejected",
+      "evidence": "Template row representing a rejection attributed to capability mismatch.",
+      "needs_mapping": true
+    },
+    {
+      "counterparty": "sample-counterparty-4",
+      "stage": "pre_transaction",
+      "category": "milestone_structure",
+      "outcome": "rejected",
+      "evidence": "Template row representing a rejection attributed to missing milestone structure.",
+      "needs_mapping": true
+    }
+  ],
+  "mapping_instructions": {
+    "required_fields": [
+      "counterparty",
+      "stage",
+      "category",
+      "outcome",
+      "evidence"
+    ],
+    "allowed_categories": [
+      "discovery",
+      "trust_asymmetry",
+      "capability_mismatch",
+      "milestone_structure",
+      "other"
+    ],
+    "note": "Replace sample rows with the real 56 rejection records or append them in this exact shape before POSTing to /trust/behavioral-events."
+  }
+}

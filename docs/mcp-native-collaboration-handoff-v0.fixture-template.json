@@ -1,0 +1,76 @@
+{
+  "fixture_id": "example_success_iterative_refinement",
+  "counterparty_id": "testy",
+  "thread_id": "hub-thread-001",
+  "surface": "hub",
+  "new_turn": {
+    "message_id": "incoming-001",
+    "text": "Let's tighten the evaluator table and move to fixtures.",
+    "timestamp": "2026-03-26T06:00:00Z"
+  },
+  "frame": {
+    "counterparty": {
+      "id": "testy",
+      "label": "testy",
+      "relationship_class": "peer",
+      "interaction_pattern": ["iterative", "high_context", "analytical"],
+      "tone_profile": ["direct", "technical"]
+    },
+    "thread": {
+      "id": "hub-thread-001",
+      "surface": "hub",
+      "summary": "Refining the conversation rebind evaluation artifacts.",
+      "current_pressure": "Need clean runner-facing fixtures before coding."
+    },
+    "interaction_mode": {
+      "primary": "refinement",
+      "modifiers": ["critique", "drafting"]
+    },
+    "open_loops": [
+      {
+        "item": "Tighten fixture field separation",
+        "owner": "me",
+        "status": "open",
+        "due_at": null,
+        "risk_if_dropped": "medium"
+      }
+    ],
+    "obligations": [
+      {
+        "item": "Ship cleaned-up fixture matrix",
+        "strength": "explicit",
+        "due_at": null
+      }
+    ],
+    "expected_next_move": {
+      "type": "advance",
+      "detail": "Convert the matrix into cleaner runner-facing fixture structure."
+    },
+    "response_shape": {
+      "verbosity": "tight",
+      "stance": "collaborative_analytical",
+      "should_recap": false,
+      "should_advance": true,
+      "response_form": "proposal"
+    },
+    "surface_constraints": ["Use Hub message format", "Prefer concrete artifacts over theory"],
+    "source_refs": ["hub/docs/mcp-native-collaboration-handoff-v0.test-matrix.json"],
+    "actionability": {
+      "status": "actionable",
+      "blockers": [],
+      "available_actions": ["update_fixture_matrix", "ship_json_fixture_template"]
+    },
+    "silence_policy": {
+      "silence_is_correct_until": null,
+      "reason": "Counterparty requested active progress, not waiting.",
+      "expiry_behavior": "reassess"
+    }
+  },
+  "expected": {
+    "read_decision": "RESPOND_USING_FRAME",
+    "response_form": "proposal",
+    "frame_write_decision": "REFRESH_IF_CONTROL_STATE_CHANGED",
+    "invalidation_strength": "none",
+    "failure_labels_if_wrong": ["wrong_mode", "missed_obligation", "response_shape_error", "genericity"]
+  }
+}

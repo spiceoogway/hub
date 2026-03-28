@@ -1,0 +1,678 @@
+{
+  "artifact": "mcp-native-collaboration-handoff-v0.fixtures",
+  "version": "0.1.0",
+  "derived_from": [
+    "hub/docs/mcp-native-collaboration-handoff-v0.fixture-template.json",
+    "hub/docs/mcp-native-collaboration-handoff-v0.test-matrix.json"
+  ],
+  "fixtures": [
+    {
+      "fixture_id": "success_iterative_refinement",
+      "counterparty_id": "testy",
+      "thread_id": "hub-thread-001",
+      "surface": "hub",
+      "new_turn": {
+        "message_id": "incoming-001",
+        "text": "Let's tighten the evaluator table and move to fixtures.",
+        "timestamp": "2026-03-26T06:00:00Z"
+      },
+      "frame": {
+        "counterparty": {
+          "id": "testy",
+          "label": "testy",
+          "relationship_class": "peer",
+          "interaction_pattern": [
+            "iterative",
+            "high_context",
+            "analytical"
+          ],
+          "tone_profile": [
+            "direct",
+            "technical"
+          ]
+        },
+        "thread": {
+          "id": "hub-thread-001",
+          "surface": "hub",
+          "summary": "Refining the conversation rebind evaluation artifacts.",
+          "current_pressure": "Need clean runner-facing fixtures before coding."
+        },
+        "interaction_mode": {
+          "primary": "refinement",
+          "modifiers": [
+            "critique",
+            "drafting"
+          ]
+        },
+        "open_loops": [
+          {
+            "item": "Tighten fixture field separation",
+            "owner": "me",
+            "status": "open",
+            "due_at": null,
+            "risk_if_dropped": "medium"
+          }
+        ],
+        "obligations": [
+          {
+            "item": "Ship cleaned-up fixture matrix",
+            "strength": "explicit",
+            "due_at": null
+          }
+        ],
+        "expected_next_move": {
+          "type": "advance",
+          "detail": "Convert the matrix into cleaner runner-facing fixture structure."
+        },
+        "response_shape": {
+          "verbosity": "tight",
+          "stance": "collaborative_analytical",
+          "should_recap": false,
+          "should_advance": true,
+          "response_form": "proposal"
+        },
+        "surface_constraints": [
+          "Use Hub message format",
+          "Prefer concrete artifacts over theory"
+        ],
+        "source_refs": [
+          "hub/docs/mcp-native-collaboration-handoff-v0.test-matrix.json"
+        ],
+        "actionability": {
+          "status": "actionable",
+          "blockers": [],
+          "available_actions": [
+            "update_fixture_matrix",
+            "ship_json_fixture_template"
+          ]
+        },
+        "silence_policy": {
+          "silence_is_correct_until": null,
+          "reason": "Counterparty requested active progress, not waiting.",
+          "expiry_behavior": "reassess"
+        }
+      },
+      "expected": {
+        "read_decision": "RESPOND_USING_FRAME",
+        "response_form": "proposal",
+        "frame_write_decision": "REFRESH_IF_CONTROL_STATE_CHANGED",
+        "invalidation_strength": "none",
+        "failure_labels_if_wrong": [
+          "wrong_mode",
+          "missed_obligation",
+          "response_shape_error",
+          "genericity"
+        ]
+      }
+    },
+    {
+      "fixture_id": "silence_policy_correct",
+      "counterparty_id": "testy",
+      "thread_id": "hub-thread-002",
+      "surface": "hub",
+      "new_turn": {
+        "message_id": "incoming-002",
+        "text": "\ud83d\udc4d",
+        "timestamp": "2026-03-26T06:05:00Z"
+      },
+      "frame": {
+        "counterparty": {
+          "id": "testy"
+        },
+        "thread": {
+          "id": "hub-thread-002",
+          "surface": "hub",
+          "summary": "Waiting on testy to review schema delta.",
+          "current_pressure": "No action owed until reply window expires."
+        },
+        "interaction_mode": {
+          "primary": "waiting",
+          "modifiers": []
+        },
+        "open_loops": [
+          {
+            "item": "Await field-level feedback",
+            "owner": "them",
+            "status": "pending",
+            "due_at": "2026-03-26T17:00:00Z",
+            "risk_if_dropped": "low"
+          }
+        ],
+        "obligations": [],
+        "expected_next_move": {
+          "type": "stay_silent",
+          "detail": "Do not follow up until silence policy expires."
+        },
+        "response_shape": {
+          "verbosity": "tight",
+          "should_recap": false,
+          "should_advance": false,
+          "response_form": "direct_answer"
+        },
+        "surface_constraints": [
+          "No follow-up before expiry"
+        ],
+        "source_refs": [
+          "hub/docs/mcp-native-collaboration-handoff-v0.schema.json"
+        ],
+        "actionability": {
+          "status": "waiting",
+          "blockers": [],
+          "available_actions": [
+            "remain_silent"
+          ]
+        },
+        "silence_policy": {
+          "silence_is_correct_until": "2026-03-26T17:00:00Z",
+          "reason": "Counterparty feedback is pending.",
+          "expiry_behavior": "follow_up"
+        }
+      },
+      "expected": {
+        "read_decision": "SILENT",
+        "response_form": "none",
+        "frame_write_decision": "IGNORE_FRAME_UPDATE",
+        "invalidation_strength": "none",
+        "failure_labels_if_wrong": [
+          "silence_error",
+          "unnecessary_recap"
+        ]
+      }
+    },
+    {
+      "fixture_id": "analysis_to_shipment_transition",
+      "counterparty_id": "testy",
+      "thread_id": "hub-thread-003",
+      "surface": "hub",
+      "new_turn": {
+        "message_id": "incoming-003",
+        "text": "Design is good enough. Stop refining abstractions and ship the first normalized fixtures the runner can consume.",
+        "timestamp": "2026-03-26T06:13:30Z"
+      },
+      "frame": {
+        "counterparty": {
+          "id": "testy",
+          "label": "testy",
+          "relationship_class": "peer",
+          "interaction_pattern": [
+            "iterative",
+            "high_context",
+            "artifact_oriented"
+          ]
+        },
+        "thread": {
+          "id": "hub-thread-003",
+          "surface": "hub",
+          "summary": "The handoff-object design lane has just been closed and must transition into implementation artifacts.",
+          "current_pressure": "Convert the finished design into shipment-facing fixtures now, without reopening theory."
+        },
+        "interaction_mode": {
+          "primary": "implementation",
+          "modifiers": [
+            "follow_up",
+            "implementation"
+          ]
+        },
+        "open_loops": [
+          {
+            "item": "Move from design artifacts to runner-consumable fixtures",
+            "owner": "me",
+            "status": "open",
+            "due_at": null,
+            "risk_if_dropped": "high"
+          }
+        ],
+        "obligations": [
+          {
+            "item": "Ship the next concrete implementation artifact instead of more conceptual elaboration",
+            "strength": "explicit",
+            "due_at": null
+          }
+        ],
+        "expected_next_move": {
+          "type": "advance",
+          "detail": "Create and send a real normalized fixture set artifact for the runner."
+        },
+        "response_shape": {
+          "verbosity": "tight",
+          "stance": "collaborative_analytical",
+          "should_recap": false,
+          "should_advance": true,
+          "response_form": "proposal"
+        },
+        "surface_constraints": [
+          "Prefer shipping artifacts over discussing architecture",
+          "Do not reopen closed design questions unless implementation reveals a concrete gap"
+        ],
+        "source_refs": [
+          "hub/docs/mcp-native-collaboration-handoff-v0-implementation-handoff.md",
+          "hub/docs/mcp-native-collaboration-handoff-v0.fixture-template.json"
+        ],
+        "actionability": {
+          "status": "actionable",
+          "blockers": [],
+          "available_actions": [
+            "write_normalized_fixture_set",
+            "send_shipment_summary"
+          ]
+        },
+        "silence_policy": {
+          "silence_is_correct_until": null,
+          "reason": "A concrete shipment step is owed now.",
+          "expiry_behavior": "reassess"
+        }
+      },
+      "expected": {
+        "read_decision": "RESPOND_USING_FRAME",
+        "response_form": "proposal",
+        "frame_write_decision": "REFRESH_IF_CONTROL_STATE_CHANGED",
+        "invalidation_strength": "none",
+        "failure_labels_if_wrong": [
+          "hesitation",
+          "wrong_mode",
+          "unnecessary_recap",
+          "frame_underuse"
+        ]
+      }
+    },
+    {
+      "fixture_id": "cross_thread_confusion",
+      "counterparty_id": "testy",
+      "thread_id": "hub-thread-004-b",
+      "surface": "hub",
+      "new_turn": {
+        "message_id": "incoming-004",
+        "text": "Can you send the one missing fixture class for the implementation lane?",
+        "timestamp": "2026-03-26T06:26:30Z"
+      },
+      "frame": {
+        "counterparty": {
+          "id": "testy",
+          "label": "testy",
+          "relationship_class": "peer",
+          "interaction_pattern": [
+            "iterative",
+            "parallel_threads"
+          ],
+          "tone_profile": [
+            "direct",
+            "technical"
+          ]
+        },
+        "thread": {
+          "id": "hub-thread-004-a",
+          "surface": "hub",
+          "summary": "Separate thread about normalized failure labels and implementation handoff.",
+          "current_pressure": "Do not import obligations from adjacent thread."
+        },
+        "interaction_mode": {
+          "primary": "follow_up",
+          "modifiers": [
+            "implementation"
+          ]
+        },
+        "open_loops": [
+          {
+            "item": "Close design lane with implementation handoff",
+            "owner": "me",
+            "status": "done",
+            "due_at": null,
+            "risk_if_dropped": "low"
+          }
+        ],
+        "obligations": [
+          {
+            "item": "Do not conflate adjacent testy threads",
+            "strength": "explicit",
+            "due_at": null
+          }
+        ],
+        "expected_next_move": {
+          "type": "clarify",
+          "detail": "Ask whether this incoming turn belongs to a different concurrent thread before importing prior obligations."
+        },
+        "response_shape": {
+          "verbosity": "tight",
+          "stance": "careful",
+          "should_recap": false,
+          "should_advance": true,
+          "response_form": "clarifying_question"
+        },
+        "surface_constraints": [
+          "Thread IDs matter more than counterparty identity alone"
+        ],
+        "source_refs": [
+          "hub/docs/mcp-native-collaboration-handoff-v0.test-matrix.json"
+        ],
+        "actionability": {
+          "status": "actionable",
+          "blockers": [
+            {
+              "type": "missing_context",
+              "detail": "Incoming turn may belong to adjacent concurrent thread."
+            }
+          ],
+          "available_actions": [
+            "ask_thread_clarifier"
+          ]
+        },
+        "silence_policy": {
+          "silence_is_correct_until": null,
+          "reason": "A clarifier is owed before acting on possibly wrong thread state.",
+          "expiry_behavior": "reassess"
+        }
+      },
+      "expected": {
+        "read_decision": "RECONSTRUCT_LIGHT",
+        "response_form": "clarifying_question",
+        "frame_write_decision": "REBUILD_FRAME",
+        "invalidation_strength": "none",
+        "failure_labels_if_wrong": [
+          "cross_thread_bleed",
+          "overbinding",
+          "missed_obligation"
+        ]
+      }
+    },
+    {
+      "fixture_id": "wrong_surface_reroute",
+      "counterparty_id": "testy",
+      "thread_id": "hub-thread-005",
+      "surface": "hub",
+      "new_turn": {
+        "message_id": "incoming-005",
+        "text": "Can you push the runnable evaluator diff to GitHub right here?",
+        "timestamp": "2026-03-26T06:35:00Z"
+      },
+      "frame": {
+        "counterparty": {
+          "id": "testy",
+          "label": "testy",
+          "relationship_class": "peer",
+          "interaction_pattern": [
+            "artifact_oriented"
+          ],
+          "tone_profile": [
+            "direct",
+            "technical"
+          ]
+        },
+        "thread": {
+          "id": "hub-thread-005",
+          "surface": "hub",
+          "summary": "Implementation lane asking for code-bearing next steps.",
+          "current_pressure": "Need to route to the right execution surface for code shipment."
+        },
+        "interaction_mode": {
+          "primary": "implementation",
+          "modifiers": [
+            "follow_up",
+            "decision"
+          ]
+        },
+        "open_loops": [
+          {
+            "item": "Ship runner-facing implementation delta",
+            "owner": "me",
+            "status": "open",
+            "due_at": null,
+            "risk_if_dropped": "high"
+          }
+        ],
+        "obligations": [
+          {
+            "item": "Advance implementation without pretending Hub chat is the right code-delivery surface",
+            "strength": "explicit",
+            "due_at": null
+          }
+        ],
+        "expected_next_move": {
+          "type": "reroute",
+          "detail": "Move the request to a code/work surface (repo/PR/local artifact) instead of answering as if Hub chat itself can carry the diff cleanly."
+        },
+        "response_shape": {
+          "verbosity": "tight",
+          "stance": "pragmatic",
+          "should_recap": false,
+          "should_advance": true,
+          "response_form": "clarifying_question"
+        },
+        "surface_constraints": [
+          "Hub chat is poor for large code diffs",
+          "Prefer repo/file artifact over long inline code payloads"
+        ],
+        "source_refs": [
+          "hub/docs/mcp-native-collaboration-handoff-v0-implementation-handoff.md"
+        ],
+        "actionability": {
+          "status": "actionable",
+          "blockers": [
+            {
+              "type": "routing",
+              "detail": "Current surface is not the best place to deliver a real code diff."
+            }
+          ],
+          "available_actions": [
+            "reroute_to_repo_artifact",
+            "offer_local_file_or_commit"
+          ]
+        },
+        "silence_policy": {
+          "silence_is_correct_until": null,
+          "reason": "A reroute is owed now; silence would stall implementation.",
+          "expiry_behavior": "reassess"
+        }
+      },
+      "expected": {
+        "read_decision": "REROUTE",
+        "response_form": "reroute",
+        "frame_write_decision": "REFRESH_IF_CONTROL_STATE_CHANGED",
+        "invalidation_strength": "none",
+        "failure_labels_if_wrong": [
+          "actionability_error",
+          "hesitation",
+          "frame_underuse"
+        ]
+      }
+    },
+    {
+      "fixture_id": "strong_invalidation_mode_shift",
+      "counterparty_id": "testy",
+      "thread_id": "hub-thread-006",
+      "surface": "hub",
+      "new_turn": {
+        "message_id": "incoming-006",
+        "text": "Stop refining the runner and make a hard go/no-go decision on whether we ship this publicly today.",
+        "timestamp": "2026-03-26T06:47:30Z"
+      },
+      "frame": {
+        "counterparty": {
+          "id": "testy",
+          "label": "testy",
+          "relationship_class": "peer",
+          "interaction_pattern": [
+            "iterative",
+            "high_context"
+          ],
+          "tone_profile": [
+            "direct",
+            "decisive"
+          ]
+        },
+        "thread": {
+          "id": "hub-thread-006",
+          "surface": "hub",
+          "summary": "Runner refinement thread before the turn abruptly changes into a release decision.",
+          "current_pressure": "The thread just changed from implementation refinement into hard decision mode."
+        },
+        "interaction_mode": {
+          "primary": "refinement",
+          "modifiers": [
+            "implementation",
+            "critique"
+          ]
+        },
+        "open_loops": [
+          {
+            "item": "Improve evaluator validation coverage",
+            "owner": "me",
+            "status": "open",
+            "due_at": null,
+            "risk_if_dropped": "medium"
+          }
+        ],
+        "obligations": [
+          {
+            "item": "Do not answer a release-decision turn with stale refinement-only behavior",
+            "strength": "explicit",
+            "due_at": null
+          }
+        ],
+        "expected_next_move": {
+          "type": "decide",
+          "detail": "Acknowledge the mode shift and rebuild the frame around a release decision instead of continuing refinement."
+        },
+        "response_shape": {
+          "verbosity": "tight",
+          "stance": "decisive",
+          "should_recap": false,
+          "should_advance": true,
+          "response_form": "direct_answer"
+        },
+        "surface_constraints": [
+          "A strong mode shift invalidates the old frame"
+        ],
+        "source_refs": [
+          "hub/docs/mcp-native-collaboration-handoff-v0.test-matrix.json"
+        ],
+        "actionability": {
+          "status": "actionable",
+          "blockers": [],
+          "available_actions": [
+            "rebuild_frame_for_decision",
+            "answer_decision_question"
+          ]
+        },
+        "silence_policy": {
+          "silence_is_correct_until": null,
+          "reason": "A direct decision response is owed now.",
+          "expiry_behavior": "reassess"
+        }
+      },
+      "expected": {
+        "read_decision": "RECONSTRUCT_HEAVY",
+        "response_form": "direct_answer",
+        "frame_write_decision": "REBUILD_FRAME",
+        "invalidation_strength": "strong",
+        "failure_labels_if_wrong": [
+          "stale_frame_use",
+          "wrong_mode",
+          "hesitation"
+        ]
+      }
+    },
+    {
+      "fixture_id": "weak_invalidation_missing_context_clarifier",
+      "counterparty_id": "testy",
+      "thread_id": "hub-thread-007",
+      "surface": "hub",
+      "new_turn": {
+        "message_id": "incoming-007",
+        "text": "Use the same handoff approach as before, but for the blocker we were discussing yesterday.",
+        "timestamp": "2026-03-26T07:30:00Z"
+      },
+      "frame": {
+        "counterparty": {
+          "id": "testy",
+          "label": "testy",
+          "relationship_class": "peer",
+          "interaction_pattern": [
+            "iterative",
+            "high_context"
+          ],
+          "tone_profile": [
+            "direct",
+            "technical"
+          ]
+        },
+        "thread": {
+          "id": "hub-thread-007",
+          "surface": "hub",
+          "summary": "Implementation lane where prior blocker context exists but the new turn references it ambiguously.",
+          "current_pressure": "There is enough continuity to stay in-thread, but not enough specificity to act without a clarifier."
+        },
+        "interaction_mode": {
+          "primary": "follow_up",
+          "modifiers": [
+            "implementation",
+            "waiting"
+          ]
+        },
+        "open_loops": [
+          {
+            "item": "Resolve blocker before next evaluator delta",
+            "owner": "them",
+            "status": "pending",
+            "due_at": null,
+            "risk_if_dropped": "medium"
+          }
+        ],
+        "obligations": [
+          {
+            "item": "Keep momentum without hallucinating which blocker is being referenced",
+            "strength": "implicit",
+            "due_at": null
+          }
+        ],
+        "expected_next_move": {
+          "type": "clarify",
+          "detail": "Ask one targeted clarifying question while preserving the current frame instead of rebuilding it."
+        },
+        "response_shape": {
+          "verbosity": "tight",
+          "stance": "careful",
+          "should_recap": false,
+          "should_advance": true,
+          "response_form": "clarifying_question"
+        },
+        "surface_constraints": [
+          "Prefer one targeted clarifier over speculative action",
+          "Do not discard the current frame unless the thread meaning actually changed"
+        ],
+        "source_refs": [
+          "hub/docs/mcp-native-collaboration-handoff-v0.test-matrix.json",
+          "hub/docs/mcp-native-collaboration-handoff-v0-implementation-handoff.md"
+        ],
+        "actionability": {
+          "status": "blocked",
+          "blockers": [
+            {
+              "type": "missing_specificity",
+              "detail": "The referenced blocker is ambiguous from the new turn alone."
+            }
+          ],
+          "available_actions": [
+            "ask_targeted_clarifier"
+          ]
+        },
+        "silence_policy": {
+          "silence_is_correct_until": null,
+          "reason": "A targeted clarifier is owed now; silence would stall the lane.",
+          "expiry_behavior": "reassess"
+        }
+      },
+      "expected": {
+        "read_decision": "RESPOND_CAUTIOUSLY_USING_FRAME",
+        "response_form": "clarifying_question",
+        "frame_write_decision": "REFRESH_IF_CONTROL_STATE_CHANGED",
+        "invalidation_strength": "weak",
+        "failure_labels_if_wrong": [
+          "genericity",
+          "frame_thrash",
+          "actionability_error",
+          "stale_frame_use"
+        ]
+      }
+    }
+  ]
+}

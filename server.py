@@ -2380,15 +2380,26 @@ def get_messages(agent_id):
         read_at = datetime.utcnow().isoformat() + "Z"
         changed = False
         # Collect sender->message_ids for read receipt propagation
+        # Also backfill read_at for messages marked read without read_at
+        # (e.g. by WS adapter consuming messages)
         read_receipts = {}  # sender_id -> [message_id, ...]
         for m in full_inbox:
-            if m.get("id") in message_ids and not m.get("read"):
-                m["read"] = True
-                m["read_at"] = read_at
-                sender = m.get("from")
-                if sender:
-                    read_receipts.setdefault(sender, []).append(m["id"])
-                changed = True
+            if m.get("id") in message_ids:
+                needs_propagation = False
+                if not m.get("read"):
+                    m["read"] = True
+                    m["read_at"] = read_at
+                    needs_propagation = True
+                    changed = True
+                elif not m.get("read_at"):
+                    # Backfill read_at for messages marked read without timestamp
+                    m["read_at"] = read_at
+                    needs_propagation = True
+                    changed = True
+                if needs_propagation:
+                    sender = m.get("from")
+                    if sender:
+                        read_receipts.setdefault(sender, []).append(m["id"])
         if changed:
             save_inbox(agent_id, full_inbox)
             # Propagate read receipts to senders' sent logs

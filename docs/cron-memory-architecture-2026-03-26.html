@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Brain System Architecture — Cron + Memory Stack</title>
+  <style>
+    :root {
+      --bg:#0b1020; --panel:#121933; --panel2:#172041; --text:#e9eefc; --muted:#9fb0d8;
+      --accent:#73e0a9; --accent2:#6bb6ff; --warn:#ffd166; --danger:#ff7b7b; --border:#2a3566;
+      --mono: ui-monospace, SFMono-Regular, Menlo, monospace; --sans: Inter, system-ui, sans-serif;
+    }
+    * { box-sizing:border-box; }
+    body { margin:0; font-family:var(--sans); background:linear-gradient(180deg,#0b1020,#0e1330); color:var(--text); }
+    .wrap { max-width:1200px; margin:0 auto; padding:32px 20px 80px; }
+    h1,h2,h3 { line-height:1.1; }
+    h1 { font-size:42px; margin:0 0 8px; }
+    h2 { font-size:28px; margin:40px 0 16px; }
+    h3 { font-size:20px; margin:20px 0 10px; }
+    p, li { color:var(--text); opacity:.96; }
+    .sub { color:var(--muted); font-size:18px; margin-bottom:24px; }
+    .grid { display:grid; gap:16px; }
+    .g2 { grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); }
+    .card { background:rgba(18,25,51,.92); border:1px solid var(--border); border-radius:16px; padding:18px; box-shadow:0 10px 30px rgba(0,0,0,.25); }
+    .tag { display:inline-block; padding:4px 10px; border-radius:999px; background:#1d2850; color:var(--muted); font-size:12px; margin:0 8px 8px 0; border:1px solid var(--border); }
+    code, pre { font-family:var(--mono); }
+    pre { background:#0a0f22; border:1px solid var(--border); padding:14px; border-radius:12px; overflow:auto; color:#dfe8ff; }
+    .flow { display:grid; grid-template-columns:1fr; gap:14px; }
+    .box { background:var(--panel2); border:1px solid var(--border); border-radius:14px; padding:16px; position:relative; }
+    .arrow { text-align:center; color:var(--accent2); font-size:28px; }
+    .pill { display:inline-block; padding:6px 10px; border-radius:10px; font-size:12px; font-weight:700; }
+    .green { background:rgba(115,224,169,.12); color:var(--accent); border:1px solid rgba(115,224,169,.25); }
+    .blue { background:rgba(107,182,255,.12); color:var(--accent2); border:1px solid rgba(107,182,255,.25); }
+    .yellow { background:rgba(255,209,102,.12); color:var(--warn); border:1px solid rgba(255,209,102,.25); }
+    .red { background:rgba(255,123,123,.12); color:var(--danger); border:1px solid rgba(255,123,123,.25); }
+    .layers { display:grid; gap:14px; }
+    .layer { border-left:5px solid var(--accent2); background:var(--panel); border-radius:14px; padding:16px 18px; }
+    .layer.l1 { border-color:#a98bff; } .layer.l2 { border-color:#6bb6ff; } .layer.l3 { border-color:#73e0a9; } .layer.l4 { border-color:#ffd166; }
+    .small { font-size:14px; color:var(--muted); }
+    .center { text-align:center; }
+    .diagram { background:#0a0f22; border:1px solid var(--border); border-radius:16px; padding:24px; }
+    svg text { font-family:var(--sans); fill:var(--text); }
+    a { color:#93c8ff; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="tag">OpenClaw / Brain</div>
+  <div class="tag">Cron architecture</div>
+  <div class="tag">Layered memory</div>
+  <div class="tag">Updated 2026-03-26</div>
+  <h1>Brain System Architecture</h1>
+  <div class="sub">How the cron system, memory stack, synthesis loops, and product-facing actions fit together right now.</div>
+
+  <div class="card">
+    <h2 style="margin-top:0">Executive summary</h2>
+    <p>This system has four main moving parts:</p>
+    <ol>
+      <li><b>Crons</b> schedule agent work across families: <code>distribution</code>, <code>hub</code>, <code>experiments</code>, and <code>synthesis</code>.</li>
+      <li><b>Context assemblers</b> create task-specific dynamic context for each cron so it does not run blind.</li>
+      <li><b>Artifacts</b> are written as structured JSON into <code>cron-output/&lt;family&gt;/</code> and indexed via <code>latest-*.json</code>.</li>
+      <li><b>Memory layers</b> decide what should remain ephemeral, tactical, durable, or identity-level.</li>
+    </ol>
+    <p>The design goal is: <b>observe reality → synthesize learning → update tactical state → change behavior</b>.</p>
+  </div>
+
+  <h2>1. Layered memory model</h2>
+  <div class="layers">
+    <div class="layer l1">
+      <h3>Layer 1 — Identity</h3>
+      <p><code>SOUL.md</code>, <code>USER.md</code></p>
+      <p class="small">Who Brain is, who Hands is, deepest operating identity. Changes rarely.</p>
+    </div>
+    <div class="layer l2">
+      <h3>Layer 2 — Durable knowledge</h3>
+      <p><code>AGENTS.md</code>, <code>MEMORY.md</code></p>
+      <p class="small">Validated lessons, durable truths, frameworks that should survive a sprint change.</p>
+    </div>
+    <div class="layer l3">
+      <h3>Layer 3 — Tactical state</h3>
+      <p><code>HEARTBEAT.md</code></p>
+      <p class="small">Current priorities, active hypotheses, current counterparties, what matters now.</p>
+    </div>
+    <div class="layer l4">
+      <h3>Layer 4 — Ephemeral evidence</h3>
+      <p><code>memory/YYYY-MM-DD.md</code>, cron artifacts, live logs, recent outputs</p>
+      <p class="small">Raw daily evidence and one-off incidents. Useful now, not necessarily durable.</p>
+    </div>
+  </div>
+
+  <h2>2. Cron families</h2>
+  <div class="grid g2">
+    <div class="card"><h3>Distribution</h3><p>Posts, comment replies, Hub conversion attempts, performance review.</p><span class="pill yellow">Goal: attract and convert</span></div>
+    <div class="card"><h3>Hub</h3><p>Pending replies, stalled thread revival, collaboration advance, collaboration audit.</p><span class="pill green">Goal: deepen active work</span></div>
+    <div class="card"><h3>Experiments</h3><p>Evidence collection, problem presentation, falsification, product tests.</p><span class="pill blue">Goal: test hypotheses</span></div>
+    <div class="card"><h3>Synthesis</h3><p>Evidence aggregation, hypothesis steering, system audit, memory promotion.</p><span class="pill red">Goal: metabolize learning</span></div>
+  </div>
+
+  <h2>3. Runtime flow</h2>
+  <div class="flow">
+    <div class="box"><b>Step 1 — Scheduler fires a cron</b><br><span class="small">Jobs are defined in <code>~/.openclaw/cron/jobs.json</code>.</span></div>
+    <div class="arrow">↓</div>
+    <div class="box"><b>Step 2 — Static job contract loads</b><br><span class="small">The cron has a stable role, schedule, and base prompt.</span></div>
+    <div class="arrow">↓</div>
+    <div class="box"><b>Step 3 — Dynamic context gets assembled</b><br><span class="small">A task-specific Python script reads recent artifacts, Hub state, memory, and synthesis signals.</span></div>
+    <div class="arrow">↓</div>
+    <div class="box"><b>Step 4 — Isolated agent run executes</b><br><span class="small">The agent performs one concrete task and writes a structured JSON artifact.</span></div>
+    <div class="arrow">↓</div>
+    <div class="box"><b>Step 5 — Artifact lands in cron-output</b><br><span class="small">Written to <code>cron-output/&lt;family&gt;/YYYY-...json</code> and mirrored into <code>latest-*.json</code>.</span></div>
+    <div class="arrow">↓</div>
+    <div class="box"><b>Step 6 — Post-processors update memory layers</b><br><span class="small"><code>apply-synthesis.py</code> updates Layer 3; <code>apply-memory.py</code> updates Layer 2.</span></div>
+  </div>
+
+  <h2>4. The actual file/data flow</h2>
+  <div class="diagram">
+    <svg viewBox="0 0 1100 640" width="100%" height="auto" aria-label="System architecture diagram">
+      <rect x="40" y="40" width="280" height="90" rx="14" fill="#172041" stroke="#2a3566"/>
+      <text x="60" y="75" font-size="22">Cron scheduler</text>
+      <text x="60" y="105" font-size="15" fill="#9fb0d8">~/.openclaw/cron/jobs.json</text>
+
+      <rect x="390" y="40" width="300" height="90" rx="14" fill="#172041" stroke="#2a3566"/>
+      <text x="410" y="75" font-size="22">Context assembler</text>
+      <text x="410" y="105" font-size="15" fill="#9fb0d8">infra/cron_bus/context-*.py</text>
+
+      <rect x="760" y="40" width="300" height="90" rx="14" fill="#172041" stroke="#2a3566"/>
+      <text x="780" y="75" font-size="22">Isolated agent run</text>
+      <text x="780" y="105" font-size="15" fill="#9fb0d8">sessionTarget=isolated</text>
+
+      <line x1="320" y1="85" x2="390" y2="85" stroke="#6bb6ff" stroke-width="3"/>
+      <line x1="690" y1="85" x2="760" y2="85" stroke="#6bb6ff" stroke-width="3"/>
+
+      <rect x="120" y="220" width="320" height="100" rx="14" fill="#172041" stroke="#2a3566"/>
+      <text x="145" y="255" font-size="22">Structured artifact</text>
+      <text x="145" y="285" font-size="15" fill="#9fb0d8">cron-output/&lt;family&gt;/YYYY-...json</text>
+      <text x="145" y="307" font-size="15" fill="#9fb0d8">latest-&lt;job&gt;.json</text>
+
+      <rect x="520" y="220" width="250" height="100" rx="14" fill="#172041" stroke="#2a3566"/>
+      <text x="545" y="255" font-size="22">Layer 3 update</text>
+      <text x="545" y="285" font-size="15" fill="#9fb0d8">apply-synthesis.py</text>
+      <text x="545" y="307" font-size="15" fill="#9fb0d8">→ HEARTBEAT.md</text>
+
+      <rect x="840" y="220" width="220" height="100" rx="14" fill="#172041" stroke="#2a3566"/>
+      <text x="865" y="255" font-size="22">Layer 2 update</text>
+      <text x="865" y="285" font-size="15" fill="#9fb0d8">apply-memory.py</text>
+      <text x="865" y="307" font-size="15" fill="#9fb0d8">→ MEMORY.md</text>
+
+      <line x1="760" y1="130" x2="280" y2="220" stroke="#73e0a9" stroke-width="3"/>
+      <line x1="280" y1="320" x2="645" y2="320" stroke="#73e0a9" stroke-width="3"/>
+      <line x1="440" y1="270" x2="520" y2="270" stroke="#6bb6ff" stroke-width="3"/>
+      <line x1="770" y1="270" x2="840" y2="270" stroke="#ffd166" stroke-width="3"/>
+
+      <rect x="40" y="420" width="280" height="120" rx="14" fill="#172041" stroke="#2a3566"/>
+      <text x="60" y="455" font-size="22">Layer 4 evidence</text>
+      <text x="60" y="485" font-size="15" fill="#9fb0d8">daily logs</text>
+      <text x="60" y="507" font-size="15" fill="#9fb0d8">recent cron outputs</text>
+      <text x="60" y="529" font-size="15" fill="#9fb0d8">Hub state / logs / incidents</text>
+
+      <rect x="400" y="420" width="300" height="120" rx="14" fill="#172041" stroke="#2a3566"/>
+      <text x="420" y="455" font-size="22">Layer 3 tactical state</text>
+      <text x="420" y="485" font-size="15" fill="#9fb0d8">HEARTBEAT.md</text>
+      <text x="420" y="507" font-size="15" fill="#9fb0d8">current strategy / priorities</text>
+      <text x="420" y="529" font-size="15" fill="#9fb0d8">active hypotheses</text>
+
+      <rect x="790" y="420" width="270" height="120" rx="14" fill="#172041" stroke="#2a3566"/>
+      <text x="810" y="455" font-size="22">Layer 2 durable knowledge</text>
+      <text x="810" y="485" font-size="15" fill="#9fb0d8">MEMORY.md</text>
+      <text x="810" y="507" font-size="15" fill="#9fb0d8">validated lessons</text>
+      <text x="810" y="529" font-size="15" fill="#9fb0d8">sprint-independent truths</text>
+
+      <line x1="180" y1="320" x2="180" y2="420" stroke="#ffd166" stroke-width="3"/>
+      <line x1="645" y1="320" x2="550" y2="420" stroke="#73e0a9" stroke-width="3"/>
+      <line x1="950" y1="320" x2="925" y2="420" stroke="#a98bff" stroke-width="3"/>
+    </svg>
+  </div>
+
+  <h2>5. Where context comes from</h2>
+  <div class="grid g2">
+    <div class="card">
+      <h3>Recent artifacts</h3>
+      <p>Each context script reads recent JSON artifacts from <code>cron-output/</code>.</p>
+    </div>
+    <div class="card">
+      <h3>Latest indexes</h3>
+      <p><code>latest-*.json</code> gives each cron quick access to the latest state of other families.</p>
+    </div>
+    <div class="card">
+      <h3>Hub APIs / data</h3>
+      <p>Some contexts call local Hub endpoints like <code>/collaboration</code> or <code>/obligations</code>, or read <code>hub-data/</code> files directly.</p>
+    </div>
+    <div class="card">
+      <h3>Synthesis signals</h3>
+      <p><code>synthesis_signals.py</code> extracts compact tactical signals from synthesis artifacts for action crons.</p>
+    </div>
+  </div>
+
+  <h2>6. What was recently fixed</h2>
+  <div class="grid g2">
+    <div class="card">
+      <h3>Gap 1</h3>
+      <p><span class="pill green">Closed</span> Synthesis can now update Layer 3 tactical memory via <code>apply-synthesis.py</code>.</p>
+    </div>
+    <div class="card">
+      <h3>Gaps 2–3</h3>
+      <p><span class="pill yellow">Partially closed</span> Action crons read more dynamic context, but hard static contracts still needed rewriting to stop tactic-forcing.</p>
+    </div>
+    <div class="card">
+      <h3>Gap 4</h3>
+      <p><span class="pill green">Structurally closed</span> Distribution review now checks attributable Hub outcomes, not just surface engagement.</p>
+    </div>
+    <div class="card">
+      <h3>Gap 5</h3>
+      <p><span class="pill yellow">Structurally closed, behaviorally young</span> Weekly memory promotion path now exists from Layer 4 to Layer 2.</p>
+    </div>
+  </div>
+
+  <h2>7. Current weak spots</h2>
+  <div class="card">
+    <ul>
+      <li><b>Attribution is still heuristic.</b> Gap 4 is much better, but direct causal joins are still weaker than explicit acquisition/source tracking.</li>
+      <li><b>Static contracts still matter.</b> Dynamic context helps, but jobs still need well-designed top-level mission prompts.</li>
+      <li><b>Memory rewrite path is powerful but brittle.</b> A bad artifact could rewrite <code>MEMORY.md</code> poorly unless additional validation / diff guards are added.</li>
+      <li><b>The real product test is external usage.</b> Internal architecture only matters if it improves actual customer discovery, collaboration, and retention.</li>
+    </ul>
+  </div>
+
+  <h2>8. Files worth knowing</h2>
+  <pre>~/.openclaw/cron/jobs.json
+~/.openclaw/workspace/cron-output/&lt;family&gt;/
+~/.openclaw/workspace/infra/cron_bus/context-*.py
+~/.openclaw/workspace/infra/cron_bus/apply-synthesis.py
+~/.openclaw/workspace/infra/cron_bus/apply-memory.py
+~/.openclaw/workspace/HEARTBEAT.md
+~/.openclaw/workspace/MEMORY.md
+~/.openclaw/workspace/memory/YYYY-MM-DD.md
+~/.openclaw/workspace/hub-data/
+</pre>
+
+  <div class="card center">
+    <h2 style="margin-top:0">Reference URL</h2>
+    <p><a href="https://admin.slate.ceo/oc/brain/static/cron-memory-architecture-2026-03-26.html">https://admin.slate.ceo/oc/brain/static/cron-memory-architecture-2026-03-26.html</a></p>
+    <p class="small">Hosted from the server so you can reference it or show people directly.</p>
+  </div>
+</div>
+</body>
+</html>
