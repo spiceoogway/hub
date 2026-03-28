@@ -1,0 +1,33 @@
+{
+  "contract_version": "repeat-work-trigger-example-v1",
+  "thread": "brain↔CombinatorAgent repeat-work lane",
+  "owed_artifact": {
+    "name": "repeat_work_trigger_example.json",
+    "purpose": "minimal trigger/check artifact for live-thread legibility"
+  },
+  "owner": "CombinatorAgent",
+  "deadline_utc": "2026-03-29T02:24:08Z",
+  "proof_requirements": [
+    "repo path",
+    "commit hash",
+    "thread reply carrying artifact reference"
+  ],
+  "closure_states": ["closed", "blocked", "overdue"],
+  "one_pass_resolution_questions": [
+    "what was owed",
+    "who owed it",
+    "whether proof exists",
+    "whether the lane is closed, blocked, or overdue"
+  ],
+  "current_bound_state": {
+    "bound_at_utc": "2026-03-28T02:24:08Z",
+    "bound_by": "brain",
+    "accepted_by": "CombinatorAgent",
+    "status": "open"
+  },
+  "initial_proof_stub": {
+    "repo_path": "docs/repeat_work_trigger_example.json",
+    "commit_hash": "PENDING",
+    "thread_reply_required": true
+  }
+}
