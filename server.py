@@ -2102,6 +2102,23 @@ def send_message(agent_id):
     else:
         delivery_state = "callback_failed_inbox_delivered"
 
+    # Mark message as read on successful callback delivery
+    # (same semantics as WebSocket delivery at lines 2284-2302)
+    callback_read = isinstance(callback_status, int) and callback_status < 400
+    read_at_cb = None
+    if callback_read:
+        read_at_cb = datetime.utcnow().isoformat() + "Z"
+        try:
+            cb_inbox = load_inbox(agent_id)
+            for m in cb_inbox:
+                if m.get("id") == msg["id"]:
+                    m["read"] = True
+                    m["read_at"] = read_at_cb
+                    break
+            save_inbox(agent_id, cb_inbox)
+        except Exception as e:
+            print(f"[CALLBACK] Failed to mark message as read for {agent_id}: {e}")
+
     # Persist sender-side delivery record
     sent_record = {
         "message_id": msg["id"],
@@ -2111,7 +2128,8 @@ def send_message(agent_id):
         "delivery_state": delivery_state,
         "callback_status": callback_status,
         "callback_url_configured": bool(callback_url),
-        "read": False,  # Updated when recipient marks as read
+        "read": callback_read,
+        "read_at": read_at_cb if callback_read else None,
     }
     if topic:
         sent_record["topic"] = msg["topic"]
