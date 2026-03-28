@@ -12126,8 +12126,9 @@ def report_scope_violation(obl_id):
     if not obl:
         return jsonify({"error": "not found"}), 404
 
-    if not _obl_auth(obl, agent_id):
-        return jsonify({"error": "not a party to this obligation"}), 403
+    # Any authenticated agent can report violations (governance agents need this)
+    # _obl_auth is NOT required here — docstring says "any party or governance layer"
+    is_party = _obl_auth(obl, agent_id)
 
     if obl["status"] in ("resolved", "rejected", "withdrawn", "failed"):
         return jsonify({"error": f"obligation is terminal ({obl['status']}), cannot report violations"}), 409
@@ -12136,6 +12137,7 @@ def report_scope_violation(obl_id):
     violation_entry = {
         "reported_at": now,
         "reported_by": agent_id,
+        "reporter_is_party": is_party,
         "action": violation.get("action"),       # READ, WRITE, EXEC, NET
         "target": violation.get("target"),         # file path, URL, command
         "blocked": violation.get("blocked", True), # was it actually blocked?
@@ -12178,20 +12180,24 @@ def request_scope_expansion(obl_id):
     now = datetime.utcnow().isoformat() + "Z"
     tier = expansion.get("tier", 1)
 
-    # Tier 2 expansions (dependency-derived) are auto-approved
-    # Tier 1 expansions (outside declared scope) are logged as pending
-    auto_approved = tier == 2
+    # Tier 2 expansions (dependency-derived) are auto-approved for READ/EXEC only
+    # NET and WRITE are never auto-approved regardless of tier (ClawHavoc vector)
+    # Tier 1 expansions (outside declared scope) are always logged as pending
+    action = expansion.get("action", "").upper()
+    never_auto_approve = action in ("NET", "WRITE")
+    auto_approved = tier == 2 and not never_auto_approve
     
     expansion_entry = {
         "requested_at": now,
         "requested_by": agent_id,
-        "action": expansion.get("action"),         # READ, WRITE, EXEC, NET
+        "action": action,                           # READ, WRITE, EXEC, NET
         "expanded_to": expansion.get("target"),     # file path, URL, command
         "reason": expansion.get("reason"),          # why expansion is needed
         "tier": tier,                               # which tier this falls under
-        "approved": auto_approved,                  # tier 2 = auto, tier 1 = needs review
+        "approved": auto_approved,                  # tier 2 READ/EXEC = auto, all others = needs review
         "approved_by": "tier2_auto" if auto_approved else None,
         "approved_at": now if auto_approved else None,
+        "auto_approve_blocked": "NET/WRITE never auto-approve" if never_auto_approve and tier == 2 else None,
     }
     obl.setdefault("scope_expansion_log", []).append(expansion_entry)
     save_obligations(obls)
