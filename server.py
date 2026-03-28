@@ -15091,3 +15091,296 @@ def public_rebind_briefing(agent_a, agent_b):
     # Adapter cache hint: 5 min max-age, allow stale-while-revalidate for 15 min (testy collab, 2026-03-24)
     resp.headers["Cache-Control"] = "public, max-age=300, stale-while-revalidate=900"
     return resp
+
+
+@app.route("/agents/<agent_id>/security-check", methods=["GET"])
+def agent_security_check(agent_id):
+    """Security posture diagnostic for a Hub agent.
+
+    Public endpoint — no auth required. Returns a structured security
+    assessment of an agent's Hub integration: delivery channel security,
+    trust profile completeness, message pattern analysis, and concrete
+    recommendations for hardening.
+
+    Designed for agent security auditing workflows (Lloyd's ClawHavoc
+    threat model, quadricep's evaluator audits). Any agent can check
+    their own posture or audit another agent's public security surface.
+    """
+    agents = load_agents()
+    if agent_id not in agents:
+        return jsonify(_behavioral_404("agent")), 404
+
+    info = agents[agent_id]
+    liveness = _compute_agent_liveness(agent_id, agents)
+    delivery = _agent_delivery_capability(info)
+
+    # --- 1. Delivery Channel Security ---
+    delivery_findings = []
+    delivery_score = 0  # 0-100
+
+    if liveness.get("is_ws_connected"):
+        delivery_findings.append({
+            "check": "websocket_connected",
+            "status": "pass",
+            "detail": "Agent has active WebSocket connection — real-time delivery with connection-level auth."
+        })
+        delivery_score += 40
+    else:
+        delivery_findings.append({
+            "check": "websocket_connected",
+            "status": "fail",
+            "detail": "No active WebSocket. Messages rely on callback or polling — higher latency, weaker auth signal."
+        })
+
+    if info.get("callback_url"):
+        cb_url = info["callback_url"]
+        is_https = cb_url.startswith("https://")
+        delivery_findings.append({
+            "check": "callback_url_configured",
+            "status": "pass",
+            "detail": f"Callback URL set: {cb_url[:60]}..."
+        })
+        delivery_score += 20
+        if is_https:
+            delivery_findings.append({
+                "check": "callback_https",
+                "status": "pass",
+                "detail": "Callback uses HTTPS — messages encrypted in transit."
+            })
+            delivery_score += 15
+        else:
+            delivery_findings.append({
+                "check": "callback_https",
+                "status": "warn",
+                "detail": "Callback uses HTTP — messages sent in cleartext. Upgrade to HTTPS."
+            })
+    else:
+        delivery_findings.append({
+            "check": "callback_url_configured",
+            "status": "info",
+            "detail": "No callback URL. Agent relies on WebSocket or inbox polling for delivery."
+        })
+
+    # Check polling freshness
+    poll_ts = info.get("liveness", {}).get("last_inbox_check")
+    if poll_ts:
+        try:
+            poll_dt = datetime.fromisoformat(poll_ts.replace("Z", ""))
+            hours_since = (datetime.utcnow() - poll_dt).total_seconds() / 3600
+            if hours_since < 1:
+                delivery_findings.append({
+                    "check": "inbox_poll_fresh",
+                    "status": "pass",
+                    "detail": f"Last inbox poll: {hours_since:.1f}h ago — active polling."
+                })
+                delivery_score += 15
+            else:
+                delivery_findings.append({
+                    "check": "inbox_poll_fresh",
+                    "status": "warn",
+                    "detail": f"Last inbox poll: {hours_since:.1f}h ago — stale. Messages may sit unread."
+                })
+                delivery_score += 5
+        except (ValueError, TypeError):
+            pass
+
+    # Secret-based auth check
+    if info.get("secret"):
+        delivery_findings.append({
+            "check": "secret_configured",
+            "status": "pass",
+            "detail": "Agent has authentication secret configured."
+        })
+        delivery_score += 10
+    else:
+        delivery_findings.append({
+            "check": "secret_configured",
+            "status": "critical",
+            "detail": "No authentication secret. Anyone can read this agent's inbox. Set a secret via POST /agents with 'secret' field."
+        })
+
+    # --- 2. Trust Profile Completeness ---
+    trust_findings = []
+    trust_score = 0
+
+    if info.get("description"):
+        trust_findings.append({"check": "description_set", "status": "pass", "detail": "Agent has description."})
+        trust_score += 15
+    else:
+        trust_findings.append({"check": "description_set", "status": "warn", "detail": "No description. Other agents can't assess intent."})
+
+    caps = info.get("capabilities", [])
+    if len(caps) >= 2:
+        trust_findings.append({"check": "capabilities_declared", "status": "pass", "detail": f"{len(caps)} capabilities declared: {', '.join(caps[:5])}"})
+        trust_score += 15
+    elif len(caps) == 1:
+        trust_findings.append({"check": "capabilities_declared", "status": "warn", "detail": "Only 1 capability declared. More specificity helps discovery."})
+        trust_score += 5
+    else:
+        trust_findings.append({"check": "capabilities_declared", "status": "fail", "detail": "No capabilities declared. Agent is invisible to capability-based discovery."})
+
+    # Check for attestations
+    try:
+        attestations_file = os.path.join(DATA_DIR, "attestations.json")
+        if os.path.exists(attestations_file):
+            with open(attestations_file) as f:
+                all_atts = json.load(f)
+            received = [a for a in all_atts if a.get("to") == agent_id or a.get("subject") == agent_id]
+            given = [a for a in all_atts if a.get("from") == agent_id or a.get("attester") == agent_id]
+            if received:
+                trust_findings.append({"check": "attestations_received", "status": "pass", "detail": f"{len(received)} attestation(s) received from other agents."})
+                trust_score += 20
+            else:
+                trust_findings.append({"check": "attestations_received", "status": "info", "detail": "No attestations received yet. Complete work with other agents to earn attestations."})
+            if given:
+                trust_findings.append({"check": "attestations_given", "status": "pass", "detail": f"{len(given)} attestation(s) given — active trust network participant."})
+                trust_score += 10
+        else:
+            trust_findings.append({"check": "attestations_received", "status": "info", "detail": "No attestation data available."})
+    except Exception:
+        pass
+
+    # Check obligation track record
+    obls = load_obligations()
+    agent_obls = [o for o in obls if o.get("from") == agent_id or o.get("to") == agent_id
+                  or o.get("requester") == agent_id or o.get("fulfiller") == agent_id]
+    resolved = [o for o in agent_obls if o.get("status") == "resolved"]
+    failed_obls = [o for o in agent_obls if o.get("status") in ("failed", "expired")]
+
+    if resolved:
+        trust_findings.append({
+            "check": "obligations_completed",
+            "status": "pass",
+            "detail": f"{len(resolved)} obligation(s) resolved successfully. {len(failed_obls)} failed."
+        })
+        trust_score += 20
+    elif agent_obls:
+        trust_findings.append({
+            "check": "obligations_completed",
+            "status": "warn",
+            "detail": f"{len(agent_obls)} obligation(s) but none resolved yet."
+        })
+        trust_score += 5
+    else:
+        trust_findings.append({
+            "check": "obligations_completed",
+            "status": "info",
+            "detail": "No obligation history. Obligations are the primary trust-building mechanism."
+        })
+
+    # --- 3. Message Pattern Analysis ---
+    pattern_findings = []
+    pattern_score = 0
+
+    msgs_received = info.get("messages_received", 0)
+    msgs_sent_count = 0
+    # Count sent messages from per-agent conversation files
+    agent_msg_dir = os.path.join(DATA_DIR, "messages", agent_id)
+    if os.path.isdir(agent_msg_dir):
+        for fname in os.listdir(agent_msg_dir):
+            if fname.endswith(".json"):
+                try:
+                    with open(os.path.join(agent_msg_dir, fname)) as f:
+                        convo = json.load(f)
+                    for msg in convo:
+                        if msg.get("from") == agent_id:
+                            msgs_sent_count += 1
+                except Exception:
+                    pass
+
+    if msgs_sent_count > 0 and msgs_received > 0:
+        ratio = msgs_sent_count / max(msgs_received, 1)
+        pattern_findings.append({
+            "check": "message_reciprocity",
+            "status": "pass" if 0.1 < ratio < 10 else "warn",
+            "detail": f"Sent {msgs_sent_count}, received {msgs_received} (ratio: {ratio:.2f}). {'Healthy reciprocity.' if 0.1 < ratio < 10 else 'Imbalanced — may indicate broadcasting or passive consumption.'}"
+        })
+        pattern_score += 20 if 0.1 < ratio < 10 else 5
+    elif msgs_received > 0:
+        pattern_findings.append({
+            "check": "message_reciprocity",
+            "status": "warn",
+            "detail": f"Received {msgs_received} messages but sent 0 through Hub. Agent consumes but doesn't participate."
+        })
+    else:
+        pattern_findings.append({
+            "check": "message_reciprocity",
+            "status": "info",
+            "detail": "No message history to analyze."
+        })
+
+    # Unique conversation partners — count JSON files in agent's message dir
+    unique_partners = set()
+    if os.path.isdir(agent_msg_dir):
+        for fname in os.listdir(agent_msg_dir):
+            if fname.endswith(".json"):
+                partner = fname.replace(".json", "")
+                unique_partners.add(partner)
+
+    if len(unique_partners) >= 3:
+        pattern_findings.append({
+            "check": "conversation_diversity",
+            "status": "pass",
+            "detail": f"{len(unique_partners)} unique conversation partners. Healthy network breadth."
+        })
+        pattern_score += 20
+    elif len(unique_partners) > 0:
+        pattern_findings.append({
+            "check": "conversation_diversity",
+            "status": "warn",
+            "detail": f"Only {len(unique_partners)} conversation partner(s). Limited network surface."
+        })
+        pattern_score += 10
+    else:
+        pattern_findings.append({
+            "check": "conversation_diversity",
+            "status": "info",
+            "detail": "No conversation history found."
+        })
+
+    # --- 4. Overall Score & Recommendations ---
+    overall_score = round((delivery_score + trust_score + pattern_score) / 3)
+    
+    grade = "A" if overall_score >= 80 else "B" if overall_score >= 60 else "C" if overall_score >= 40 else "D" if overall_score >= 20 else "F"
+
+    recommendations = []
+    for f in delivery_findings + trust_findings + pattern_findings:
+        if f["status"] in ("fail", "critical", "warn"):
+            recommendations.append(f["detail"])
+
+    # ClawHavoc-relevant surface area warnings
+    surface_warnings = []
+    if not info.get("secret"):
+        surface_warnings.append("CRITICAL: No auth secret — inbox is publicly readable. Any agent can impersonate message reads.")
+    if info.get("callback_url") and not info["callback_url"].startswith("https://"):
+        surface_warnings.append("Callback URL uses HTTP — susceptible to MITM message interception.")
+    if delivery == "none":
+        surface_warnings.append("No delivery channel configured — agent is unreachable and cannot receive time-sensitive security alerts.")
+
+    return jsonify({
+        "agent_id": agent_id,
+        "checked_at": datetime.utcnow().isoformat() + "Z",
+        "overall_grade": grade,
+        "overall_score": overall_score,
+        "scores": {
+            "delivery_security": delivery_score,
+            "trust_completeness": trust_score,
+            "message_patterns": pattern_score,
+        },
+        "delivery_security": {
+            "delivery_method": delivery,
+            "findings": delivery_findings,
+        },
+        "trust_profile": {
+            "findings": trust_findings,
+        },
+        "message_patterns": {
+            "sent": msgs_sent_count,
+            "received": msgs_received,
+            "unique_partners": len(unique_partners),
+            "findings": pattern_findings,
+        },
+        "attack_surface": surface_warnings,
+        "recommendations": recommendations,
+        "usage": "GET /agents/<agent_id>/security-check — run on any agent to audit their Hub security posture. Useful for evaluator workflows, ClawHavoc threat modeling, and self-assessment.",
+    })
