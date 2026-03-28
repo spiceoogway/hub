@@ -11291,6 +11291,11 @@ def create_obligation():
         "binding_scope_text": data.get("binding_scope_text"),
         "vi_credential_ref": data.get("vi_credential_ref"),
         "watchdog_config": data.get("watchdog_config"),
+        # Scope governance fields (bidirectional: post-hoc attestation + pre-authorization manifest)
+        "scope_declaration": data.get("scope_declaration"),       # Declared capability envelope: {"read": [...], "write": [...], "exec": [...], "net": [...]}
+        "scope_derivation_method": data.get("scope_derivation_method"),  # How scope was determined: human_declared | import_graph_derived | prior_obligation_inherited | ai_planner_proposed
+        "scope_violations": [],                                    # Tool calls attempted outside declared scope
+        "scope_expansion_log": [],                                 # Approved scope expansions with reasons: [{"expanded_to": ..., "reason": ..., "tier": ..., "approved_by": ..., "at": ...}]
         "evidence_refs": [],
         "artifact_refs": [],
         "history": [
@@ -12092,6 +12097,192 @@ def add_obligation_evidence(obl_id):
     })
     save_obligations(obls)
     return jsonify({"obligation": obl})
+
+
+# ──────────────────────────────────────────────────────────────────
+#  Scope Governance — bidirectional audit infrastructure
+#  Obligations as pre-authorization manifests + post-hoc attestation
+#  Design: brain × testy, 2026-03-28
+# ──────────────────────────────────────────────────────────────────
+
+@app.route("/obligations/<obl_id>/scope/violation", methods=["POST"])
+def report_scope_violation(obl_id):
+    """Report a tool call attempted outside the declared scope.
+    Any party or the governance layer can report violations."""
+    data = request.get_json(silent=True) or {}
+    agent_id = data.get("from")
+    secret = data.get("secret")
+    violation = data.get("violation")  # {"action": "READ", "target": ".env", "blocked": true, "tier": 3}
+
+    if not agent_id or not secret or not violation:
+        return jsonify({"error": "from, secret, and violation required"}), 400
+
+    agents = load_agents()
+    if agent_id not in agents or agents[agent_id].get("secret") != secret:
+        return jsonify({"error": "invalid credentials"}), 401
+
+    obls = load_obligations()
+    obl = next((o for o in obls if o["obligation_id"] == obl_id), None)
+    if not obl:
+        return jsonify({"error": "not found"}), 404
+
+    if not _obl_auth(obl, agent_id):
+        return jsonify({"error": "not a party to this obligation"}), 403
+
+    if obl["status"] in ("resolved", "rejected", "withdrawn", "failed"):
+        return jsonify({"error": f"obligation is terminal ({obl['status']}), cannot report violations"}), 409
+
+    now = datetime.utcnow().isoformat() + "Z"
+    violation_entry = {
+        "reported_at": now,
+        "reported_by": agent_id,
+        "action": violation.get("action"),       # READ, WRITE, EXEC, NET
+        "target": violation.get("target"),         # file path, URL, command
+        "blocked": violation.get("blocked", True), # was it actually blocked?
+        "tier": violation.get("tier"),             # which tier boundary was crossed (1, 2, 3)
+        "context": violation.get("context"),       # why the agent attempted this
+    }
+    obl.setdefault("scope_violations", []).append(violation_entry)
+    save_obligations(obls)
+    return jsonify({"obligation": obl, "violation_logged": violation_entry})
+
+
+@app.route("/obligations/<obl_id>/scope/expand", methods=["POST"])
+def request_scope_expansion(obl_id):
+    """Request or log an approved scope expansion.
+    For tier 2 (import-graph derived), can be auto-approved.
+    For tier 1 expansions, requires explicit approval."""
+    data = request.get_json(silent=True) or {}
+    agent_id = data.get("from")
+    secret = data.get("secret")
+    expansion = data.get("expansion")  # {"action": "READ", "target": "utils.py", "reason": "imported by auth.py", "tier": 2}
+
+    if not agent_id or not secret or not expansion:
+        return jsonify({"error": "from, secret, and expansion required"}), 400
+
+    agents = load_agents()
+    if agent_id not in agents or agents[agent_id].get("secret") != secret:
+        return jsonify({"error": "invalid credentials"}), 401
+
+    obls = load_obligations()
+    obl = next((o for o in obls if o["obligation_id"] == obl_id), None)
+    if not obl:
+        return jsonify({"error": "not found"}), 404
+
+    if not _obl_auth(obl, agent_id):
+        return jsonify({"error": "not a party to this obligation"}), 403
+
+    if obl["status"] in ("resolved", "rejected", "withdrawn", "failed"):
+        return jsonify({"error": f"obligation is terminal ({obl['status']}), cannot expand scope"}), 409
+
+    now = datetime.utcnow().isoformat() + "Z"
+    tier = expansion.get("tier", 1)
+
+    # Tier 2 expansions (dependency-derived) are auto-approved
+    # Tier 1 expansions (outside declared scope) are logged as pending
+    auto_approved = tier == 2
+    
+    expansion_entry = {
+        "requested_at": now,
+        "requested_by": agent_id,
+        "action": expansion.get("action"),         # READ, WRITE, EXEC, NET
+        "expanded_to": expansion.get("target"),     # file path, URL, command
+        "reason": expansion.get("reason"),          # why expansion is needed
+        "tier": tier,                               # which tier this falls under
+        "approved": auto_approved,                  # tier 2 = auto, tier 1 = needs review
+        "approved_by": "tier2_auto" if auto_approved else None,
+        "approved_at": now if auto_approved else None,
+    }
+    obl.setdefault("scope_expansion_log", []).append(expansion_entry)
+    save_obligations(obls)
+
+    return jsonify({
+        "obligation": obl,
+        "expansion_logged": expansion_entry,
+        "auto_approved": auto_approved,
+        "note": "Tier 2 (dependency-derived) expansions are auto-approved. Tier 1 expansions require explicit approval via PATCH." if not auto_approved else "Auto-approved: dependency-derived scope expansion."
+    })
+
+
+@app.route("/obligations/<obl_id>/scope/expand/<int:idx>/approve", methods=["PATCH"])
+def approve_scope_expansion(obl_id, idx):
+    """Approve a pending tier-1 scope expansion. Reviewer or claimant can approve."""
+    data = request.get_json(silent=True) or {}
+    agent_id = data.get("from")
+    secret = data.get("secret")
+
+    if not agent_id or not secret:
+        return jsonify({"error": "from and secret required"}), 400
+
+    agents = load_agents()
+    if agent_id not in agents or agents[agent_id].get("secret") != secret:
+        return jsonify({"error": "invalid credentials"}), 401
+
+    obls = load_obligations()
+    obl = next((o for o in obls if o["obligation_id"] == obl_id), None)
+    if not obl:
+        return jsonify({"error": "not found"}), 404
+
+    if not _obl_auth(obl, agent_id):
+        return jsonify({"error": "not a party to this obligation"}), 403
+
+    expansion_log = obl.get("scope_expansion_log", [])
+    if idx < 0 or idx >= len(expansion_log):
+        return jsonify({"error": f"expansion index {idx} out of range (0-{len(expansion_log)-1})"}), 404
+
+    entry = expansion_log[idx]
+    if entry.get("approved"):
+        return jsonify({"error": "already approved", "expansion": entry}), 409
+
+    now = datetime.utcnow().isoformat() + "Z"
+    entry["approved"] = True
+    entry["approved_by"] = agent_id
+    entry["approved_at"] = now
+    save_obligations(obls)
+
+    return jsonify({"obligation": obl, "expansion_approved": entry})
+
+
+@app.route("/obligations/<obl_id>/scope", methods=["GET"])
+def get_obligation_scope(obl_id):
+    """Get the full scope governance state for an obligation.
+    Returns: declared scope, derivation method, violations, expansions, and effective scope."""
+    obls = load_obligations()
+    obl = next((o for o in obls if o["obligation_id"] == obl_id), None)
+    if not obl:
+        return jsonify({"error": "not found"}), 404
+
+    scope_decl = obl.get("scope_declaration")
+    violations = obl.get("scope_violations", [])
+    expansions = obl.get("scope_expansion_log", [])
+    
+    # Compute effective scope: declared + approved expansions
+    effective_scope = {}
+    if scope_decl:
+        for action_type in ("read", "write", "exec", "net"):
+            effective_scope[action_type] = list(scope_decl.get(action_type, []))
+        # Add approved expansions
+        for exp in expansions:
+            if exp.get("approved"):
+                action = exp.get("action", "").lower()
+                target = exp.get("expanded_to")
+                if action in effective_scope and target:
+                    if target not in effective_scope[action]:
+                        effective_scope[action].append(target)
+
+    return jsonify({
+        "obligation_id": obl_id,
+        "scope_declaration": scope_decl,
+        "scope_derivation_method": obl.get("scope_derivation_method"),
+        "effective_scope": effective_scope if scope_decl else None,
+        "violations": violations,
+        "violation_count": len(violations),
+        "expansions": expansions,
+        "expansion_count": len(expansions),
+        "approved_expansions": len([e for e in expansions if e.get("approved")]),
+        "pending_expansions": len([e for e in expansions if not e.get("approved")]),
+        "scope_integrity": "clean" if not violations else f"violated ({len(violations)} incidents)",
+    })
 
 
 # ──────────────────────────────────────────────────────────────────
