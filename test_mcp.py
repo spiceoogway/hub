@@ -15,14 +15,17 @@ import asyncio
 import json
 import sys
 
+import httpx
 from mcp.client.streamable_http import streamablehttp_client
 from mcp import ClientSession
 
 
 MCP_URL = "http://localhost:8090/mcp"
+HEALTH_URL = "http://localhost:8090/health"
 
 passed = 0
 failed = 0
+mcp_tool_count = 0  # set during MCP tests, cross-checked against /health
 
 
 def report(name: str, ok: bool, detail: str = ""):
@@ -61,6 +64,8 @@ async def run_tests():
                 print("\n[2] Listing tools...")
                 tools_result = await session.list_tools()
                 tool_names = [t.name for t in tools_result.tools]
+                global mcp_tool_count
+                mcp_tool_count = len(tool_names)
                 print(f"     Found {len(tool_names)} tools: {tool_names}")
 
                 expected_tools = [
@@ -236,6 +241,111 @@ async def run_tests():
 
     except Exception as exc:
         print(f"\n❌ FATAL: {type(exc).__name__}: {exc}")
+        failed += 1
+
+    # ── Health endpoint (HTTP, not MCP) ──
+    print("\n[17] GET /health endpoint...")
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(HEALTH_URL)
+            report(
+                "/health returns 200",
+                resp.status_code == 200,
+                f"Status: {resp.status_code}",
+            )
+
+            data = resp.json()
+
+            # Schema: all required fields present
+            required_fields = [
+                "status",
+                "server",
+                "started_at",
+                "uptime_seconds",
+                "request_count",
+                "last_request_at",
+                "tools_registered",
+                "memory_rss_mb",
+                "hub_url",
+            ]
+            missing = [f for f in required_fields if f not in data]
+            report(
+                "/health response has all required fields",
+                len(missing) == 0,
+                f"Missing: {missing}",
+            )
+
+            # status == "ok"
+            report(
+                "/health status is 'ok'",
+                data.get("status") == "ok",
+                f"Got: {data.get('status')}",
+            )
+
+            # server identifier
+            report(
+                "/health server is 'hub-mcp'",
+                data.get("server") == "hub-mcp",
+                f"Got: {data.get('server')}",
+            )
+
+            # uptime > 0
+            uptime = data.get("uptime_seconds", 0)
+            report(
+                "/health uptime_seconds > 0",
+                isinstance(uptime, (int, float)) and uptime > 0,
+                f"Got: {uptime}",
+            )
+
+            # tools_registered > 0
+            tool_count = data.get("tools_registered", 0)
+            report(
+                "/health tools_registered > 0",
+                isinstance(tool_count, int) and tool_count > 0,
+                f"Got: {tool_count}",
+            )
+
+            # Cross-check: tools_registered should match the count from MCP list_tools
+            if mcp_tool_count > 0:
+                report(
+                    "/health tools_registered matches MCP tool count",
+                    tool_count == mcp_tool_count,
+                    f"Health: {tool_count}, MCP: {mcp_tool_count}",
+                )
+
+            # memory_rss_mb is a positive number
+            mem = data.get("memory_rss_mb")
+            report(
+                "/health memory_rss_mb is positive",
+                isinstance(mem, (int, float)) and mem > 0,
+                f"Got: {mem}",
+            )
+
+            # started_at is a valid ISO timestamp
+            started = data.get("started_at", "")
+            report(
+                "/health started_at is ISO timestamp",
+                isinstance(started, str) and "T" in started and len(started) > 10,
+                f"Got: {started}",
+            )
+
+            # hub_url is set
+            report(
+                "/health hub_url is set",
+                isinstance(data.get("hub_url"), str) and len(data["hub_url"]) > 0,
+                f"Got: {data.get('hub_url')}",
+            )
+
+            # Content-Type is JSON
+            ct = resp.headers.get("content-type", "")
+            report(
+                "/health Content-Type is JSON",
+                "application/json" in ct,
+                f"Got: {ct}",
+            )
+
+    except Exception as exc:
+        print(f"\n❌ Health test error: {type(exc).__name__}: {exc}")
         failed += 1
 
     # ── Summary ──
