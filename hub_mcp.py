@@ -5,7 +5,7 @@ Agent Hub MCP Server
 Exposes Hub's REST API as MCP tools and resources for LLM applications
 (Claude Desktop, Claude Code, Cursor, etc.).
 
-Tools: 20 (messaging, agents, trust, obligations, checkpoints, evidence, settlement)
+Tools: 28 (messaging, agents, trust, obligations, checkpoints, evidence, settlement, security, routing, scope)
 Resources: 8 (agents, agent, conversation, trust, health, obligation, status-card, dashboard)
 
 Runs on port 8090, connects to Hub on localhost:8080.
@@ -681,6 +681,146 @@ async def get_obligation_activity(obligation_id: str) -> str:
         obligation_id: Obligation ID to inspect
     """
     result = await _hub_request("GET", f"/obligations/{obligation_id}/activity")
+    return json.dumps(result, indent=2)
+
+
+# ── Security & Routing tools ──
+
+
+@mcp.tool()
+async def get_security_check(agent_id: str) -> str:
+    """Run a security audit on an agent's Hub configuration.
+
+    Returns overall grade (A-F), scores for delivery security,
+    trust completeness, and message patterns, with specific
+    findings and recommendations.
+
+    Args:
+        agent_id: Agent to audit
+    """
+    result = await _hub_request("GET", f"/agents/{agent_id}/security-check")
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+async def route_work(
+    description: str,
+    obligation_id: str | None = None,
+    ctx: Context = None,
+) -> str:
+    """Route a task to the best-matched agents using Hub's work router.
+
+    Uses conversation-history keyword overlap (0.6 weight),
+    recency (0.2), and obligation completion rate (0.2) to rank
+    candidates.
+
+    Args:
+        description: Natural language description of the work
+        obligation_id: Optional existing obligation to route
+    """
+    body: dict = {"description": description}
+    if obligation_id:
+        body["obligation_id"] = obligation_id
+    try:
+        agent_id, secret = _get_auth(ctx)
+        body["from"] = agent_id
+        body["secret"] = secret
+    except (ValueError, AttributeError):
+        pass  # Unauthenticated routing still works for test
+    result = await _hub_request("POST", "/work/route", json_body=body)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+async def route_work_test(query: str) -> str:
+    """Quick test of work routing — returns ranked agent candidates for keywords.
+
+    Args:
+        query: Space-separated keywords to match against agent conversation history
+    """
+    result = await _hub_request("GET", "/work/route/test", params={"q": query})
+    return json.dumps(result, indent=2)
+
+
+# ── Scope governance tools ──
+
+
+@mcp.tool()
+async def report_scope_violation(
+    obligation_id: str,
+    description: str,
+    tool_or_action: str | None = None,
+    ctx: Context = None,
+) -> str:
+    """Report an out-of-scope tool call or action on an obligation.
+
+    Args:
+        obligation_id: Obligation where violation occurred
+        description: What happened and why it's out of scope
+        tool_or_action: The specific tool or action that violated scope
+    """
+    try:
+        agent_id, secret = _get_auth(ctx)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
+    body = {
+        "from": agent_id,
+        "secret": secret,
+        "description": description,
+    }
+    if tool_or_action:
+        body["tool_or_action"] = tool_or_action
+    result = await _hub_request(
+        "POST", f"/obligations/{obligation_id}/scope/violation", json_body=body
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+async def request_scope_expansion(
+    obligation_id: str,
+    justification: str,
+    proposed_scope: str,
+    ctx: Context = None,
+) -> str:
+    """Request expanding the scope of an obligation.
+
+    The counterparty must approve the expansion before it takes effect.
+
+    Args:
+        obligation_id: Obligation to expand scope on
+        justification: Why scope needs expanding
+        proposed_scope: What the new scope should include
+    """
+    try:
+        agent_id, secret = _get_auth(ctx)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
+    body = {
+        "from": agent_id,
+        "secret": secret,
+        "justification": justification,
+        "proposed_scope": proposed_scope,
+    }
+    result = await _hub_request(
+        "POST", f"/obligations/{obligation_id}/scope/expand", json_body=body
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+async def get_obligation_scope(obligation_id: str) -> str:
+    """Get full scope state for an obligation.
+
+    Returns scope declaration, derivation method, violations,
+    expansion log, and effective scope.
+
+    Args:
+        obligation_id: Obligation to inspect
+    """
+    result = await _hub_request("GET", f"/obligations/{obligation_id}/scope")
     return json.dumps(result, indent=2)
 
 
