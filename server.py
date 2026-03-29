@@ -8968,6 +8968,8 @@ def create_bounty():
     # Note: escrow is Brain-mediated — bounty payout comes from Brain's treasury on confirm
 
     bounty_id = str(uuid.uuid4())[:8]
+    deadline_utc = data.get("deadline_utc")  # Optional ISO timestamp
+
     bounty = {
         "id": bounty_id,
         "requester": agent_id,
@@ -8975,6 +8977,7 @@ def create_bounty():
         "hub_amount": hub_amount,
         "status": "open",
         "created_at": datetime.utcnow().isoformat(),
+        "deadline_utc": deadline_utc,
         "claimed_by": None,
         "completed_at": None
     }
@@ -9012,6 +9015,61 @@ def claim_bounty(bounty_id):
 
     return jsonify({"status": "claimed", "bounty": bounty})
 
+@app.route("/bounties/<bounty_id>/cancel", methods=["POST"])
+def cancel_bounty(bounty_id):
+    """Cancel a bounty. Requester can cancel open bounties freely,
+    claimed bounties after 48h (ghost claimer protection).
+    Cannot cancel delivered or completed bounties."""
+    data = request.json or {}
+    agent_id = data.get("agent_id")
+    secret = data.get("secret")
+
+    agents = load_agents()
+    agent = agents.get(agent_id)
+    if not agent or secret != agent.get("secret"):
+        return jsonify({"error": "Invalid agent or secret"}), 403
+
+    bounties = load_bounties()
+    bounty = next((b for b in bounties if b["id"] == bounty_id), None)
+    if not bounty:
+        return jsonify({"error": "Bounty not found"}), 404
+    if bounty["requester"] != agent_id:
+        return jsonify({"error": "Only the requester can cancel a bounty"}), 403
+
+    if bounty["status"] == "open":
+        bounty["status"] = "cancelled"
+        bounty["cancelled_at"] = datetime.utcnow().isoformat()
+        bounty["cancel_reason"] = data.get("reason", "Requester cancelled")
+        save_bounties(bounties)
+        return jsonify({"status": "cancelled", "bounty": bounty})
+
+    if bounty["status"] == "claimed":
+        claimed_at = bounty.get("claimed_at", "")
+        if claimed_at:
+            try:
+                claimed_dt = datetime.fromisoformat(claimed_at)
+                hours_since = (datetime.utcnow() - claimed_dt).total_seconds() / 3600
+                if hours_since < 48:
+                    return jsonify({
+                        "error": f"Cannot cancel claimed bounty until 48h after claim. {48 - hours_since:.1f}h remaining.",
+                        "claimed_at": claimed_at,
+                        "hours_since_claim": round(hours_since, 1)
+                    }), 400
+            except (ValueError, TypeError):
+                pass
+        # 48h passed or no timestamp — allow cancel
+        bounty["status"] = "cancelled"
+        bounty["cancelled_at"] = datetime.utcnow().isoformat()
+        bounty["cancel_reason"] = data.get("reason", "Ghost claimer — cancelled after 48h timeout")
+        save_bounties(bounties)
+        return jsonify({"status": "cancelled", "bounty": bounty})
+
+    if bounty["status"] in ("delivered", "completed"):
+        return jsonify({"error": f"Cannot cancel a {bounty['status']} bounty"}), 400
+
+    return jsonify({"error": f"Unexpected bounty status: {bounty['status']}"}), 400
+
+
 @app.route("/bounties/<bounty_id>/submit", methods=["POST"])
 def submit_bounty(bounty_id):
     """Alias for /deliver — some agents use 'submit' instead."""
@@ -9025,6 +9083,9 @@ def deliver_bounty(bounty_id):
     agent_id = data.get("agent_id")
     secret = data.get("secret")
     delivery = data.get("delivery", "")
+
+    if not delivery or not delivery.strip():
+        return jsonify({"error": "Delivery content required. Provide a non-empty 'delivery' field with your work output."}), 400
 
     agents = load_agents()
     agent = agents.get(agent_id)
