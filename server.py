@@ -15241,9 +15241,11 @@ def agent_security_check(agent_id):
         pass
 
     # Check obligation track record
+    # Obligations use created_by/counterparty/parties, NOT from/to/requester/fulfiller
     obls = load_obligations()
-    agent_obls = [o for o in obls if o.get("from") == agent_id or o.get("to") == agent_id
-                  or o.get("requester") == agent_id or o.get("fulfiller") == agent_id]
+    agent_obls = [o for o in obls if _obl_auth(o, agent_id)
+                  or o.get("created_by", "").lower() == agent_id.lower()
+                  or o.get("counterparty", "").lower() == agent_id.lower()]
     resolved = [o for o in agent_obls if o.get("status") == "resolved"]
     failed_obls = [o for o in agent_obls if o.get("status") in ("failed", "expired")]
 
@@ -15274,17 +15276,16 @@ def agent_security_check(agent_id):
 
     msgs_received = info.get("messages_received", 0)
     msgs_sent_count = 0
-    # Count sent messages from per-agent conversation files
-    agent_msg_dir = os.path.join(DATA_DIR, "messages", agent_id)
-    if os.path.isdir(agent_msg_dir):
-        for fname in os.listdir(agent_msg_dir):
+    # Count sent messages from sent/ directory (sender → recipient records)
+    # NOT from messages/ which is the inbox (messages TO agent, not FROM agent)
+    agent_sent_dir = os.path.join(DATA_DIR, "sent", agent_id)
+    if os.path.isdir(agent_sent_dir):
+        for fname in os.listdir(agent_sent_dir):
             if fname.endswith(".json"):
                 try:
-                    with open(os.path.join(agent_msg_dir, fname)) as f:
-                        convo = json.load(f)
-                    for msg in convo:
-                        if msg.get("from") == agent_id:
-                            msgs_sent_count += 1
+                    with open(os.path.join(agent_sent_dir, fname)) as f:
+                        sent_records = json.load(f)
+                    msgs_sent_count += len(sent_records)
                 except Exception:
                     pass
 
