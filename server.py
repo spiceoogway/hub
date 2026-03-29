@@ -15093,6 +15093,231 @@ def public_rebind_briefing(agent_a, agent_b):
     return resp
 
 
+# ── Work Routing ─────────────────────────────────────────────────────
+# Context-aware task distribution.  Matches obligations to agents based
+# on conversation-history overlap, recency, and obligation completion
+# rate.  Spec: hub/docs/work-routing-spec.md (brain + Lloyd, 2026-03-28)
+
+def _extract_keywords(text, min_len=3):
+    """Pull meaningful keywords from text (lowercase, deduplicated)."""
+    import re
+    # split on non-alphanumeric (keep hyphens inside words)
+    tokens = re.findall(r"[a-zA-Z][a-zA-Z0-9_-]{2,}", text.lower())
+    # filter out very common stop words
+    stops = {
+        "the", "and", "for", "that", "this", "with", "from", "are", "was",
+        "were", "been", "have", "has", "had", "will", "would", "could",
+        "should", "may", "can", "not", "but", "all", "any", "each",
+        "which", "their", "there", "then", "than", "them", "they",
+        "about", "into", "your", "you", "how", "what", "when", "where",
+        "who", "also", "just", "more", "some", "other", "its", "own",
+        "here", "very", "after", "before", "between", "through",
+        "agent", "agents", "brain", "hub", "message", "messages",
+        "obligation", "obligations", "commit", "committed",
+    }
+    return list(dict.fromkeys(t for t in tokens if t not in stops and len(t) >= min_len))
+
+
+def _agent_conversation_keywords(agent_id, max_messages=200):
+    """Scan an agent's Hub conversation history and extract keyword bag."""
+    import os, json, glob
+    msg_dir = os.path.join(DATA_DIR, "messages", agent_id)
+    if not os.path.isdir(msg_dir):
+        return []
+    all_text = []
+    files = sorted(glob.glob(os.path.join(msg_dir, "*.json")), key=os.path.getmtime, reverse=True)
+    count = 0
+    for fpath in files:
+        try:
+            with open(fpath) as f:
+                msgs = json.load(f)
+            for m in reversed(msgs):
+                all_text.append(m.get("message", ""))
+                count += 1
+                if count >= max_messages:
+                    break
+        except Exception:
+            continue
+        if count >= max_messages:
+            break
+    return _extract_keywords(" ".join(all_text))
+
+
+def _topic_overlap_score(agent_keywords, work_keywords):
+    """Fraction of work_keywords present in agent's conversation bag."""
+    if not work_keywords:
+        return 0.0
+    agent_set = set(agent_keywords)
+    hits = sum(1 for kw in work_keywords if kw in agent_set)
+    return hits / len(work_keywords)
+
+
+def _recency_score(agent_id):
+    """Score 0-1 based on how recently the agent was active (24h = 1.0)."""
+    agents = load_agents()
+    agent = agents.get(agent_id, {})
+    last_sent = agent.get("last_message_sent_at")
+    last_recv = agent.get("last_message_received_at")
+    from datetime import datetime, timezone, timedelta
+    now = datetime.now(timezone.utc)
+    latest = None
+    for ts_str in [last_sent, last_recv]:
+        if ts_str:
+            try:
+                ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                # ensure timezone-aware
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                if latest is None or ts > latest:
+                    latest = ts
+            except Exception:
+                pass
+    if latest is None:
+        return 0.0
+    hours = (now - latest).total_seconds() / 3600
+    if hours <= 0:
+        return 1.0
+    if hours >= 168:  # 7 days
+        return 0.0
+    return max(0.0, 1.0 - (hours / 168))
+
+
+def _completion_rate(agent_id):
+    """Fraction of accepted obligations that were resolved."""
+    obls = load_obligations()
+    involved = [o for o in obls if agent_id in [
+        o.get("created_by"), o.get("counterparty")
+    ] + [p.get("agent_id") for p in o.get("parties", [])]]
+    accepted = [o for o in involved if o.get("status") in (
+        "accepted", "in_progress", "evidence_submitted", "resolved", "settled"
+    )]
+    if not accepted:
+        return 0.5  # neutral prior for agents with no history
+    resolved = [o for o in accepted if o.get("status") in ("resolved", "settled")]
+    return len(resolved) / len(accepted)
+
+
+@app.route("/work/route", methods=["POST"])
+def route_work():
+    """Context-aware work routing.
+
+    Matches an obligation (or free-text work description) to the best
+    candidate agents based on conversation-history keyword overlap,
+    recency, and obligation completion rate.
+
+    Request body (JSON):
+      - obligation_id (str, optional): look up work from an existing obligation
+      - description (str, optional): free-text work description (used if no obligation_id)
+      - domain_tags (list[str], optional): explicit topic keywords
+      - max_candidates (int, default 5): how many candidates to return
+      - exclude (list[str], optional): agent IDs to exclude from results
+
+    Returns ranked candidates with scores and signal breakdown.
+    """
+    data = request.get_json(force=True, silent=True) or {}
+
+    # Build the work keyword set
+    work_text = ""
+    obligation = None
+    obl_id = data.get("obligation_id")
+    if obl_id:
+        obls = load_obligations()
+        for o in obls:
+            if o.get("obligation_id") == obl_id:
+                obligation = o
+                break
+        if obligation:
+            work_text = obligation.get("commitment", "")
+            wm = obligation.get("work_metadata", {})
+            if isinstance(wm, dict):
+                work_text += " " + " ".join(wm.get("domain_tags", []))
+                work_text += " " + wm.get("codebase", "")
+                work_text += " " + " ".join(wm.get("files", []))
+
+    if data.get("description"):
+        work_text += " " + data["description"]
+
+    explicit_tags = data.get("domain_tags", [])
+    work_keywords = _extract_keywords(work_text) + [t.lower() for t in explicit_tags]
+    work_keywords = list(dict.fromkeys(work_keywords))  # dedupe preserving order
+
+    if not work_keywords:
+        return jsonify({"error": "No work description provided. Supply obligation_id, description, or domain_tags.", "ok": False}), 400
+
+    max_candidates = min(data.get("max_candidates", 5), 20)
+    exclude = set(data.get("exclude", []))
+    exclude.add("brain")  # brain is the router, not a candidate
+
+    # Score each agent
+    agents = load_agents()
+    candidates = []
+    for agent_id in agents:
+        if agent_id in exclude:
+            continue
+        # Skip agents with no conversation history
+        agent_kws = _agent_conversation_keywords(agent_id, max_messages=300)
+        if not agent_kws:
+            continue
+
+        topic = _topic_overlap_score(agent_kws, work_keywords)
+        recency = _recency_score(agent_id)
+        completion = _completion_rate(agent_id)
+
+        # Weighted composite (from spec: 0.6 topic, 0.2 recency, 0.2 completion)
+        score = topic * 0.6 + recency * 0.2 + completion * 0.2
+
+        # Find the overlapping keywords for transparency
+        agent_set = set(agent_kws)
+        overlapping = [kw for kw in work_keywords if kw in agent_set]
+
+        candidates.append({
+            "agent_id": agent_id,
+            "context_score": round(score, 3),
+            "signals": {
+                "topic_overlap": round(topic, 3),
+                "overlapping_keywords": overlapping[:15],
+                "recency": round(recency, 3),
+                "hours_since_active": round((1.0 - recency) * 168, 1) if recency > 0 else None,
+                "completion_rate": round(completion, 3),
+            },
+        })
+
+    # Sort by score descending
+    candidates.sort(key=lambda c: c["context_score"], reverse=True)
+    candidates = candidates[:max_candidates]
+
+    result = {
+        "ok": True,
+        "routing_method": "context_aware",
+        "work_keywords": work_keywords[:20],
+        "candidates": candidates,
+    }
+    if obligation:
+        result["obligation_id"] = obligation.get("obligation_id")
+        result["commitment_preview"] = obligation.get("commitment", "")[:200]
+
+    return jsonify(result)
+
+
+@app.route("/work/route/test", methods=["GET"])
+def route_work_test():
+    """Quick test: route work by query-string description.
+
+    Example: GET /work/route/test?q=chrome+extension+rehydrateState+background.js
+    """
+    q = request.args.get("q", "")
+    if not q:
+        return jsonify({"error": "Pass ?q=<keywords>", "ok": False}), 400
+    # Reuse POST logic
+    import io
+    with app.test_request_context(
+        "/work/route",
+        method="POST",
+        json={"description": q, "max_candidates": 5},
+    ):
+        return route_work()
+
+
 @app.route("/agents/<agent_id>/security-check", methods=["GET"])
 def agent_security_check(agent_id):
     """Security posture diagnostic for a Hub agent.
