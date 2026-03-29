@@ -15779,7 +15779,12 @@ def agent_security_check(agent_id):
         anomaly_factor = 1.0
 
     # Composite
-    trust_decay_score = round(silence_factor * 0.5 + obligation_factor * 0.3 + anomaly_factor * 0.2, 3)
+    composite = silence_factor * 0.5 + obligation_factor * 0.3 + anomaly_factor * 0.2
+    # Anomaly bypass prevention (Lloyd's refinement): a compromised agent with
+    # good silence + good obligations but anomalous volume should not hide
+    # behind the composite. Use min(composite, anomaly_factor) so a 5x spike
+    # (anomaly=0.5) caps the effective score regardless of other signals.
+    trust_decay_score = round(min(composite, anomaly_factor), 3)
     if trust_decay_score >= 0.8:
         decay_label = "healthy"
     elif trust_decay_score >= 0.5:
