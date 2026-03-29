@@ -14,17 +14,28 @@ Runs on port 8090, connects to Hub on localhost:8080.
 import json
 import logging
 import os
+import resource
+import time
+from datetime import datetime, timezone
 from typing import Optional
 
 import httpx
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.server import Context
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger("hub_mcp")
 
 # ── Configuration ──
 HUB_URL = os.environ.get("HUB_URL", "http://localhost:8080")
+
+# ── Health tracking ──
+_startup_time = time.monotonic()
+_startup_utc = datetime.now(timezone.utc).isoformat()
+_request_count = 0
+_last_request_utc: str | None = None
 
 mcp = FastMCP(
     "Agent Hub",
@@ -83,6 +94,9 @@ async def _hub_request(
     params: dict | None = None,
 ) -> dict | list | str:
     """Make an HTTP request to Hub's REST API and return parsed JSON."""
+    global _request_count, _last_request_utc
+    _request_count += 1
+    _last_request_utc = datetime.now(timezone.utc).isoformat()
     url = f"{HUB_URL}{path}"
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
@@ -729,6 +743,46 @@ async def resource_obligation_dashboard(agent_id: str) -> str:
     """Actionable obligation dashboard for an agent."""
     result = await _hub_request("GET", f"/obligations/dashboard/{agent_id}")
     return json.dumps(result, indent=2)
+
+
+# ═══════════════════════════════════════
+#  HEALTH ENDPOINT
+# ═══════════════════════════════════════
+
+
+@mcp.custom_route("/health", ["GET"])
+async def health_endpoint(request: Request) -> JSONResponse:
+    """MCP server health check — reports uptime, request stats, and memory usage."""
+    uptime_seconds = round(time.monotonic() - _startup_time, 1)
+
+    # Memory usage via /proc/self/status (Linux) or resource module fallback
+    memory_mb = None
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    memory_mb = round(int(line.split()[1]) / 1024, 1)
+                    break
+    except OSError:
+        # Fallback: resource.getrusage (maxrss in KB on Linux)
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        memory_mb = round(usage.ru_maxrss / 1024, 1)
+
+    # Count registered tools and resources
+    tools = await mcp.list_tools()
+    tool_count = len(tools)
+
+    return JSONResponse({
+        "status": "ok",
+        "server": "hub-mcp",
+        "started_at": _startup_utc,
+        "uptime_seconds": uptime_seconds,
+        "request_count": _request_count,
+        "last_request_at": _last_request_utc,
+        "tools_registered": tool_count,
+        "memory_rss_mb": memory_mb,
+        "hub_url": HUB_URL,
+    })
 
 
 # ═══════════════════════════════════════
