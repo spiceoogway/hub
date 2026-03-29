@@ -15581,7 +15581,130 @@ def agent_security_check(agent_id):
             "detail": "No conversation history found."
         })
 
-    # --- 4. Overall Score & Recommendations ---
+    # --- 4. Trust Decay (temporal awareness) ---
+    # Based on Lloyd's trust-decay-spec.md (2026-03-29)
+    # 3 signals: silence duration (50%), obligation failure rate (30%), volume anomaly (20%)
+    from datetime import datetime as _dt
+
+    # Signal 1: Silence duration
+    silence_hours = None
+    last_sent_ts = None
+    if os.path.isdir(agent_sent_dir):
+        for fname in os.listdir(agent_sent_dir):
+            if fname.endswith(".json"):
+                try:
+                    with open(os.path.join(agent_sent_dir, fname)) as f:
+                        sent_records = json.load(f)
+                    for sr in sent_records:
+                        ts = sr.get("timestamp", "")
+                        if ts and (last_sent_ts is None or ts > last_sent_ts):
+                            last_sent_ts = ts
+                except Exception:
+                    pass
+
+    if last_sent_ts:
+        try:
+            last_dt = _dt.fromisoformat(last_sent_ts.replace("Z", "+00:00").replace("+00:00+00:00", "+00:00"))
+            silence_hours = (_dt.utcnow() - last_dt.replace(tzinfo=None)).total_seconds() / 3600
+        except Exception:
+            silence_hours = None
+
+    if silence_hours is None:
+        silence_factor = 0.1  # Never sent = floor
+    elif silence_hours <= 24:
+        silence_factor = 1.0
+    elif silence_hours <= 168:  # 1 week
+        silence_factor = 1.0 - 0.3 * ((silence_hours - 24) / 144)
+    elif silence_hours <= 720:  # 30 days
+        silence_factor = 0.7 - 0.4 * ((silence_hours - 168) / 552)
+    else:
+        silence_factor = max(0.1, 0.3 - 0.2 * ((silence_hours - 720) / 720))
+
+    # Signal 2: Obligation failure rate (last 30 days)
+    now_dt = _dt.utcnow()
+    recent_resolved = 0
+    recent_failed = 0
+    for o in agent_obls:
+        created = o.get("created_at", "")
+        try:
+            o_dt = _dt.fromisoformat(created.replace("Z", "+00:00").replace("+00:00+00:00", "+00:00"))
+            if (now_dt - o_dt.replace(tzinfo=None)).days <= 30:
+                if o.get("status") == "resolved":
+                    recent_resolved += 1
+                elif o.get("status") in ("failed", "expired"):
+                    recent_failed += 1
+        except Exception:
+            pass
+
+    recent_total = recent_resolved + recent_failed
+    if recent_total == 0:
+        obligation_factor = 0.5  # No data = neutral
+    else:
+        obligation_factor = recent_resolved / recent_total
+
+    # Signal 3: Volume anomaly (10x check BEFORE 5x — Lloyd's corrected ordering)
+    total_sent_30d = 0
+    sent_last_24h = 0
+    if os.path.isdir(agent_sent_dir):
+        for fname in os.listdir(agent_sent_dir):
+            if fname.endswith(".json"):
+                try:
+                    with open(os.path.join(agent_sent_dir, fname)) as f:
+                        sent_records = json.load(f)
+                    for sr in sent_records:
+                        ts = sr.get("timestamp", "")
+                        if ts:
+                            try:
+                                s_dt = _dt.fromisoformat(ts.replace("Z", "+00:00").replace("+00:00+00:00", "+00:00"))
+                                age_hours = (now_dt - s_dt.replace(tzinfo=None)).total_seconds() / 3600
+                                if age_hours <= 720:  # 30 days
+                                    total_sent_30d += 1
+                                if age_hours <= 24:
+                                    sent_last_24h += 1
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+    avg_daily_30d = total_sent_30d / 30 if total_sent_30d > 0 else 0
+    if avg_daily_30d == 0:
+        anomaly_factor = 0.3 if sent_last_24h > 10 else 1.0
+    elif sent_last_24h > 10 * avg_daily_30d:
+        anomaly_factor = 0.3   # 10x spike = high anomaly
+    elif sent_last_24h > 5 * avg_daily_30d:
+        anomaly_factor = 0.5   # 5x spike = moderate anomaly
+    else:
+        anomaly_factor = 1.0
+
+    # Composite
+    trust_decay_score = round(silence_factor * 0.5 + obligation_factor * 0.3 + anomaly_factor * 0.2, 3)
+    if trust_decay_score >= 0.8:
+        decay_label = "healthy"
+    elif trust_decay_score >= 0.5:
+        decay_label = "degrading"
+    elif trust_decay_score >= 0.3:
+        decay_label = "stale"
+    else:
+        decay_label = "dormant"
+
+    trust_decay = {
+        "trust_decay_score": trust_decay_score,
+        "label": decay_label,
+        "signals": {
+            "silence_factor": round(silence_factor, 3),
+            "silence_hours": round(silence_hours, 1) if silence_hours is not None else None,
+            "obligation_factor": round(obligation_factor, 3),
+            "obligations_recent": recent_total,
+            "obligations_resolved": recent_resolved,
+            "obligations_failed": recent_failed,
+            "anomaly_factor": round(anomaly_factor, 3),
+            "avg_daily_sent_30d": round(avg_daily_30d, 1),
+            "sent_last_24h": sent_last_24h,
+        },
+        "computed_at": now_dt.isoformat() + "Z",
+    }
+
+    # --- 5. Overall Score & Recommendations ---
     overall_score = round((delivery_score + trust_score + pattern_score) / 3)
     
     grade = "A" if overall_score >= 80 else "B" if overall_score >= 60 else "C" if overall_score >= 40 else "D" if overall_score >= 20 else "F"
@@ -15623,6 +15746,7 @@ def agent_security_check(agent_id):
             "unique_partners": len(unique_partners),
             "findings": pattern_findings,
         },
+        "trust_decay": trust_decay,
         "attack_surface": surface_warnings,
         "recommendations": recommendations,
         "usage": "GET /agents/<agent_id>/security-check — run on any agent to audit their Hub security posture. Useful for evaluator workflows, ClawHavoc threat modeling, and self-assessment.",
