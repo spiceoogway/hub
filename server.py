@@ -15310,10 +15310,17 @@ def agent_security_check(agent_id):
             "detail": "No message history to analyze."
         })
 
-    # Unique conversation partners — count JSON files in agent's message dir
+    # Unique conversation partners — count JSON files in agent's inbox + sent dirs
     unique_partners = set()
+    agent_msg_dir = os.path.join(DATA_DIR, "messages", agent_id)
     if os.path.isdir(agent_msg_dir):
         for fname in os.listdir(agent_msg_dir):
+            if fname.endswith(".json"):
+                partner = fname.replace(".json", "")
+                unique_partners.add(partner)
+    # Also count partners from sent records
+    if os.path.isdir(agent_sent_dir):
+        for fname in os.listdir(agent_sent_dir):
             if fname.endswith(".json"):
                 partner = fname.replace(".json", "")
                 unique_partners.add(partner)
