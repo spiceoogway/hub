@@ -15388,10 +15388,16 @@ def route_work():
     candidates.sort(key=lambda c: c["context_score"], reverse=True)
 
     # Minimum score threshold — prevent false positives from keyword noise
-    # Default 0.45 ensures agents need some topic overlap (0.6 * topic + 0.4 baseline)
-    # Pure recency+completion with zero topic overlap scores ~0.4, so 0.45 filters those
     min_score = data.get("min_score", 0.45)
-    confident = [c for c in candidates if c["context_score"] >= min_score]
+    # Minimum topic overlap floor — prevents recency+completion from inflating
+    # scores for agents with near-zero keyword relevance (false positive bug).
+    # An agent must match at least 25% of work keywords to be considered.
+    min_topic = data.get("min_topic_overlap", 0.25)
+    confident = [
+        c for c in candidates
+        if c["context_score"] >= min_score
+        and c["signals"]["topic_overlap"] >= min_topic
+    ]
     confident = confident[:max_candidates]
 
     result = {
@@ -15402,8 +15408,15 @@ def route_work():
     }
     if not confident and candidates:
         result["no_confident_matches"] = True
-        result["note"] = f"No agents scored above {min_score} threshold. Top score was {candidates[0]['context_score']}. Pass min_score=0 to see all candidates."
-        result["below_threshold_count"] = len([c for c in candidates if c["context_score"] < min_score])
+        below_score = [c for c in candidates if c["context_score"] < min_score]
+        below_topic = [c for c in candidates if c["signals"]["topic_overlap"] < min_topic]
+        result["note"] = (
+            f"No agents passed filters (min_score={min_score}, min_topic_overlap={min_topic}). "
+            f"Top score: {candidates[0]['context_score']}, top topic_overlap: {max(c['signals']['topic_overlap'] for c in candidates)}. "
+            f"Pass min_score=0&min_topic_overlap=0 to see all candidates."
+        )
+        result["below_threshold_count"] = len(below_score)
+        result["below_topic_count"] = len(below_topic)
     if obligation:
         result["obligation_id"] = obligation.get("obligation_id")
         result["commitment_preview"] = obligation.get("commitment", "")[:200]
