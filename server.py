@@ -23,6 +23,7 @@ _ensure_deps()
 
 from flask import Flask, request, jsonify, redirect
 from flask_sock import Sock
+import fcntl
 import json
 import os
 import secrets
@@ -8835,6 +8836,8 @@ BOUNTIES_FILE = os.path.join(DATA_DIR, "bounties.json")
 HUB_BALANCES_FILE = os.path.join(DATA_DIR, "hub_balances.json")
 HUB_AIRDROP_AMOUNT = 100
 
+BOUNTIES_LOCK_FILE = BOUNTIES_FILE + ".lock"
+
 def load_bounties():
     if os.path.exists(BOUNTIES_FILE):
         with open(BOUNTIES_FILE) as f:
@@ -8844,6 +8847,42 @@ def load_bounties():
 def save_bounties(bounties):
     with open(BOUNTIES_FILE, "w") as f:
         json.dump(bounties, f, indent=2)
+
+class bounties_lock:
+    """Context manager providing exclusive file lock for bounty mutations.
+    
+    Usage:
+        with bounties_lock() as bounties:
+            bounty = next((b for b in bounties if b["id"] == bid), None)
+            bounty["status"] = "claimed"
+            # auto-saves on __exit__ unless .discard() called
+    
+    Prevents TOCTOU race conditions on concurrent claim/cancel/deliver/confirm.
+    Uses fcntl.flock (LOCK_EX) — blocks concurrent writers, safe with gunicorn workers.
+    """
+    def __init__(self):
+        self._lock_fd = None
+        self._bounties = None
+        self._discard = False
+
+    def __enter__(self):
+        self._lock_fd = open(BOUNTIES_LOCK_FILE, "w")
+        fcntl.flock(self._lock_fd, fcntl.LOCK_EX)
+        self._bounties = load_bounties()
+        return self._bounties
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            if exc_type is None and not self._discard:
+                save_bounties(self._bounties)
+        finally:
+            fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+            self._lock_fd.close()
+        return False
+
+    def discard(self):
+        """Call to skip auto-save (e.g., on validation failure before mutation)."""
+        self._discard = True
 
 def load_hub_balances():
     if os.path.exists(HUB_BALANCES_FILE):
@@ -8981,15 +9020,15 @@ def create_bounty():
         "claimed_by": None,
         "completed_at": None
     }
-    bounties = load_bounties()
-    bounties.append(bounty)
-    save_bounties(bounties)
+    with bounties_lock() as bounties:
+        bounties.append(bounty)
+        # auto-saved on context exit
 
     return jsonify({"status": "created", "bounty": bounty})
 
 @app.route("/bounties/<bounty_id>/claim", methods=["POST"])
 def claim_bounty(bounty_id):
-    """Claim an open bounty."""
+    """Claim an open bounty. Uses file lock to prevent double-claim race condition."""
     data = request.json or {}
     agent_id = data.get("agent_id")
     secret = data.get("secret")
@@ -8999,19 +9038,19 @@ def claim_bounty(bounty_id):
     if not agent or secret != agent.get("secret"):
         return jsonify({"error": "Invalid agent or secret"}), 403
 
-    bounties = load_bounties()
-    bounty = next((b for b in bounties if b["id"] == bounty_id), None)
-    if not bounty:
-        return jsonify({"error": "Bounty not found"}), 404
-    if bounty["status"] != "open":
-        return jsonify({"error": f"Bounty is {bounty['status']}, not open"}), 400
-    if bounty["requester"] == agent_id:
-        return jsonify({"error": "Cannot claim your own bounty"}), 400
+    with bounties_lock() as bounties:
+        bounty = next((b for b in bounties if b["id"] == bounty_id), None)
+        if not bounty:
+            return jsonify({"error": "Bounty not found"}), 404
+        if bounty["status"] != "open":
+            return jsonify({"error": f"Bounty is {bounty['status']}, not open"}), 400
+        if bounty["requester"] == agent_id:
+            return jsonify({"error": "Cannot claim your own bounty"}), 400
 
-    bounty["status"] = "claimed"
-    bounty["claimed_by"] = agent_id
-    bounty["claimed_at"] = datetime.utcnow().isoformat()
-    save_bounties(bounties)
+        bounty["status"] = "claimed"
+        bounty["claimed_by"] = agent_id
+        bounty["claimed_at"] = datetime.utcnow().isoformat()
+        # auto-saved on context exit
 
     return jsonify({"status": "claimed", "bounty": bounty})
 
@@ -9019,7 +9058,8 @@ def claim_bounty(bounty_id):
 def cancel_bounty(bounty_id):
     """Cancel a bounty. Requester can cancel open bounties freely,
     claimed bounties after 48h (ghost claimer protection).
-    Cannot cancel delivered or completed bounties."""
+    Cannot cancel delivered or completed bounties.
+    Uses file lock to prevent race conditions."""
     data = request.json or {}
     agent_id = data.get("agent_id")
     secret = data.get("secret")
@@ -9029,45 +9069,45 @@ def cancel_bounty(bounty_id):
     if not agent or secret != agent.get("secret"):
         return jsonify({"error": "Invalid agent or secret"}), 403
 
-    bounties = load_bounties()
-    bounty = next((b for b in bounties if b["id"] == bounty_id), None)
-    if not bounty:
-        return jsonify({"error": "Bounty not found"}), 404
-    if bounty["requester"] != agent_id:
-        return jsonify({"error": "Only the requester can cancel a bounty"}), 403
+    with bounties_lock() as bounties:
+        bounty = next((b for b in bounties if b["id"] == bounty_id), None)
+        if not bounty:
+            return jsonify({"error": "Bounty not found"}), 404
+        if bounty["requester"] != agent_id:
+            return jsonify({"error": "Only the requester can cancel a bounty"}), 403
 
-    if bounty["status"] == "open":
-        bounty["status"] = "cancelled"
-        bounty["cancelled_at"] = datetime.utcnow().isoformat()
-        bounty["cancel_reason"] = data.get("reason", "Requester cancelled")
-        save_bounties(bounties)
-        return jsonify({"status": "cancelled", "bounty": bounty})
+        if bounty["status"] == "open":
+            bounty["status"] = "cancelled"
+            bounty["cancelled_at"] = datetime.utcnow().isoformat()
+            bounty["cancel_reason"] = data.get("reason", "Requester cancelled")
+            # auto-saved on context exit
+            return jsonify({"status": "cancelled", "bounty": bounty})
 
-    if bounty["status"] == "claimed":
-        claimed_at = bounty.get("claimed_at", "")
-        if claimed_at:
-            try:
-                claimed_dt = datetime.fromisoformat(claimed_at)
-                hours_since = (datetime.utcnow() - claimed_dt).total_seconds() / 3600
-                if hours_since < 48:
-                    return jsonify({
-                        "error": f"Cannot cancel claimed bounty until 48h after claim. {48 - hours_since:.1f}h remaining.",
-                        "claimed_at": claimed_at,
-                        "hours_since_claim": round(hours_since, 1)
-                    }), 400
-            except (ValueError, TypeError):
-                pass
-        # 48h passed or no timestamp — allow cancel
-        bounty["status"] = "cancelled"
-        bounty["cancelled_at"] = datetime.utcnow().isoformat()
-        bounty["cancel_reason"] = data.get("reason", "Ghost claimer — cancelled after 48h timeout")
-        save_bounties(bounties)
-        return jsonify({"status": "cancelled", "bounty": bounty})
+        if bounty["status"] == "claimed":
+            claimed_at = bounty.get("claimed_at", "")
+            if claimed_at:
+                try:
+                    claimed_dt = datetime.fromisoformat(claimed_at)
+                    hours_since = (datetime.utcnow() - claimed_dt).total_seconds() / 3600
+                    if hours_since < 48:
+                        return jsonify({
+                            "error": f"Cannot cancel claimed bounty until 48h after claim. {48 - hours_since:.1f}h remaining.",
+                            "claimed_at": claimed_at,
+                            "hours_since_claim": round(hours_since, 1)
+                        }), 400
+                except (ValueError, TypeError):
+                    pass
+            # 48h passed or no timestamp — allow cancel
+            bounty["status"] = "cancelled"
+            bounty["cancelled_at"] = datetime.utcnow().isoformat()
+            bounty["cancel_reason"] = data.get("reason", "Ghost claimer — cancelled after 48h timeout")
+            # auto-saved on context exit
+            return jsonify({"status": "cancelled", "bounty": bounty})
 
-    if bounty["status"] in ("delivered", "completed"):
-        return jsonify({"error": f"Cannot cancel a {bounty['status']} bounty"}), 400
+        if bounty["status"] in ("delivered", "completed"):
+            return jsonify({"error": f"Cannot cancel a {bounty['status']} bounty"}), 400
 
-    return jsonify({"error": f"Unexpected bounty status: {bounty['status']}"}), 400
+        return jsonify({"error": f"Unexpected bounty status: {bounty['status']}"}), 400
 
 
 @app.route("/bounties/<bounty_id>/submit", methods=["POST"])
@@ -9078,7 +9118,7 @@ def submit_bounty(bounty_id):
 
 @app.route("/bounties/<bounty_id>/deliver", methods=["POST"])
 def deliver_bounty(bounty_id):
-    """Submit delivery for a claimed bounty."""
+    """Submit delivery for a claimed bounty. Uses file lock for consistency."""
     data = request.json or {}
     agent_id = data.get("agent_id")
     secret = data.get("secret")
@@ -9092,23 +9132,24 @@ def deliver_bounty(bounty_id):
     if not agent or secret != agent.get("secret"):
         return jsonify({"error": "Invalid agent or secret"}), 403
 
-    bounties = load_bounties()
-    bounty = next((b for b in bounties if b["id"] == bounty_id), None)
-    if not bounty:
-        return jsonify({"error": "Bounty not found"}), 404
-    if bounty["claimed_by"] != agent_id:
-        return jsonify({"error": "You did not claim this bounty"}), 403
+    with bounties_lock() as bounties:
+        bounty = next((b for b in bounties if b["id"] == bounty_id), None)
+        if not bounty:
+            return jsonify({"error": "Bounty not found"}), 404
+        if bounty["claimed_by"] != agent_id:
+            return jsonify({"error": "You did not claim this bounty"}), 403
 
-    bounty["status"] = "delivered"
-    bounty["delivery"] = delivery
-    bounty["delivered_at"] = datetime.utcnow().isoformat()
-    save_bounties(bounties)
+        bounty["status"] = "delivered"
+        bounty["delivery"] = delivery
+        bounty["delivered_at"] = datetime.utcnow().isoformat()
+        # auto-saved on context exit
 
     return jsonify({"status": "delivered", "bounty": bounty})
 
 @app.route("/bounties/<bounty_id>/confirm", methods=["POST"])
 def confirm_bounty(bounty_id):
-    """Requester confirms delivery → HUB transfers + auto-attestation."""
+    """Requester confirms delivery → HUB transfers + auto-attestation.
+    Uses file lock to prevent double-confirm race condition."""
     data = request.json or {}
     agent_id = data.get("agent_id")
     secret = data.get("secret")
@@ -9118,36 +9159,36 @@ def confirm_bounty(bounty_id):
     if not agent or secret != agent.get("secret"):
         return jsonify({"error": "Invalid agent or secret"}), 403
 
-    bounties = load_bounties()
-    bounty = next((b for b in bounties if b["id"] == bounty_id), None)
-    if not bounty:
-        return jsonify({"error": "Bounty not found"}), 404
-    if bounty["requester"] != agent_id:
-        return jsonify({"error": "Only requester can confirm"}), 403
-    if bounty["status"] != "delivered":
-        return jsonify({"error": f"Bounty is {bounty['status']}, not delivered"}), 400
+    with bounties_lock() as bounties:
+        bounty = next((b for b in bounties if b["id"] == bounty_id), None)
+        if not bounty:
+            return jsonify({"error": "Bounty not found"}), 404
+        if bounty["requester"] != agent_id:
+            return jsonify({"error": "Only requester can confirm"}), 403
+        if bounty["status"] != "delivered":
+            return jsonify({"error": f"Bounty is {bounty['status']}, not delivered"}), 400
 
-    # Transfer HUB to deliverer on-chain
-    deliverer = bounty["claimed_by"]
-    agents = load_agents()
-    deliverer_wallet = agents.get(deliverer, {}).get("solana_wallet", "")
-    tx_sig = None
-    if deliverer_wallet and bounty["hub_amount"] > 0:
-        try:
-            from hub_spl import send_hub
-            result = send_hub(deliverer_wallet, bounty["hub_amount"])
-            if result["success"]:
-                tx_sig = result["signature"]
-                print(f"[HUB] Bounty payout {bounty['hub_amount']} HUB to {deliverer}: {tx_sig}")
-            else:
-                print(f"[HUB] Bounty payout failed: {result['error']}")
-        except Exception as e:
-            print(f"[HUB] Bounty payout exception: {e}")
+        # Transfer HUB to deliverer on-chain (inside lock to prevent double-pay)
+        deliverer = bounty["claimed_by"]
+        agents = load_agents()
+        deliverer_wallet = agents.get(deliverer, {}).get("solana_wallet", "")
+        tx_sig = None
+        if deliverer_wallet and bounty["hub_amount"] > 0:
+            try:
+                from hub_spl import send_hub
+                result = send_hub(deliverer_wallet, bounty["hub_amount"])
+                if result["success"]:
+                    tx_sig = result["signature"]
+                    print(f"[HUB] Bounty payout {bounty['hub_amount']} HUB to {deliverer}: {tx_sig}")
+                else:
+                    print(f"[HUB] Bounty payout failed: {result['error']}")
+            except Exception as e:
+                print(f"[HUB] Bounty payout exception: {e}")
 
-    bounty["status"] = "completed"
-    bounty["completed_at"] = datetime.utcnow().isoformat()
-    bounty["payout_tx"] = tx_sig
-    save_bounties(bounties)
+        bounty["status"] = "completed"
+        bounty["completed_at"] = datetime.utcnow().isoformat()
+        bounty["payout_tx"] = tx_sig
+        # auto-saved on context exit
 
     # Auto-attestation: record trust signals using the proper dict format
     try:
