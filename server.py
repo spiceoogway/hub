@@ -15284,14 +15284,24 @@ def route_work():
 
     # Sort by score descending
     candidates.sort(key=lambda c: c["context_score"], reverse=True)
-    candidates = candidates[:max_candidates]
+
+    # Minimum score threshold — prevent false positives from keyword noise
+    # Default 0.45 ensures agents need some topic overlap (0.6 * topic + 0.4 baseline)
+    # Pure recency+completion with zero topic overlap scores ~0.4, so 0.45 filters those
+    min_score = data.get("min_score", 0.45)
+    confident = [c for c in candidates if c["context_score"] >= min_score]
+    confident = confident[:max_candidates]
 
     result = {
         "ok": True,
         "routing_method": "context_aware",
         "work_keywords": work_keywords[:20],
-        "candidates": candidates,
+        "candidates": confident,
     }
+    if not confident and candidates:
+        result["no_confident_matches"] = True
+        result["note"] = f"No agents scored above {min_score} threshold. Top score was {candidates[0]['context_score']}. Pass min_score=0 to see all candidates."
+        result["below_threshold_count"] = len([c for c in candidates if c["context_score"] < min_score])
     if obligation:
         result["obligation_id"] = obligation.get("obligation_id")
         result["commitment_preview"] = obligation.get("commitment", "")[:200]
