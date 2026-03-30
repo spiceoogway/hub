@@ -1958,6 +1958,7 @@ def update_agent(agent_id):
 # Designed with StarAgent (verifier) and quadricep (audit + implementation).
 
 PUBKEYS_FILE = DATA_DIR / "pubkeys.json"
+AGENT_SIGNING_KEYS_FILE = DATA_DIR / "agent_signing_keys.json"
 
 def _load_pubkeys():
     """Load per-agent pubkey registry. Returns dict: agent_id -> list of key objects."""
@@ -1992,6 +1993,67 @@ def _lookup_agent_by_pubkey(pubkey_b64_or_hex):
             if key.get("active", True) and key.get("public_key") == search_b64:
                 return agent_id, key
     return None, None
+
+
+def _load_agent_signing_keys():
+    if AGENT_SIGNING_KEYS_FILE.exists():
+        try:
+            with open(AGENT_SIGNING_KEYS_FILE) as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_agent_signing_keys(data):
+    with open(AGENT_SIGNING_KEYS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def _canonical_agent_attestation_payload(export_data, attestation_meta):
+    import copy
+    payload = {
+        "obligation_id": export_data.get("obligation_id"),
+        "evidence_refs": copy.deepcopy(export_data.get("evidence_refs", [])),
+        "history": copy.deepcopy(export_data.get("history", [])),
+        "agent_attestation": {
+            "agent_id": attestation_meta.get("agent_id"),
+            "key_id": attestation_meta.get("key_id"),
+            "algorithm": attestation_meta.get("algorithm", "Ed25519"),
+            "signed_at": attestation_meta.get("signed_at"),
+            "claim_type": attestation_meta.get("claim_type", "export_snapshot")
+        }
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def _maybe_build_agent_attestation(export_data, agent_id):
+    """Best-effort per-agent attestation for one export fixture lane.
+    Uses a custodial test signing key generated via authenticated endpoint."""
+    import base64
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    signing = _load_agent_signing_keys().get(agent_id)
+    if not signing:
+        return None
+    key_id = signing.get("key_id")
+    private_b64 = signing.get("private_key")
+    if not key_id or not private_b64:
+        return None
+    signed_at = datetime.utcnow().isoformat() + "Z"
+    meta = {
+        "agent_id": agent_id,
+        "key_id": key_id,
+        "algorithm": "Ed25519",
+        "signed_at": signed_at,
+        "claim_type": "export_snapshot"
+    }
+    private_key = Ed25519PrivateKey.from_private_bytes(base64.b64decode(private_b64))
+    canonical = _canonical_agent_attestation_payload(export_data, meta)
+    signature = private_key.sign(canonical)
+    meta["signature"] = base64.b64encode(signature).decode()
+    meta["signed_fields"] = "obligation_id,evidence_refs,history,agent_attestation"
+    meta["verification"] = "Resolve public key via GET /agents/{agent_id}/pubkeys, reconstruct canonical payload, verify detached Ed25519 signature."
+    return meta
 
 
 @app.route("/agents/<agent_id>/pubkeys", methods=["POST"])
@@ -2071,6 +2133,52 @@ def register_pubkey(agent_id):
         "registered_at": key_record["registered_at"],
         "active_keys": active_count + 1,
     }), 201
+
+
+@app.route("/agents/<agent_id>/pubkeys/generate-test-key", methods=["POST"])
+def generate_test_pubkey(agent_id):
+    """Generate and register a custodial test Ed25519 key for fixture signing.
+    Auth by agent secret. Intended for bounded export-fixture work, not general production use."""
+    import base64
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives import serialization
+    data = request.get_json() or {}
+    secret = data.get("secret", "")
+    agents = load_agents()
+    if agent_id not in agents:
+        return jsonify({"ok": False, "error": "Agent not found"}), 404
+    if agents[agent_id].get("secret") != secret:
+        return jsonify({"ok": False, "error": "Invalid secret"}), 403
+
+    priv = Ed25519PrivateKey.generate()
+    pub = priv.public_key()
+    pub_raw = pub.public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
+    priv_raw = priv.private_bytes(encoding=serialization.Encoding.Raw, format=serialization.PrivateFormat.Raw, encryption_algorithm=serialization.NoEncryption())
+    pub_b64 = base64.b64encode(pub_raw).decode()
+
+    pubkeys = _load_pubkeys()
+    agent_keys = pubkeys.get(agent_id, [])
+    active_count = sum(1 for k in agent_keys if k.get("active", True))
+    if active_count >= 3:
+        return jsonify({"ok": False, "error": "Max 3 active keys per agent. Revoke one first via DELETE."}), 400
+    key_id = f"key-{secrets.token_hex(4)}"
+    key_record = {
+        "key_id": key_id,
+        "public_key": pub_b64,
+        "algorithm": "Ed25519",
+        "label": data.get("label", "fixture-test"),
+        "registered_at": datetime.utcnow().isoformat() + "Z",
+        "active": True,
+    }
+    agent_keys.append(key_record)
+    pubkeys[agent_id] = agent_keys
+    _save_pubkeys(pubkeys)
+
+    signing = _load_agent_signing_keys()
+    signing[agent_id] = {"key_id": key_id, "private_key": base64.b64encode(priv_raw).decode(), "created_at": datetime.utcnow().isoformat() + "Z"}
+    _save_agent_signing_keys(signing)
+
+    return jsonify({"ok": True, "agent_id": agent_id, "key_id": key_id, "public_key": pub_b64, "note": "Custodial test key generated and registered for fixture signing."}), 201
 
 
 @app.route("/agents/<agent_id>/pubkeys", methods=["GET"])
