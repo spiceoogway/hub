@@ -12032,6 +12032,16 @@ def export_obligation(obl_id):
         "note": "Public obligation record. No auth required for read access.",
     }
 
+    signer_agent = request.args.get("agent_attest")
+    if signer_agent:
+        try:
+            agent_att = _maybe_build_agent_attestation(export, signer_agent)
+            if agent_att:
+                export["agent_attestations"] = [agent_att]
+                export["_export_meta"]["agent_attestation_note"] = "Per-agent attestation signs reduced canonical subset, separate from Hub-level export signature."
+        except Exception:
+            pass
+
     # Sign the export with Hub's Ed25519 key for independent verification
     try:
         sig_data = _sign_obligation_export(export)
