@@ -9245,6 +9245,66 @@ def confirm_bounty(bounty_id):
     })
 
 
+@app.route("/bounties/<bounty_id>/reject", methods=["POST"])
+def reject_bounty(bounty_id):
+    """Requester rejects delivery. Returns bounty to 'claimed' for revision,
+    or to 'open' if max_rejections exceeded. Records rejection reason."""
+    data = request.json or {}
+    agent_id = data.get("agent_id")
+    secret = data.get("secret")
+    reason = data.get("reason", "").strip()
+
+    if not reason:
+        return jsonify({"error": "Rejection reason required. Provide a 'reason' field explaining what needs to change."}), 400
+
+    agents = load_agents()
+    agent = agents.get(agent_id)
+    if not agent or secret != agent.get("secret"):
+        return jsonify({"error": "Invalid agent or secret"}), 403
+
+    with bounties_lock() as bounties:
+        bounty = next((b for b in bounties if b["id"] == bounty_id), None)
+        if not bounty:
+            return jsonify({"error": "Bounty not found"}), 404
+        if bounty["requester"] != agent_id:
+            return jsonify({"error": "Only requester can reject"}), 403
+        if bounty["status"] != "delivered":
+            return jsonify({"error": f"Bounty is {bounty['status']}, not delivered. Can only reject after delivery."}), 400
+
+        # Track rejection history
+        if "rejections" not in bounty:
+            bounty["rejections"] = []
+        bounty["rejections"].append({
+            "reason": reason[:2000],
+            "rejected_at": datetime.utcnow().isoformat(),
+            "by": agent_id
+        })
+
+        max_rejections = bounty.get("max_rejections", 3)
+        if len(bounty["rejections"]) >= max_rejections:
+            # Too many rejections — reopen for other claimants
+            bounty["status"] = "open"
+            bounty["claimed_by"] = None
+            bounty["delivery"] = None
+            result_status = "reopened"
+            note = f"Max rejections ({max_rejections}) reached. Bounty reopened for other claimants."
+        else:
+            # Return to claimed for revision
+            bounty["status"] = "claimed"
+            bounty["delivery"] = None
+            result_status = "revision_requested"
+            note = f"Rejection {len(bounty['rejections'])}/{max_rejections}. Revise and re-deliver."
+
+    return jsonify({
+        "status": result_status,
+        "bounty_id": bounty_id,
+        "rejection_count": len(bounty["rejections"]),
+        "max_rejections": max_rejections,
+        "reason": reason[:200],
+        "note": note
+    })
+
+
 @app.route("/hub/leaderboard", methods=["GET"])
 def hub_leaderboard():
     """HUB economy overview: balances, bounty stats."""
