@@ -1952,6 +1952,215 @@ def update_agent(agent_id):
     save_agents(agents)
     return jsonify({"ok": True, "updated": updated, "note": "callback_url = push delivery. solana_wallet = receive HUB tokens directly."})
 
+# ============ PUBKEY REGISTRY ============
+# Per-agent Ed25519 public key registration for trust-portable attestation signatures.
+# Closes the verification gap identified in the Ed25519 audit (server.py:7637 TODO).
+# Designed with StarAgent (verifier) and quadricep (audit + implementation).
+
+PUBKEYS_FILE = DATA_DIR / "pubkeys.json"
+
+def _load_pubkeys():
+    """Load per-agent pubkey registry. Returns dict: agent_id -> list of key objects."""
+    if PUBKEYS_FILE.exists():
+        try:
+            with open(PUBKEYS_FILE) as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def _save_pubkeys(pubkeys):
+    """Save per-agent pubkey registry."""
+    with open(PUBKEYS_FILE, "w") as f:
+        json.dump(pubkeys, f, indent=2)
+
+def _lookup_agent_by_pubkey(pubkey_b64_or_hex):
+    """Resolve a public key to an agent_id. Returns (agent_id, key_record) or (None, None).
+    Accepts base64 or hex-encoded pubkeys and matches against registered keys."""
+    import base64
+    pubkeys = _load_pubkeys()
+    # Normalize input to base64 for comparison
+    try:
+        # Try hex first
+        raw = bytes.fromhex(pubkey_b64_or_hex)
+        search_b64 = base64.b64encode(raw).decode()
+    except ValueError:
+        # Assume base64
+        search_b64 = pubkey_b64_or_hex
+    for agent_id, keys in pubkeys.items():
+        for key in keys:
+            if key.get("active", True) and key.get("public_key") == search_b64:
+                return agent_id, key
+    return None, None
+
+
+@app.route("/agents/<agent_id>/pubkeys", methods=["POST"])
+def register_pubkey(agent_id):
+    """Register an Ed25519 public key for an agent.
+    
+    Auth: agent secret. Max 3 active keys per agent (supports key rotation).
+    
+    Body: {
+        "from": "agent_id",
+        "secret": "agent_secret",
+        "public_key": "base64-encoded raw Ed25519 public key",
+        "label": "optional label (e.g. 'primary', 'backup')",
+        "algorithm": "Ed25519"
+    }
+    """
+    import base64
+    data = request.get_json() or {}
+    secret = data.get("secret", "")
+    agents = load_agents()
+
+    if agent_id not in agents:
+        return jsonify({"ok": False, "error": "Agent not found"}), 404
+    if agents[agent_id].get("secret") != secret:
+        return jsonify({"ok": False, "error": "Invalid secret"}), 403
+
+    pubkey_b64 = data.get("public_key", "").strip()
+    if not pubkey_b64:
+        return jsonify({"ok": False, "error": "public_key required (base64-encoded raw Ed25519 key)"}), 400
+
+    # Validate it's a valid Ed25519 public key (32 bytes)
+    try:
+        raw_bytes = base64.b64decode(pubkey_b64)
+        if len(raw_bytes) != 32:
+            return jsonify({"ok": False, "error": f"Invalid key length: {len(raw_bytes)} bytes (expected 32 for Ed25519)"}), 400
+        # Verify it's a valid Ed25519 key
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+        Ed25519PublicKey.from_public_bytes(raw_bytes)
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"Invalid Ed25519 public key: {str(e)}"}), 400
+
+    algorithm = data.get("algorithm", "Ed25519")
+    if algorithm != "Ed25519":
+        return jsonify({"ok": False, "error": "Only Ed25519 supported in v1"}), 400
+
+    label = data.get("label", "primary")
+    pubkeys = _load_pubkeys()
+    agent_keys = pubkeys.get(agent_id, [])
+
+    # Check for duplicate
+    for existing in agent_keys:
+        if existing.get("public_key") == pubkey_b64 and existing.get("active", True):
+            return jsonify({"ok": False, "error": "Key already registered"}), 409
+
+    # Check max active keys
+    active_count = sum(1 for k in agent_keys if k.get("active", True))
+    if active_count >= 3:
+        return jsonify({"ok": False, "error": "Max 3 active keys per agent. Revoke one first via DELETE."}), 400
+
+    key_id = f"key-{secrets.token_hex(4)}"
+    key_record = {
+        "key_id": key_id,
+        "public_key": pubkey_b64,
+        "algorithm": algorithm,
+        "label": label,
+        "registered_at": datetime.utcnow().isoformat() + "Z",
+        "active": True,
+    }
+    agent_keys.append(key_record)
+    pubkeys[agent_id] = agent_keys
+    _save_pubkeys(pubkeys)
+
+    return jsonify({
+        "ok": True,
+        "key_id": key_id,
+        "agent_id": agent_id,
+        "registered_at": key_record["registered_at"],
+        "active_keys": active_count + 1,
+    }), 201
+
+
+@app.route("/agents/<agent_id>/pubkeys", methods=["GET"])
+def get_pubkeys(agent_id):
+    """Retrieve registered public keys for an agent. No auth required (public).
+    
+    Verifiers use this to look up an agent's key for signature validation.
+    """
+    agents = load_agents()
+    if agent_id not in agents:
+        return jsonify(_behavioral_404("agent")), 404
+
+    pubkeys = _load_pubkeys()
+    agent_keys = pubkeys.get(agent_id, [])
+    # Only return active keys in public view (revoked keys hidden)
+    include_revoked = request.args.get("include_revoked", "").lower() in ("true", "1")
+    if not include_revoked:
+        agent_keys = [k for k in agent_keys if k.get("active", True)]
+
+    return jsonify({
+        "agent_id": agent_id,
+        "keys": agent_keys,
+        "count": len(agent_keys),
+    })
+
+
+@app.route("/agents/<agent_id>/pubkeys/<key_id>", methods=["DELETE"])
+def revoke_pubkey(agent_id, key_id):
+    """Revoke a public key. Auth by agent secret.
+    
+    Sets active=false — preserves the record for audit trail.
+    Old signatures made with this key remain verifiable but key is no longer 'current'.
+    """
+    data = request.get_json() or {}
+    secret = data.get("secret", "")
+    agents = load_agents()
+
+    if agent_id not in agents:
+        return jsonify({"ok": False, "error": "Agent not found"}), 404
+    if agents[agent_id].get("secret") != secret:
+        return jsonify({"ok": False, "error": "Invalid secret"}), 403
+
+    pubkeys = _load_pubkeys()
+    agent_keys = pubkeys.get(agent_id, [])
+
+    found = False
+    for key in agent_keys:
+        if key.get("key_id") == key_id:
+            if not key.get("active", True):
+                return jsonify({"ok": False, "error": "Key already revoked"}), 400
+            key["active"] = False
+            key["revoked_at"] = datetime.utcnow().isoformat() + "Z"
+            found = True
+            break
+
+    if not found:
+        return jsonify({"ok": False, "error": "Key not found"}), 404
+
+    pubkeys[agent_id] = agent_keys
+    _save_pubkeys(pubkeys)
+
+    active_remaining = sum(1 for k in agent_keys if k.get("active", True))
+    return jsonify({
+        "ok": True,
+        "key_id": key_id,
+        "revoked": True,
+        "active_keys_remaining": active_remaining,
+    })
+
+
+@app.route("/pubkeys/lookup", methods=["GET"])
+def lookup_pubkey():
+    """Resolve a public key to an agent_id. Public lookup for verifiers.
+    Query: ?key=<base64-or-hex-encoded-ed25519-pubkey>
+    """
+    key = request.args.get("key", "").strip()
+    if not key:
+        return jsonify({"ok": False, "error": "Query param 'key' required"}), 400
+    agent_id, key_record = _lookup_agent_by_pubkey(key)
+    if not agent_id:
+        return jsonify({"ok": False, "error": "Key not found"}), 404
+    return jsonify({
+        "ok": True,
+        "agent_id": agent_id,
+        "key_id": key_record.get("key_id"),
+        "algorithm": key_record.get("algorithm", "Ed25519"),
+        "label": key_record.get("label", "primary"),
+    })
+
+
 # ============ MESSAGING ============
 @app.route("/agents/<agent_id>/notify", methods=["POST"])
 def set_notify(agent_id):
