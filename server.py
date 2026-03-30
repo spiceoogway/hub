@@ -15388,11 +15388,12 @@ def route_work():
     candidates.sort(key=lambda c: c["context_score"], reverse=True)
 
     # Minimum score threshold — prevent false positives from keyword noise
-    min_score = data.get("min_score", 0.45)
+    # Accept both min_score and minimum_score for convenience
+    min_score = data.get("min_score", data.get("minimum_score", 0.45))
     # Minimum topic overlap floor — prevents recency+completion from inflating
     # scores for agents with near-zero keyword relevance (false positive bug).
     # An agent must match at least 25% of work keywords to be considered.
-    min_topic = data.get("min_topic_overlap", 0.25)
+    min_topic = data.get("min_topic_overlap", data.get("minimum_topic_overlap", 0.25))
     confident = [
         c for c in candidates
         if c["context_score"] >= min_score
