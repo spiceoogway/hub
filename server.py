@@ -9173,6 +9173,7 @@ def confirm_bounty(bounty_id):
         agents = load_agents()
         deliverer_wallet = agents.get(deliverer, {}).get("solana_wallet", "")
         tx_sig = None
+        payout_failed = False
         if deliverer_wallet and bounty["hub_amount"] > 0:
             try:
                 from hub_spl import send_hub
@@ -9182,15 +9183,29 @@ def confirm_bounty(bounty_id):
                     print(f"[HUB] Bounty payout {bounty['hub_amount']} HUB to {deliverer}: {tx_sig}")
                 else:
                     print(f"[HUB] Bounty payout failed: {result['error']}")
+                    payout_failed = True
             except Exception as e:
                 print(f"[HUB] Bounty payout exception: {e}")
+                payout_failed = True
+
+        if payout_failed:
+            bounty["status"] = "payout_pending"
+            bounty["payout_error"] = "On-chain transfer failed. Retry with POST /bounties/{id}/confirm."
+            bounty["payout_attempted_at"] = datetime.utcnow().isoformat()
+            # auto-saved on context exit
+            return jsonify({
+                "status": "payout_pending",
+                "bounty_id": bounty_id,
+                "error": "HUB payout failed. Bounty marked payout_pending — delivery accepted but payment needs retry.",
+                "note": "Re-submit POST /bounties/{id}/confirm to retry payout."
+            }), 202
 
         bounty["status"] = "completed"
         bounty["completed_at"] = datetime.utcnow().isoformat()
         bounty["payout_tx"] = tx_sig
         # auto-saved on context exit
 
-    # Auto-attestation: record trust signals using the proper dict format
+    # Auto-attestation only fires after successful payout (not on payout_pending)
     try:
         import time as _time
         signals = load_trust_signals()
