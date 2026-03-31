@@ -511,8 +511,13 @@ def _compute_agent_permission_state(agent_id, agents=None, obligations=None):
         if isinstance(base, (int, float)):
             effective_limits[key] = round(base * trust_multiplier, 3)
 
+    allowed_actions = operator_constraints.get("allowed_actions", [])
+    denied_actions = operator_constraints.get("denied_actions", [])
+
     return {
         "agent_id": agent_id,
+        "allowed_actions": allowed_actions,
+        "denied_actions": denied_actions,
         "permissions": {
             "operator_constraints": operator_constraints,
             "peer_grants": peer_grants,
@@ -12611,6 +12616,40 @@ def advance_obligation(obl_id):
 
     save_obligations(obls)
 
+    # --- Phase 1 peer grant auto-creation on acceptance ---
+    peer_grants_created = []
+    if new_status == "accepted":
+        try:
+            parties = [p["agent_id"] for p in obl.get("parties", []) if p.get("agent_id")]
+            if len(parties) >= 2:
+                obligation_actions = [
+                    "advance_obligation", "submit_evidence", "send_message",
+                ]
+                for party in parties:
+                    other_parties = [p for p in parties if p != party]
+                    existing_grants = agents.get(party, {}).get("permissions", {}).get("peer_grants", [])
+                    for other in other_parties:
+                        # Check if grant already exists for this obligation
+                        already_exists = any(
+                            g.get("granted_by_obligation") == obl_id and g.get("peer") == other
+                            for g in existing_grants
+                        )
+                        if not already_exists:
+                            grant = {
+                                "peer": other,
+                                "actions": obligation_actions,
+                                "granted_by_obligation": obl_id,
+                                "granted_at": now,
+                                "expires_at": obl.get("deadline_utc"),
+                            }
+                            agents.setdefault(party, {}).setdefault("permissions", {}).setdefault("peer_grants", []).append(grant)
+                            peer_grants_created.append({"agent": party, "peer": other, "obligation": obl_id})
+                if peer_grants_created:
+                    save_agents(agents)
+                    print(f"[PEER-GRANT] Auto-created {len(peer_grants_created)} peer grants for obligation {obl_id}")
+        except Exception as e:
+            print(f"[PEER-GRANT] Error creating peer grants for {obl_id}: {e}")
+
     # --- Obligation state-change webhook: notify counterparty ---
     try:
         _fire_obligation_state_webhook(obl, agent_id, current, new_status, data.get("note"))
@@ -12618,6 +12657,8 @@ def advance_obligation(obl_id):
         print(f"[OBL-WEBHOOK] State notification error on {obl_id}: {e}")
 
     resp = {"obligation": obl}
+    if peer_grants_created:
+        resp["peer_grants_created"] = peer_grants_created
     if rearticulation_warning:
         resp["warning"] = rearticulation_warning
     return jsonify(resp)
