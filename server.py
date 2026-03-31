@@ -448,6 +448,82 @@ def save_agents(agents):
     with open(AGENTS_FILE, "w") as f:
         json.dump(agents, f, indent=2)
 
+
+def _trust_multiplier_from_decay(score):
+    """Map trust decay score to effective-limit multiplier.
+
+    Phase 1 helper for permission scoping. Mirrors Lloyd's 2026-03-29 spec.
+    """
+    try:
+        score = float(score)
+    except (TypeError, ValueError):
+        return 1.0
+    if score >= 0.8:
+        return 1.0
+    if score >= 0.5:
+        return 0.75
+    if score >= 0.3:
+        return 0.5
+    if score >= 0.1:
+        return 0.25
+    return 0.0
+
+
+def _compute_agent_permission_state(agent_id, agents=None, obligations=None):
+    """Return operator constraints + effective limits for an agent.
+
+    Phase 1 is intentionally additive/non-breaking:
+    - No constraints configured => unrestricted behavior, visibility only.
+    - Effective numeric limits apply trust decay multiplier.
+    - trust_multiplier uses decay score already capped by min(composite, anomaly_factor).
+    """
+    if agents is None:
+        agents = load_agents()
+    info = agents.get(agent_id)
+    if not info:
+        return None
+
+    permissions = info.get("permissions") or {}
+    operator_constraints = permissions.get("operator_constraints") or {}
+    peer_grants = permissions.get("peer_grants") or []
+
+    trust_decay = None
+    try:
+        if obligations is None:
+            obligations = load_obligations()
+        trust_decay = _compute_trust_decay(agent_id, info, obligations)
+    except Exception:
+        trust_decay = None
+
+    trust_score = ((trust_decay or {}).get("trust_decay_score") if isinstance(trust_decay, dict) else None)
+    trust_multiplier = _trust_multiplier_from_decay(trust_score)
+
+    numeric_keys = [
+        "max_obligation_hub",
+        "max_messages_per_hour",
+        "max_obligations_per_day",
+        "max_trust_attestations_per_day",
+        "max_recipients_per_hour",
+    ]
+    effective_limits = {}
+    for key in numeric_keys:
+        base = operator_constraints.get(key)
+        if isinstance(base, (int, float)):
+            effective_limits[key] = round(base * trust_multiplier, 3)
+
+    return {
+        "agent_id": agent_id,
+        "permissions": {
+            "operator_constraints": operator_constraints,
+            "peer_grants": peer_grants,
+        },
+        "effective_limits": effective_limits,
+        "trust_decay": trust_decay,
+        "trust_multiplier": trust_multiplier,
+        "mode": "unrestricted" if not operator_constraints else "constrained",
+        "computed_at": datetime.utcnow().isoformat() + "Z",
+    }
+
 def get_inbox_path(agent_id):
     return MESSAGES_DIR / f"{agent_id}.json"
 
@@ -1619,6 +1695,24 @@ def get_agent(agent_id):
     result["liveness"] = _compute_agent_liveness(agent_id, agents)
     return jsonify(result)
 
+
+@app.route("/agents/<agent_id>/permissions", methods=["GET"])
+def get_agent_permissions(agent_id):
+    """Return current permission constraints + trust-adjusted effective limits.
+
+    Phase 1 visibility endpoint from Lloyd's permission-scoping spec.
+    Public read by default: operators/counterparties need to inspect constraint posture.
+    """
+    agents = load_agents()
+    if agent_id not in agents:
+        return jsonify(_behavioral_404("agent")), 404
+
+    obligations = load_obligations()
+    if _expire_obligations(obligations):
+        save_obligations(obligations)
+    state = _compute_agent_permission_state(agent_id, agents=agents, obligations=obligations)
+    return jsonify(state)
+
 @app.route("/agents/<agent_id>/portfolio", methods=["GET"])
 def agent_portfolio(agent_id):
     """Public obligation portfolio for an agent.
@@ -1889,6 +1983,28 @@ def update_agent(agent_id):
     if "capabilities" in data:
         agents[agent_id]["capabilities"] = data["capabilities"]
         updated.append("capabilities")
+    if "allowed_actions" in data:
+        if not isinstance(data["allowed_actions"], list) or not all(isinstance(x, str) for x in data["allowed_actions"]):
+            return jsonify({"ok": False, "error": "allowed_actions must be a list of strings"}), 400
+        agents[agent_id].setdefault("permissions", {}).setdefault("operator_constraints", {})["allowed_actions"] = data["allowed_actions"]
+        updated.append("allowed_actions")
+    if "permissions" in data:
+        perms = data["permissions"]
+        if not isinstance(perms, dict):
+            return jsonify({"ok": False, "error": "permissions must be an object"}), 400
+        existing = agents[agent_id].get("permissions") or {}
+        operator_constraints = perms.get("operator_constraints")
+        peer_grants = perms.get("peer_grants")
+        if operator_constraints is not None:
+            if not isinstance(operator_constraints, dict):
+                return jsonify({"ok": False, "error": "permissions.operator_constraints must be an object"}), 400
+            existing["operator_constraints"] = operator_constraints
+        if peer_grants is not None:
+            if not isinstance(peer_grants, list):
+                return jsonify({"ok": False, "error": "permissions.peer_grants must be a list"}), 400
+            existing["peer_grants"] = peer_grants
+        agents[agent_id]["permissions"] = existing
+        updated.append("permissions")
     if "intent" in data:
         intent = data["intent"]
         if isinstance(intent, dict):
@@ -5047,6 +5163,159 @@ def save_attestations(data):
     with open(ATTESTATIONS_FILE, "w") as f:
         json.dump(data, f, indent=2)
 
+
+
+@app.route("/trust/topology/<agent_id>", methods=["GET"])
+def trust_topology(agent_id):
+    """Return transaction-type-aware partner topology for one agent.
+
+    Purpose: decision surface for choosing who to involve in a live workflow.
+    Query params:
+    - transaction_type: optional label like obligation|payment|integration|research
+    - partner: optional peer filter
+    - limit: max partner rows (default 5, max 20)
+    """
+    from collections import Counter, defaultdict
+
+    transaction_type = (request.args.get("transaction_type") or "all").strip().lower()
+    partner_filter = (request.args.get("partner") or "").strip()
+    try:
+        limit = int(request.args.get("limit", 5))
+    except (TypeError, ValueError):
+        limit = 5
+    limit = max(1, min(limit, 20))
+
+    pair_stats, _, _ = _scan_all_pairs()
+    obligations = load_obligations()
+    agents = load_agents()
+
+    topology = defaultdict(lambda: {
+        "partner": None,
+        "pair": [],
+        "message_count": 0,
+        "artifact_rate": 0.0,
+        "artifact_types": {},
+        "capability_overlap": [],
+        "obligation_count": 0,
+        "resolved_obligations": 0,
+        "failed_obligations": 0,
+        "last_obligation_at": None,
+        "last_interaction": None,
+        "transaction_types": Counter(),
+        "usable_examples": [],
+        "decision_signals": {},
+    })
+
+    def _label_obligation_type(obl):
+        text_bits = " ".join([
+            str(obl.get("commitment", "")),
+            str(obl.get("success_condition", "")),
+            str(obl.get("binding_scope_text", "")),
+        ]).lower()
+        if any(k in text_bits for k in ["pay", "payment", "settlement", "escrow", "hub token", "wallet"]):
+            return "payment"
+        if any(k in text_bits for k in ["endpoint", "api", "deploy", "integration", "server", "repo", "commit", "code", "spec"]):
+            return "integration"
+        if any(k in text_bits for k in ["research", "analysis", "competitive", "synthesis", "audit", "review"]):
+            return "research"
+        return "obligation"
+
+    for pair_key, stats in pair_stats.items():
+        agents_in_pair = list(stats.get("agents", []))
+        if agent_id not in agents_in_pair or len(agents_in_pair) != 2:
+            continue
+        partner = agents_in_pair[0] if agents_in_pair[1] == agent_id else agents_in_pair[1]
+        if partner_filter and partner != partner_filter:
+            continue
+        row = topology[partner]
+        row["partner"] = partner
+        row["pair"] = [agent_id, partner]
+        row["message_count"] = stats.get("messages", 0)
+        msg_count = stats.get("messages", 0) or 0
+        row["artifact_rate"] = round((stats.get("artifact_refs", 0) / msg_count), 3) if msg_count else 0.0
+        row["artifact_types"] = dict(sorted(stats.get("artifact_types", {}).items(), key=lambda kv: kv[1], reverse=True))
+        row["last_interaction"] = stats.get("last")
+        agent_caps = set((agents.get(agent_id, {}) or {}).get("capabilities", []))
+        partner_caps = set((agents.get(partner, {}) or {}).get("capabilities", []))
+        row["capability_overlap"] = sorted(agent_caps & partner_caps)
+
+    for obl in obligations:
+        parties = {b.get("agent_id") for b in obl.get("role_bindings", []) if b.get("agent_id")}
+        if not parties:
+            parties = {p.get("agent_id") for p in obl.get("parties", []) if p.get("agent_id")}
+        if agent_id not in parties:
+            continue
+        other_parties = [p for p in parties if p != agent_id]
+        if not other_parties:
+            continue
+        obl_type = _label_obligation_type(obl)
+        for partner in other_parties:
+            if partner_filter and partner != partner_filter:
+                continue
+            if transaction_type != "all" and obl_type != transaction_type:
+                continue
+            row = topology[partner]
+            row["partner"] = partner
+            row["pair"] = [agent_id, partner]
+            row["transaction_types"][obl_type] += 1
+            row["obligation_count"] += 1
+            if obl.get("status") == "resolved":
+                row["resolved_obligations"] += 1
+            if obl.get("status") == "failed":
+                row["failed_obligations"] += 1
+            created_at = obl.get("created_at")
+            if created_at and (not row["last_obligation_at"] or created_at > row["last_obligation_at"]):
+                row["last_obligation_at"] = created_at
+            example = {
+                "obligation_id": obl.get("obligation_id"),
+                "type": obl_type,
+                "status": obl.get("status"),
+                "commitment_preview": (obl.get("commitment", "") or "")[:140],
+                "success_condition_preview": (obl.get("success_condition", "") or "")[:140],
+            }
+            if len(row["usable_examples"]) < 3:
+                row["usable_examples"].append(example)
+
+    rows = []
+    for partner, row in topology.items():
+        if transaction_type != "all" and row["obligation_count"] == 0:
+            continue
+        resolved = row["resolved_obligations"]
+        failed = row["failed_obligations"]
+        total = row["obligation_count"]
+        resolution_rate = round(resolved / total, 3) if total else None
+        row["transaction_types"] = dict(sorted(row["transaction_types"].items(), key=lambda kv: kv[1], reverse=True))
+        row["decision_signals"] = {
+            "resolution_rate": resolution_rate,
+            "last_transaction_at": row["last_obligation_at"] or row["last_interaction"],
+            "message_count": row["message_count"],
+            "artifact_rate": row["artifact_rate"],
+            "failed_count": failed,
+            "must_have_field": "decision_signals.resolution_rate",
+            "why_profile_fails": "Generic trust profile compresses counterparties together; coordination choices need per-partner, per-transaction-type history.",
+            "veto_condition": "failed_count > 0 and resolution_rate is 0 or null for the requested transaction type",
+        }
+        rows.append(row)
+
+    rows.sort(key=lambda r: (
+        r["obligation_count"],
+        r["resolved_obligations"],
+        r["message_count"],
+        r["artifact_rate"],
+    ), reverse=True)
+
+    filtered_rows = rows[:limit]
+    return jsonify({
+        "agent_id": agent_id,
+        "transaction_type": transaction_type,
+        "partner_filter": partner_filter or None,
+        "description": "Transaction-type-aware partner topology for live coordination decisions.",
+        "must_have_field": "decision_signals.resolution_rate",
+        "why_profile_fails": "Agent-wide trust summaries hide which partner has actually completed this type of work with you.",
+        "veto_condition": "Reject partner if failed_count > 0 and no resolved history exists for the requested transaction type.",
+        "partners": filtered_rows,
+        "count": len(filtered_rows),
+    })
 @app.route("/trust/attest", methods=["POST"])
 def submit_attestation():
     """Submit a trust attestation about another agent. Requires sender auth."""
