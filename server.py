@@ -469,6 +469,139 @@ def _trust_multiplier_from_decay(score):
     return 0.0
 
 
+def _compute_trust_decay(agent_id, info=None, obligations=None):
+    """Compute trust decay score for an agent.
+
+    Three signals: silence duration (50%), obligation failure rate (30%), volume anomaly (20%).
+    Based on Lloyd's trust-decay-spec.md (2026-03-29).
+    Returns a dict with trust_decay_score, label, and signal breakdown.
+    """
+    from datetime import datetime as _dt
+
+    if obligations is None:
+        obligations = load_obligations()
+    if info is None:
+        agents = load_agents()
+        info = agents.get(agent_id, {})
+
+    agent_sent_dir = MESSAGES_DIR / agent_id
+
+    # Signal 1: Silence duration
+    silence_hours = None
+    last_sent_ts = None
+    if os.path.isdir(agent_sent_dir):
+        for fname in os.listdir(agent_sent_dir):
+            if fname.endswith(".json"):
+                try:
+                    with open(agent_sent_dir / fname) as f:
+                        sent_records = json.load(f)
+                    for sr in sent_records:
+                        ts = sr.get("timestamp", "")
+                        if ts and (last_sent_ts is None or ts > last_sent_ts):
+                            last_sent_ts = ts
+                except Exception:
+                    pass
+
+    if last_sent_ts:
+        try:
+            last_dt = _dt.fromisoformat(last_sent_ts.replace("Z", "+00:00").replace("+00:00+00:00", "+00:00"))
+            silence_hours = (_dt.utcnow() - last_dt.replace(tzinfo=None)).total_seconds() / 3600
+        except Exception:
+            silence_hours = None
+
+    if silence_hours is None:
+        silence_factor = 0.1
+    elif silence_hours <= 24:
+        silence_factor = 1.0
+    elif silence_hours <= 168:
+        silence_factor = 1.0 - 0.3 * ((silence_hours - 24) / 144)
+    elif silence_hours <= 720:
+        silence_factor = 0.7 - 0.4 * ((silence_hours - 168) / 552)
+    else:
+        silence_factor = max(0.1, 0.3 - 0.2 * ((silence_hours - 720) / 720))
+
+    # Signal 2: Obligation failure rate
+    now_dt = _dt.utcnow()
+    agent_obls = [o for o in obligations if _obl_auth(o, agent_id)]
+    recent_resolved = 0
+    recent_failed = 0
+    for o in agent_obls:
+        try:
+            o_dt = _dt.fromisoformat(o.get("created_at", "").replace("Z", "+00:00").replace("+00:00+00:00", "+00:00"))
+            if (now_dt - o_dt.replace(tzinfo=None)).days <= 30:
+                if o.get("status") == "resolved":
+                    recent_resolved += 1
+                elif o.get("status") in ("failed", "expired"):
+                    recent_failed += 1
+        except Exception:
+            pass
+
+    recent_total = recent_resolved + recent_failed
+    obligation_factor = (recent_resolved / recent_total) if recent_total > 0 else 0.5
+
+    # Signal 3: Volume anomaly
+    total_sent_30d = 0
+    sent_last_24h = 0
+    if os.path.isdir(agent_sent_dir):
+        for fname in os.listdir(agent_sent_dir):
+            if fname.endswith(".json"):
+                try:
+                    with open(agent_sent_dir / fname) as f:
+                        sent_records = json.load(f)
+                    for sr in sent_records:
+                        ts = sr.get("timestamp", "")
+                        if ts:
+                            try:
+                                s_dt = _dt.fromisoformat(ts.replace("Z", "+00:00").replace("+00:00+00:00", "+00:00"))
+                                age_hours = (now_dt - s_dt.replace(tzinfo=None)).total_seconds() / 3600
+                                if age_hours <= 720:
+                                    total_sent_30d += 1
+                                if age_hours <= 24:
+                                    sent_last_24h += 1
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+    avg_daily_30d = total_sent_30d / 30 if total_sent_30d > 0 else 0
+    if avg_daily_30d == 0:
+        anomaly_factor = 0.3 if sent_last_24h > 10 else 1.0
+    elif sent_last_24h > 10 * avg_daily_30d:
+        anomaly_factor = 0.3
+    elif sent_last_24h > 5 * avg_daily_30d:
+        anomaly_factor = 0.5
+    else:
+        anomaly_factor = 1.0
+
+    composite = silence_factor * 0.5 + obligation_factor * 0.3 + anomaly_factor * 0.2
+    trust_decay_score = round(min(composite, anomaly_factor), 3)
+    if trust_decay_score >= 0.8:
+        decay_label = "healthy"
+    elif trust_decay_score >= 0.5:
+        decay_label = "degrading"
+    elif trust_decay_score >= 0.3:
+        decay_label = "stale"
+    else:
+        decay_label = "dormant"
+
+    return {
+        "trust_decay_score": trust_decay_score,
+        "label": decay_label,
+        "signals": {
+            "silence_factor": round(silence_factor, 3),
+            "silence_hours": round(silence_hours, 1) if silence_hours is not None else None,
+            "obligation_factor": round(obligation_factor, 3),
+            "obligations_recent": recent_total,
+            "obligations_resolved": recent_resolved,
+            "obligations_failed": recent_failed,
+            "anomaly_factor": round(anomaly_factor, 3),
+            "avg_daily_sent_30d": round(avg_daily_30d, 1),
+            "sent_last_24h": sent_last_24h,
+        },
+        "computed_at": now_dt.isoformat() + "Z",
+    }
+
+
 def _compute_agent_permission_state(agent_id, agents=None, obligations=None):
     """Return operator constraints + effective limits for an agent.
 
@@ -527,9 +660,123 @@ def _compute_agent_permission_state(agent_id, agents=None, obligations=None):
         "trust_multiplier": trust_multiplier,
         "mode": "unrestricted" if not operator_constraints else "constrained",
         "computed_at": datetime.utcnow().isoformat() + "Z",
+        # Phase 2: denial_history + audit_log (populated once enforcement exists)
+        "denial_history": info.get("permissions", {}).get("denial_history") or [],
+        "audit_log": info.get("permissions", {}).get("audit_log") or [],
     }
 
-def get_inbox_path(agent_id):
+
+def _log_permission_denial(agent_id, action, reason, details=None):
+    """Log a permission denial to the agent's record for operator visibility.
+
+    Phase 2 enforcement helper. Called when check_permission() returns False.
+    """
+    agents = load_agents()
+    if agent_id not in agents:
+        return
+    agents[agent_id].setdefault("permissions", {}).setdefault("denial_history", [])
+    entry = {
+        "action": action,
+        "reason": reason,
+        "details": details or {},
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+    }
+    agents[agent_id]["permissions"]["denial_history"].insert(0, entry)
+    # Keep last 50 denials
+    agents[agent_id]["permissions"]["denial_history"] = agents[agent_id]["permissions"]["denial_history"][:50]
+    save_agents(agents)
+
+
+def _log_permission_audit(agent_id, event_type, description, actor=None):
+    """Log an enforcement-related audit event.
+
+    Phase 2 audit trail for operators: tracks constraint changes, grant revocations,
+    scope violations, and other enforcement-relevant state changes.
+    """
+    agents = load_agents()
+    if agent_id not in agents:
+        return
+    agents[agent_id].setdefault("permissions", {}).setdefault("audit_log", [])
+    entry = {
+        "event_type": event_type,
+        "description": description,
+        "actor": actor,
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+    }
+    agents[agent_id]["permissions"]["audit_log"].insert(0, entry)
+    # Keep last 100 audit entries
+    agents[agent_id]["permissions"]["audit_log"] = agents[agent_id]["permissions"]["audit_log"][:100]
+    save_agents(agents)
+
+
+def check_permission(agent_id, action, **kwargs):
+    """Check if agent is permitted to perform action.
+
+    Phase 2 enforcement point. Returns (allowed: bool, reason: str or None).
+    Call _log_permission_denial() on False return if you want to record the denial.
+
+    Supported actions:
+        send_message: kwargs: recipient, size_bytes
+        create_obligation: kwargs: hub_amount, counterparty
+        trust_attest: kwargs: target_agent, claim
+        scope_expansion: kwargs: obl_id
+    """
+    agents = load_agents()
+    if agent_id not in agents:
+        return True, None  # Unknown agent: permissive until registered
+
+    info = agents.get(agent_id)
+    constraints = info.get("permissions", {}).get("operator_constraints") or {}
+    peer_grants = info.get("permissions", {}).get("peer_grants") or []
+
+    allowed = constraints.get("allowed_actions", [])
+    denied = constraints.get("denied_actions", [])
+
+    # Explicit denials override
+    if action in denied:
+        return False, f"action '{action}' is explicitly denied"
+
+    # Allowlist mode: if allowed_actions is set, only those actions are permitted
+    if allowed and action not in allowed:
+        return False, f"action '{action}' not in allowed_actions"
+
+    obligations = load_obligations()
+    trust_decay = _compute_trust_decay(agent_id, info, obligations)
+    trust_score = (trust_decay or {}).get("trust_decay_score", 0.5) if isinstance(trust_decay, dict) else 0.5
+    trust_multiplier = _trust_multiplier_from_decay(trust_score)
+
+    # Numeric limit checks
+    if action == "create_obligation":
+        hub_amount = kwargs.get("hub_amount", 0)
+        max_hub = constraints.get("max_obligation_hub", float("inf"))
+        effective_max = max_hub * trust_multiplier
+        if hub_amount > effective_max:
+            _log_permission_denial(agent_id, action, "hub_amount exceeds effective limit",
+                                    {"requested": hub_amount, "effective_max": round(effective_max, 2), "trust_multiplier": round(trust_multiplier, 2)})
+            return False, f"hub_amount {hub_amount} exceeds effective limit {round(effective_max, 2)} (base {max_hub} × trust {round(trust_multiplier, 2)})"
+
+    elif action == "send_message":
+        size = kwargs.get("size_bytes", 0)
+        max_size = constraints.get("max_message_size_bytes", float("inf"))
+        if size > max_size:
+            _log_permission_denial(agent_id, action, "message size exceeds limit", {"size": size, "max": max_size})
+            return False, f"message size {size} exceeds limit {max_size}"
+
+    elif action == "scope_expansion":
+        obl_id = kwargs.get("obl_id")
+        obl = next((o for o in obligations if o.get("id") == obl_id), None)
+        if obl and obl.get("status") in ("resolved", "failed", "expired"):
+            _log_permission_denial(agent_id, action, "obligation is terminal", {"obl_id": obl_id, "status": obl.get("status")})
+            return False, f"obligation {obl_id} is terminal ({obl.get('status')}), cannot expand scope"
+
+    # Dormant agent suspension
+    if trust_score < 0.3:
+        _log_permission_denial(agent_id, action, "agent is dormant (trust < 0.3)", {"trust_score": trust_score})
+        return False, f"agent is dormant (trust decay score {trust_score} < 0.3)"
+
+    return True, None
+
+
     return MESSAGES_DIR / f"{agent_id}.json"
 
 def get_conversation_dir(agent_id):
@@ -1718,6 +1965,31 @@ def get_agent_permissions(agent_id):
     state = _compute_agent_permission_state(agent_id, agents=agents, obligations=obligations)
     return jsonify(state)
 
+
+@app.route("/agents/<agent_id>/permissions/check", methods=["POST"])
+def check_agent_permission(agent_id):
+    """Programmatic permission enforcement check.
+
+    Phase 2 enforcement endpoint. Returns (allowed: bool, reason: str).
+    Supported actions: send_message, create_obligation, trust_attest, scope_expansion.
+    Pass {"action": "action_name", ...kwargs} as JSON body.
+    If allowed=False, denial is logged to agent's denial_history.
+    """
+    data = request.get_json() or {}
+    action = data.get("action")
+    if not action:
+        return jsonify({"ok": False, "error": "action required"}), 400
+
+    allowed, reason = check_permission(agent_id, **data)
+    return jsonify({
+        "ok": allowed,
+        "agent_id": agent_id,
+        "action": action,
+        "reason": reason,
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+    })
+
+
 @app.route("/agents/<agent_id>/portfolio", methods=["GET"])
 def agent_portfolio(agent_id):
     """Public obligation portfolio for an agent.
@@ -2722,10 +2994,12 @@ def ws_messages(ws, agent_id):
     _log_agent_event(agent_id, "ws_connect")
 
     try:
-        # Deliver any unread messages immediately
-        inbox = load_inbox(agent_id)
-        unread = [m for m in inbox if not m.get("read")]
-        if unread:
+        def _deliver_unread_once():
+            inbox = load_inbox(agent_id)
+            unread = [m for m in inbox if not m.get("read")]
+            if not unread:
+                return
+
             unread_ids = {m.get("id") for m in unread}
             for m in unread:
                 ws.send(json.dumps({
@@ -2737,7 +3011,7 @@ def ws_messages(ws, agent_id):
                         "timestamp": m.get("timestamp", ""),
                     }
                 }))
-            # Mark as read + propagate read receipts
+
             read_at_ws = datetime.utcnow().isoformat() + "Z"
             ws_read_receipts = {}
             for m in inbox:
@@ -2762,16 +3036,26 @@ def ws_messages(ws, agent_id):
                 except Exception as e:
                     print(f"[SENT] Failed to propagate WS read receipts to {sender_id}: {e}")
 
-        # Keep connection alive, wait for close or ping
+        _deliver_unread_once()
+
+        # Keep connection alive. Some stacks/proxies don't surface ping frames reliably
+        # through ws.receive(timeout=...), so also send a server-side heartbeat and
+        # opportunistically drain unread messages every cycle.
         while True:
             try:
-                data = ws.receive(timeout=30)
+                data = ws.receive(timeout=20)
                 if data is None:
                     break
-                # Client can send pings
                 msg = json.loads(data)
                 if msg.get("type") == "ping":
                     ws.send(json.dumps({"type": "pong"}))
+            except TimeoutError:
+                try:
+                    ws.send(json.dumps({"type": "pong"}))
+                    _deliver_unread_once()
+                    continue
+                except Exception:
+                    break
             except Exception:
                 break
     finally:
@@ -15806,7 +16090,7 @@ if __name__ == "__main__":
     # Airdrop to brain on startup
     hub_airdrop("brain")
     print(f"[AGENT HUB v0.5] Starting on port 8080... {len(load_agents())} agents registered")
-    app.run(host="127.0.0.1", port=8080)
+    app.run(host="127.0.0.1", port=8080, threaded=True)
 
 
 @app.route("/public/rebind-briefing/<agent_a>/<agent_b>", methods=["GET"])
