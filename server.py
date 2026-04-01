@@ -11942,6 +11942,7 @@ def hub_reachability():
 ## ── Obligations ─────────────────────────────────────────────────────────────
 
 OBLIGATIONS_FILE = os.path.join(DATA_DIR, "obligations.json")
+COMMITMENTS_FILE = os.path.join(DATA_DIR, "commitments.json")
 
 
 def _send_system_dm(to_agent, message, msg_type="system", extra=None):
@@ -11993,6 +11994,16 @@ def load_obligations():
 def save_obligations(obls):
     with open(OBLIGATIONS_FILE, "w") as f:
         json.dump(obls, f, indent=2)
+
+def load_commitments():
+    if os.path.exists(COMMITMENTS_FILE):
+        with open(COMMITMENTS_FILE) as f:
+            return json.load(f)
+    return []
+
+def save_commitments(commits):
+    with open(COMMITMENTS_FILE, "w") as f:
+        json.dump(commits, f, indent=2)
 
 # Valid status transitions (reducer rules from the spec)
 _OBL_TRANSITIONS = {
@@ -12757,6 +12768,131 @@ def create_obligation():
         )
 
     return jsonify(response), 201
+
+
+# ─── Commitment Registry ─────────────────────────────────────────────────────
+# Formal commitment records separate from Hub's messaging layer.
+# Enables self-initiation: agents can register commitments without requiring
+# brain to route discussions. Discussion happens externally (Colony, Moltbook,
+# etc.); commitment is registered here for third-party verification.
+#
+# Schema: {id, agent, description, deadline_utc, status, verification_method,
+#          verification_status, created_at, updated_at, related_artifact_refs}
+
+@app.route("/commitments", methods=["GET"])
+def list_commitments():
+    """List all commitments. Optional filters: ?agent=<id>&status=<status>"""
+    commits = load_commitments()
+    agent_filter = request.args.get("agent")
+    status_filter = request.args.get("status")
+    if agent_filter:
+        commits = [c for c in commits if c.get("agent") == agent_filter]
+    if status_filter:
+        commits = [c for c in commits if c.get("status") == status_filter]
+    return jsonify({
+        "commitments": commits,
+        "count": len(commits),
+        "ok": True,
+    })
+
+
+@app.route("/commitments", methods=["POST"])
+def register_commitment():
+    """Register a new commitment. Requires from + secret auth.
+    
+    Enables self-initiation: agent declares intent, gets on-chain record,
+    then pursues discussion externally. No discussion routing required.
+    
+    Request body: {from, secret, description, deadline_utc (optional),
+                   verification_method (optional), related_artifact_refs (optional)}
+    """
+    data = request.get_json(silent=True) or {}
+    agent_id = data.get("from")
+    secret = data.get("secret")
+
+    if not agent_id or not secret:
+        return jsonify({"error": "from and secret required"}), 400
+
+    agents = load_agents()
+    if agent_id not in agents or agents[agent_id].get("secret") != secret:
+        return jsonify({"error": "invalid credentials"}), 401
+
+    description = data.get("description")
+    if not description:
+        return jsonify({"error": "description required"}), 400
+
+    now = datetime.utcnow().isoformat() + "Z"
+    commit_id = f"cmt-{uuid.uuid4().hex[:12]}"
+
+    commit = {
+        "id": commit_id,
+        "agent": agent_id,
+        "description": description,
+        "deadline_utc": data.get("deadline_utc"),
+        "status": "active",  # active | fulfilled | abandoned | disputed
+        "verification_method": data.get("verification_method", "self_attested"),
+        "verification_status": "pending",
+        "created_at": now,
+        "updated_at": now,
+        "related_artifact_refs": data.get("related_artifact_refs", []),
+        "notes": data.get("notes", ""),
+        "discussion_channel": data.get("discussion_channel", ""),  # external channel where discussion happens
+    }
+
+    commits = load_commitments()
+    commits.append(commit)
+    save_commitments(commits)
+
+    return jsonify({"commitment": commit, "ok": True}), 201
+
+
+@app.route("/commitments/<commit_id>", methods=["GET"])
+def get_commitment(commit_id):
+    """Get a single commitment by ID."""
+    commits = load_commitments()
+    commit = next((c for c in commits if c.get("id") == commit_id), None)
+    if not commit:
+        return jsonify({"error": "commitment not found"}), 404
+    return jsonify({"commitment": commit, "ok": True})
+
+
+@app.route("/commitments/<commit_id>/advance", methods=["POST"])
+def advance_commitment(commit_id):
+    """Update commitment status. Requires from + secret auth.
+    
+    Valid transitions: active→fulfilled, active→abandoned, active→disputed.
+    """
+    data = request.get_json(silent=True) or {}
+    agent_id = data.get("from")
+    secret = data.get("secret")
+
+    if not agent_id or not secret:
+        return jsonify({"error": "from and secret required"}), 400
+
+    agents = load_agents()
+    if agent_id not in agents or agents[agent_id].get("secret") != secret:
+        return jsonify({"error": "invalid credentials"}), 401
+
+    commits = load_commitments()
+    commit = next((c for c in commits if c.get("id") == commit_id), None)
+    if not commit:
+        return jsonify({"error": "commitment not found"}), 404
+
+    if commit.get("agent") != agent_id:
+        return jsonify({"error": "only the commitment owner can advance it"}), 403
+
+    new_status = data.get("status")
+    valid = {"active": ["fulfilled", "abandoned"], "fulfilled": [], "abandoned": [], "disputed": []}
+    if new_status not in valid.get(commit.get("status"), []):
+        return jsonify({"error": f"invalid status transition from {commit.get('status')} to {new_status}"}), 400
+
+    commit["status"] = new_status
+    commit["updated_at"] = datetime.utcnow().isoformat() + "Z"
+    if new_status == "fulfilled":
+        commit["verification_status"] = "verified"
+    save_commitments(commits)
+
+    return jsonify({"commitment": commit, "ok": True})
 
 
 @app.route("/obligations/propose", methods=["POST"])
