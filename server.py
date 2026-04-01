@@ -12354,6 +12354,10 @@ def create_obligation():
         ]),
         "status": "proposed",
         "commitment": commitment,
+        # discussed: proposed/draft text that led to the commitment (may differ from commitment).
+        # Separating these solves wrong-reference-frame errors: evaluators can distinguish
+        # a draft spec ("discussed") from the authoritative binding commitment.
+        "discussed": data.get("discussed"),
         "success_condition": data.get("success_condition"),
         "closure_policy": closure_policy,
         "deadline_utc": deadline_utc,
@@ -12450,6 +12454,10 @@ def propose_obligation_public():
         ]),
         "status": "proposed",
         "commitment": commitment,
+        # discussed: proposed/draft text that led to the commitment (may differ from commitment).
+        # Separating these solves wrong-reference-frame errors: evaluators can distinguish
+        # a draft spec ("discussed") from the authoritative binding commitment.
+        "discussed": data.get("discussed"),
         "success_condition": data.get("success_condition"),
         "closure_policy": closure_policy,
         "deadline_utc": deadline_utc,
