@@ -11814,12 +11814,12 @@ def save_obligations(obls):
 
 # Valid status transitions (reducer rules from the spec)
 _OBL_TRANSITIONS = {
-    "proposed":           ["accepted", "rejected", "withdrawn", "failed"],
+    "proposed":           ["accepted", "rejected", "withdrawn", "failed", "expired"],
     "accepted":           ["evidence_submitted", "failed", "ghost_nudged"],
     "ghost_nudged":       ["accepted", "evidence_submitted", "failed", "ghost_escalated"],
     "ghost_escalated":    ["accepted", "evidence_submitted", "failed", "ghost_defaulted"],
     "ghost_defaulted":    ["resolved", "failed"],
-    "evidence_submitted": ["resolved", "disputed", "failed"],
+    "evidence_submitted": ["resolved", "disputed", "failed", "expired"],
     "disputed":           ["evidence_submitted", "resolved", "failed"],
     # deadline_elapsed: claimant_self_resolve policy allows resolution from here
     "deadline_elapsed":   ["resolved", "failed"],
@@ -11829,6 +11829,7 @@ _OBL_TRANSITIONS = {
     "withdrawn":          [],
     "failed":             [],
     "timed_out":          [],
+    "expired":            [],  # Ghost Counterparty Protocol v1: terminal state for ghost TTL expiry
 }
 
 _TIMEOUT_POLICIES = ["claimant_self_resolve", "auto_expire", "escalate"]
@@ -12105,6 +12106,174 @@ def _check_deadline_expiry(obl):
         pass
     return False
 
+
+# ─── Ghost Counterparty Protocol v1 (StarAgent co-design, 2026-04-01) ────────
+
+def _is_counterparty_ghost(obl):
+    """Check if counterparty is confirmed ghost.
+
+    Ghost Counterparty Protocol v1:
+    - First check counterparty_liveness_class set at obligation creation
+    - If not available (old obligations), fall back to agents registry liveness
+    Returns: ("ghost_confirmed", hours_silent) or (None, hours_silent)
+    """
+    cp = obl.get("counterparty")
+    if not cp:
+        return None, None
+
+    # Check creation-time snapshot first
+    liveness_class = obl.get("counterparty_liveness_class", "unknown")
+
+    # If we have a current agents record, cross-check staleness
+    agents = load_agents()
+    cp_info = agents.get(cp) if isinstance(agents, dict) else {}
+    if not isinstance(cp_info, dict):
+        cp_info = {}
+
+    current_class = None
+    if cp_info:
+        liveness = cp_info.get("liveness", {})
+        last_msg = liveness.get("last_message_received")
+        if last_msg:
+            hours = _hours_since_iso(last_msg)
+            current_class = "ghost_confirmed" if hours is not None and hours > 168 else liveness.get("liveness_class", "unknown")  # 168h = 7d
+        else:
+            current_class = liveness.get("liveness_class", "unknown")
+
+    # Ghost confirmed if: creation-time class was ghost/dormant/dead, OR current registry says ghost
+    if liveness_class in ("ghost_confirmed", "dead", "dormant") or current_class in ("ghost_confirmed", "dead"):
+        last_activity = _obl_last_activity_iso(obl, exclude_system=True)
+        hours = _hours_since_iso(last_activity) if last_activity else 999
+        return ("ghost_confirmed", hours)
+
+    return None, 0
+
+
+def _compute_liveness_class(info):
+    """Compute liveness class from agent info dict (used at obligation creation time).
+    
+    Mirrors the logic in _agent_liveness() but without the round-trip to agents.json.
+    info: agent record dict from load_agents()
+    """
+    from datetime import datetime, timedelta
+    if not info:
+        return "unknown"
+    liveness = info.get("liveness", {}) if isinstance(info, dict) else {}
+    is_ws = liveness.get("ws_connected", False)
+    last_sent = liveness.get("last_message_sent")
+    sent_ts = None
+    if last_sent:
+        try:
+            sent_ts = datetime.fromisoformat(last_sent.replace("Z", "+00:00").replace("+00:00", ""))
+        except Exception:
+            pass
+    if is_ws:
+        return "active"
+    if sent_ts:
+        age = datetime.utcnow() - sent_ts
+        if age < timedelta(days=7):
+            return "active"
+        elif age < timedelta(days=30):
+            return "warm"
+        else:
+            return "dormant"
+    return "dead"
+
+
+def _check_proposed_ttl(obl):
+    """Ghost Counterparty Protocol v1: auto-expire proposed obligations when counterparty is ghost.
+
+    TTL rules:
+    - If counterparty_liveness_class was ghost_confirmed at creation: expire after 7 days
+    - If counterparty_liveness_class was unknown/dormant at creation: expire after 14 days
+    Prevents proposed obligations from hanging indefinitely when counterparty is unreachable.
+    """
+    if obl.get("status") != "proposed":
+        return False
+
+    cp = obl.get("counterparty")
+    if not cp:
+        return False
+
+    liveness_class = obl.get("counterparty_liveness_class", "unknown")
+    ghost_class, hours_silent = _is_counterparty_ghost(obl)
+
+    if not ghost_class:
+        return False
+
+    ttl_hours = 168 if liveness_class == "ghost_confirmed" else 336  # 7d vs 14d
+
+    if hours_silent >= ttl_hours:
+        now_iso = datetime.utcnow().isoformat() + "Z"
+        obl["status"] = "expired"
+        obl.setdefault("history", []).append({
+            "status": "expired",
+            "at": now_iso,
+            "by": "system",
+            "reason": f"Ghost Counterparty Protocol v1: counterparty '{cp}' ghost (class={liveness_class}, "
+                      f"{hours_silent:.0f}h silent), proposed TTL ({ttl_hours}h) exceeded."
+        })
+        return True
+
+    return False
+
+
+def _check_evidence_submitted_ttl(obl):
+    """Ghost Counterparty Protocol v1: auto-resolve evidence_submitted when counterparty is ghost + 72h TTL.
+
+    After evidence is submitted, give counterparty 72h to respond before auto-resolving with evidence_archive.
+    This closes the loop on obligations stuck in evidence_submitted when the counterparty has gone dark.
+    """
+    if obl.get("status") != "evidence_submitted":
+        return False
+
+    ghost_class, hours_silent = _is_counterparty_ghost(obl)
+    if not ghost_class:
+        return False
+
+    # TTL: 72h after evidence submission, if counterparty still ghost, resolve
+    evidence_refs = obl.get("evidence_refs", [])
+    if not evidence_refs:
+        return False
+
+    last_evidence = evidence_refs[-1]
+    submitted_at = last_evidence.get("submitted_at", obl.get("created_at", ""))
+    hours_since_evidence = _hours_since_iso(submitted_at) if submitted_at else 999
+
+    if hours_since_evidence >= 72:
+        now_iso = datetime.utcnow().isoformat() + "Z"
+        closure_policy = obl.get("closure_policy", "counterparty_accepts")
+
+        # Build evidence_archive block
+        evidence_archive = {
+            "resolved_at": now_iso,
+            "resolved_by": "system",
+            "protocol": "Ghost Counterparty Protocol v1",
+            "closure_policy": closure_policy,
+            "resolution_reason": f"counterparty '{obl.get('counterparty')}' confirmed ghost "
+                                 f"({hours_silent:.0f}h silent), evidence submitted {hours_since_evidence:.0f}h ago, "
+                                 f"72h TTL exceeded. Auto-resolving.",
+            "evidence_count": len(evidence_refs),
+            "evidence_refs": evidence_refs,
+            "commitment": obl.get("commitment", ""),
+            "success_condition": obl.get("success_condition"),
+        }
+
+        obl["status"] = "resolved"
+        obl["evidence_archive"] = evidence_archive
+        obl.setdefault("history", []).append({
+            "status": "resolved",
+            "at": now_iso,
+            "by": "system",
+            "resolution_type": "protocol_resolves",
+            "protocol": "Ghost Counterparty Protocol v1",
+            "reason": evidence_archive["resolution_reason"]
+        })
+        return True
+
+    return False
+
+
 def _expire_obligations(obls):
     """Check all obligations for deadline expiry, watchdog state changes, and ghost timeouts."""
     changed = False
@@ -12115,6 +12284,10 @@ def _expire_obligations(obls):
             changed = True
         if _check_ghost_timeout(obl):
             changed = True
+        if _check_proposed_ttl(obl):   # Ghost Counterparty Protocol v1
+            changed = True
+        if _check_evidence_submitted_ttl(obl):  # Ghost Counterparty Protocol v1
+            changed = True
     return changed
 
 _CLOSURE_POLICIES = [
@@ -12123,6 +12296,7 @@ _CLOSURE_POLICIES = [
     "claimant_plus_reviewer",
     "reviewer_required",
     "arbiter_rules",
+    "protocol_resolves",   # Ghost Counterparty Protocol v1: protocol resolves when counterparty ghost + TTL elapsed
 ]
 
 # Policies that REQUIRE a deadline (obligations that can hang indefinitely without one)
@@ -12309,6 +12483,11 @@ def create_obligation():
     if not counterparty or not commitment:
         return jsonify({"error": "counterparty and commitment required"}), 400
 
+    # Ghost Counterparty Protocol v1: snapshot counterparty liveness at obligation creation
+    cp_info = agents.get(counterparty, {}) if isinstance(agents, dict) else {}
+    if not isinstance(cp_info, dict):
+        cp_info = {}
+
     obl_id = f"obl-{uuid.uuid4().hex[:12]}"
     now = datetime.utcnow().isoformat() + "Z"
 
@@ -12375,6 +12554,10 @@ def create_obligation():
         "history": [
             {"status": "proposed", "at": now, "by": agent_id}
         ],
+        # Ghost Counterparty Protocol v1: liveness snapshot at creation
+        # Enables TTL-based auto-expiry when counterparty goes dark
+        "counterparty_liveness_class": _compute_liveness_class(cp_info),
+        "counterparty_last_inbox_check": cp_info.get("liveness", {}).get("last_inbox_check") if isinstance(cp_info, dict) else None,
     }
 
     obls = load_obligations()
@@ -12383,7 +12566,6 @@ def create_obligation():
 
     # Include counterparty heartbeat interval in response if available
     response = {"obligation": obl}
-    cp_info = agents.get(counterparty, {})
     if cp_info.get("heartbeat_interval"):
         response["counterparty_heartbeat"] = cp_info["heartbeat_interval"]
         response["note"] = (
@@ -12421,6 +12603,10 @@ def propose_obligation_public():
 
     # Counterparty must exist on Hub (so they can see and respond)
     agents = load_agents()
+    # Ghost Counterparty Protocol v1: snapshot counterparty liveness at obligation creation
+    cp_info = agents.get(counterparty, {}) if isinstance(agents, dict) else {}
+    if not isinstance(cp_info, dict):
+        cp_info = {}
     if counterparty not in agents:
         return jsonify({
             "error": f"counterparty '{counterparty}' not found on Hub",
@@ -12469,6 +12655,9 @@ def propose_obligation_public():
         "history": [
             {"status": "proposed", "at": now, "by": agent_id, "unverified": True}
         ],
+        # Ghost Counterparty Protocol v1: liveness snapshot at creation
+        "counterparty_liveness_class": _compute_liveness_class(cp_info),
+        "counterparty_last_inbox_check": cp_info.get("liveness", {}).get("last_inbox_check") if isinstance(cp_info, dict) else None,
     }
 
     # If reviewer specified, add to role_bindings
@@ -12554,6 +12743,80 @@ def get_signing_key():
         "public_key": pubkey_b64,
         "format": "raw Ed25519 public key, base64 encoded",
         "usage": "Verify obligation export signatures. Canonicalize obligation JSON (sort_keys, compact separators), verify Ed25519 signature.",
+    })
+
+
+@app.route("/obligations/<obl_id>/transfer", methods=["POST"])
+def transfer_obligation(obl_id):
+    """Ghost Counterparty Protocol v1: reassign counterparty on an obligation.
+    
+    Use when the original counterparty has gone dark and a different agent
+    should take over the counterparty role. The new counterparty must be
+    a registered Hub agent.
+    
+    Auth: claimant (the agent who created the obligation) can transfer.
+    """
+    data = request.get_json(silent=True) or {}
+    agent_id = data.get("from")
+    secret = data.get("secret")
+    new_counterparty = data.get("new_counterparty")
+
+    if not agent_id or not secret:
+        return jsonify({"error": "from and secret required"}), 400
+    if not new_counterparty:
+        return jsonify({"error": "new_counterparty required"}), 400
+
+    agents = load_agents()
+    if agent_id not in agents or agents[agent_id].get("secret") != secret:
+        return jsonify({"error": "invalid credentials"}), 401
+
+    if new_counterparty not in agents:
+        return jsonify({"error": f"new_counterparty '{new_counterparty}' not found on Hub"}), 404
+
+    obls = load_obligations()
+    obl = next((o for o in obls if o.get("obligation_id") == obl_id), None)
+    if not obl:
+        return jsonify({"error": "obligation not found"}), 404
+
+    # Only claimant can transfer
+    created_by = obl.get("created_by", "")
+    if agent_id.lower() != created_by.lower():
+        return jsonify({"error": "only the claimant (created_by) can transfer counterparty"}), 403
+
+    old_cp = obl.get("counterparty")
+    now = datetime.utcnow().isoformat() + "Z"
+
+    # Update counterparty
+    obl["counterparty"] = new_counterparty
+    # Update parties list
+    for p in obl.get("parties", []):
+        if p.get("agent_id", "").lower() == old_cp.lower():
+            p["agent_id"] = new_counterparty
+    # Update role_bindings
+    for rb in obl.get("role_bindings", []):
+        if rb.get("agent_id", "").lower() == old_cp.lower():
+            rb["agent_id"] = new_counterparty
+    # Update liveness snapshot for new counterparty
+    cp_info = agents.get(new_counterparty, {}) if isinstance(agents, dict) else {}
+    obl["counterparty_liveness_class"] = _compute_liveness_class(cp_info)
+    obl["counterparty_last_inbox_check"] = cp_info.get("liveness", {}).get("last_inbox_check") if isinstance(cp_info, dict) else None
+    obl["history"].append({
+        "status": "counterparty_transferred",
+        "at": now,
+        "by": agent_id,
+        "from_counterparty": old_cp,
+        "to_counterparty": new_counterparty,
+        "protocol": "Ghost Counterparty Protocol v1"
+    })
+
+    save_obligations(obls)
+    return jsonify({
+        "obligation_id": obl_id,
+        "transferred": True,
+        "from_counterparty": old_cp,
+        "to_counterparty": new_counterparty,
+        "counterparty_liveness_class": obl["counterparty_liveness_class"],
+        "note": f"Counterparty transferred from '{old_cp}' to '{new_counterparty}'"
     })
 
 
@@ -12897,6 +13160,22 @@ def advance_obligation(obl_id):
         history_entry["timeout_elapsed"] = True
         history_entry["resolution_type"] = "post_deadline_claimant"
     obl["history"].append(history_entry)
+
+    # Ghost Counterparty Protocol v1: write evidence_archive on protocol_resolves closure
+    if new_status == "resolved" and obl.get("closure_policy") == "protocol_resolves":
+        obl["evidence_archive"] = {
+            "resolved_at": now,
+            "resolved_by": agent_id,
+            "protocol": "Ghost Counterparty Protocol v1",
+            "closure_policy": "protocol_resolves",
+            "resolution_reason": f"protocol_resolves closure_policy triggered by {agent_id}",
+            "evidence_count": len(obl.get("evidence_refs", [])),
+            "evidence_refs": obl.get("evidence_refs", []),
+            "commitment": obl.get("commitment", ""),
+            "success_condition": obl.get("success_condition"),
+        }
+        history_entry["resolution_type"] = "protocol_resolves"
+        history_entry["protocol"] = "Ghost Counterparty Protocol v1"
 
     # Attach evidence if provided
     if data.get("evidence"):
