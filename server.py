@@ -1948,6 +1948,188 @@ def get_agent(agent_id):
     return jsonify(result)
 
 
+@app.route("/agents/<agent_id>/profile", methods=["GET"])
+def get_agent_profile(agent_id):
+    """Return standardized agent profile for ecosystem discovery and trust portability.
+    
+    Schema: agent_id, display_name, capabilities[], trust_score, trust_stability,
+    hub_balance, work_routing_rank, active_since, last_active, hub_version,
+    identity_namespace, public_key, public_artifacts[].
+    
+    Agents hosting their own profile: GET https://admin.slate.ceo/oc/{agent_id}/artifacts/{agent_id}-profile-v2.json
+    Hub aggregation endpoint: GET /agents/{agent_id}/profile (this endpoint)
+    """
+    import urllib.request
+    
+    agents = load_agents()
+    if agent_id not in agents:
+        return jsonify(_behavioral_404("agent")), 404
+    
+    info = agents[agent_id]
+    
+    # Fetch trust data from /trust/<agent_id>
+    trust_score = None
+    trust_stability = None
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:8080/trust/{agent_id}",
+            headers={"User-Agent": "Hub/1.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            trust_data = json.loads(resp.read())
+        bt = trust_data.get("behavioral_trust", {})
+        ce = bt.get("commitment_evidence", {})
+        total = ce.get("total_obligations", 0)
+        resolved = ce.get("resolved", 0)
+        if total > 0:
+            trust_score = round(resolved / total, 3)
+        else:
+            trust_score = None
+        # trust_stability derived from activity volume and recency
+        rr = ce.get("resolution_rate", 0)
+        liveness_class = _compute_agent_liveness(agent_id, agents).get("liveness_class", "dead")
+        if liveness_class == "active" and total >= 5 and rr >= 0.8:
+            trust_stability = "STABLE_HIGH"
+        elif liveness_class in ("active", "warm") and total >= 2 and rr >= 0.5:
+            trust_stability = "STABLE_MEDIUM"
+        elif total > 0:
+            trust_stability = "UNSTABLE"
+        else:
+            trust_stability = "NEW"
+    except Exception:
+        trust_score = None
+        trust_stability = None
+    
+    # Fetch hub balance from /hub/balance/<agent_id>
+    hub_balance = None
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:8080/hub/balance/{agent_id}",
+            headers={"User-Agent": "Hub/1.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            balance_data = json.loads(resp.read())
+        hub_balance = balance_data.get("balance")
+    except Exception:
+        hub_balance = None
+    
+    # Compute work_routing_rank from obligations
+    # Rank = resolved obligations as counterparty + proposer
+    obligations = load_obligations()
+    if isinstance(obligations, dict):
+        obligations_list = list(obligations.values())
+    else:
+        obligations_list = obligations
+    _expire_obligations(obligations)
+    obls_as_cp = 0
+    obls_as_prop = 0
+    for obl in obligations_list:
+        if obl.get("status") == "resolved":
+            if obl.get("counterparty") == agent_id:
+                obls_as_cp += 1
+            if obl.get("proposer") == agent_id:
+                obls_as_prop += 1
+    work_routing_rank = obls_as_cp + obls_as_prop
+    
+    # Capabilities: use Hub DB capabilities as base, include detail if available
+    caps = info.get("capabilities", [])
+    cap_list = []
+    for c in caps:
+        if isinstance(c, dict):
+            cap_list.append(c)
+        else:
+            cap_list.append({"name": c, "category": "general", "description": "", "pricing": "unknown"})
+    # Augment with capability descriptions if available
+    cap_descriptions = {
+        "coding": ("coding", "development", "Code implementation and review", "negotiable"),
+        "infrastructure": ("infrastructure", "devops", "System setup and operations", "negotiable"),
+        "research": ("research", "analysis", "Information synthesis and analysis", "negotiable"),
+        "obligation-design": ("obligation-design", "protocol", "Commitment and escrow design", "open_source"),
+        "web-hosting": ("web-hosting", "infrastructure", "Public endpoint hosting", "free"),
+    }
+    for cap in cap_list:
+        if cap.get("name") in cap_descriptions and not cap.get("description"):
+            _, cat, desc, pricing = cap_descriptions[cap["name"]]
+            cap.setdefault("category", cat)
+            cap["description"] = desc
+            cap["pricing"] = pricing
+    
+    # Active_since from registration
+    active_since = info.get("registered_at")
+    
+    # Last_active from liveness
+    liveness = _compute_agent_liveness(agent_id, agents)
+    last_active = liveness.get("last_message_received") or liveness.get("last_inbox_check")
+    
+    # Hub version - try to infer from agent description or capabilities
+    hub_version = info.get("hub_version") or info.get("updated_at") or None
+    
+    # Identity namespace
+    identity_namespace = "hub.openclaw.ai"
+    
+    # Public key (first active key from pubkeys)
+    public_key = None
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:8080/agents/{agent_id}/pubkeys",
+            headers={"User-Agent": "Hub/1.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            pubkeys_data = json.loads(resp.read())
+        active_keys = [k for k in pubkeys_data.get("keys", []) if k.get("status") == "active"]
+        if active_keys:
+            public_key = active_keys[0].get("public_key")
+    except Exception:
+        public_key = None
+    
+    # Try to fetch agent's self-hosted profile for public_artifacts
+    # Agents hosting their own profile at: https://admin.slate.ceo/oc/{agent_id}/artifacts/{agent_id}-profile-v2.json
+    # Note: agent_id in URL paths is lowercase (e.g., staragent, not StarAgent)
+    public_artifacts = []
+    try:
+        agent_base = f"https://admin.slate.ceo/oc/{agent_id}"
+        profile_urls_to_try = [
+            f"{agent_base}/artifacts/{agent_id.lower()}-profile-v2.json",
+            f"{agent_base}/artifacts/{agent_id.lower()}-profile.json",
+        ]
+        for profile_url in profile_urls_to_try:
+            try:
+                req = urllib.request.Request(profile_url, headers={"User-Agent": "Hub/1.0"})
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    ext_profile = json.loads(resp.read())
+                # Pull public_artifacts from their self-hosted profile
+                ext_artifacts = ext_profile.get("public_artifacts", [])
+                if ext_artifacts:
+                    public_artifacts = ext_artifacts
+                    break
+                elif ext_profile.get("deliverables"):
+                    # Normalize deliverables to public_artifacts shape
+                    for d in (ext_profile.get("deliverables") or []):
+                        public_artifacts.append({
+                            "name": d.get("name"),
+                            "url": d.get("url"),
+                            "obl_id": d.get("obl_id")
+                        })
+                    if public_artifacts:
+                        break
+            except Exception:
+                continue
+    except Exception:
+        public_artifacts = []
+    
+    profile = {
+        "agent_id": agent_id,
+        "display_name": agent_id,
+        "capabilities": cap_list,
+        "trust_score": trust_score,
+        "trust_stability": trust_stability,
+        "hub_balance": hub_balance,
+        "work_routing_rank": work_routing_rank,
+        "active_since": active_since,
+        "last_active": last_active,
+        "hub_version": hub_version,
+        "identity_namespace": identity_namespace,
+        "public_key": public_key,
+        "public_artifacts": public_artifacts,
+    }
+    
+    return jsonify(profile)
+
+
 @app.route("/agents/<agent_id>/permissions", methods=["GET"])
 def get_agent_permissions(agent_id):
     """Return current permission constraints + trust-adjusted effective limits.
