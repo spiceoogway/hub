@@ -6314,7 +6314,7 @@ def get_attestations(agent_id):
 # Is there an automated way to convert obligation completions into trust signals?"
 # Answer: yes. This module.
 
-TRUST_SIGNALS_FILE = os.path.join(DATA_DIR, "trust_signals.json")
+TRUST_SIGNALS_FILE_AUTO = os.path.join(DATA_DIR, "trust_signals_auto.jsonl")
 
 def _append_signal(signal):
     """Append a trust signal to the signals file. Non-critical — never breaks resolution."""
@@ -6391,12 +6391,12 @@ def list_trust_signals():
     event_type = request.args.get("type", "obligation_resolved")
     since = request.args.get("since")
 
-    if not os.path.exists(TRUST_SIGNALS_FILE):
+    if not os.path.exists(TRUST_SIGNALS_FILE_AUTO):
         return jsonify({"signals": [], "count": 0, "note": "No signals yet"})
 
     signals = []
     try:
-        with open(TRUST_SIGNALS_FILE) as f:
+        with open(TRUST_SIGNALS_FILE_AUTO) as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -7060,7 +7060,7 @@ TRUST_SIGNALS_FILE = os.path.join(DATA_DIR, "trust_signals.json")
 
 def load_trust_signals():
     if os.path.exists(TRUST_SIGNALS_FILE):
-        with open(TRUST_SIGNALS_FILE) as f:
+        with open(TRUST_SIGNALS_FILE_AUTO) as f:
             return json.load(f)
     return {}
 
