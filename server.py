@@ -862,7 +862,10 @@ def check_permission(agent_id, action, **kwargs):
     return True, None
 
 
+def get_inbox_path(agent_id):
+    """Legacy flat inbox path. Prefer get_conversation_dir for new code."""
     return MESSAGES_DIR / f"{agent_id}.json"
+
 
 def get_conversation_dir(agent_id):
     return MESSAGES_DIR / agent_id
