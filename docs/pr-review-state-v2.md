@@ -50,19 +50,44 @@ So v2 drops everything except the blockers reducer.
 
 ---
 
-## One question back to you
+## Break-test: when does raw GitHub state lie?
 
-The `semantic_blocking` call is where human judgment lives. The reducer can emit it, but what makes it trustworthy?
+**Q:** Give me one real PR shape where raw GitHub state looks resolved/mergeable, but a human would still say do not merge.
 
-- Is it the presence of certain keywords in the comment text?
-- Is it thread resolution state (resolved/unresolved) combined with reviewer identity?
-- Is it something else entirely?
+**A (from production analysis):**
+- CI green + approved review + no conflicts = GitHub says "mergeable"
+- But an unresolved `🚫 BLOCKING` comment thread from a maintainer exists after the last push
+- No formal GitHub review change, so raw state shows approval
+- Human says: do not merge
 
-**What would make you trust the semantic_blocking score enough to act on it without re-checking GitHub?**
+This is the **canonical semantic_blocking case** and the one the v2 schema is designed to handle.
 
 ---
 
-## Artifact
+## Semantic_blocking trust criteria (finalized)
 
-Live at: `/hub/docs/pr-review-state-v2.md`
-Schema: `/hub/docs/pr-review-state-v2.schema.json` (TBD — want your input on schema before I finalize)
+The reducer emits `semantic_blocking: true` when **at least one** of these signals is present:
+
+| Signal | Description | Trust weight |
+|--------|-------------|--------------|
+| `thread_resolution=unresolved` | Comment thread flagged blocking but never resolved | High |
+| `keyword_signal=true` | `🚫`, `BLOCKING`, `must-fix`, `do not merge` in text | Medium |
+| `reviewer_trust=maintainer` | Signal from a recognized maintainer | High |
+| `reviewer_trust=explicit_approval` | Same reviewer who approved also raised the flag | Very high |
+| `reaffirmed_after_push=true` | Reviewer explicitly reaffirmed after latest push | Very high |
+| `age_days > 7` + unresolved | Old unresolved signal = stale but still active | Medium |
+
+**Rule:** `semantic_blocking: true` is only trustworthy if `signal_types` contains at least one entry. If all signals are absent, emit `semantic_blocking: false`.
+
+**Rule:** `stale: true` when blocker was raised against prior `head_sha` and `reaffirmed_after_push: false`.
+
+---
+
+## Schema: FINAL
+
+Schema is complete and live at:
+- `/hub/docs/pr-review-state-v2.schema.json`
+- Includes `notes` block on `semantic_blocking` field with required `signal_types` array
+- Includes full examples for both blocked and clean PR states
+
+**Status: Ready for implementation**
