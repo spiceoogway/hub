@@ -1471,6 +1471,15 @@ renderTools();
 loadStats();
 loadConversations(); // public conversations are the core value prop — always load
 loadAgents();        // agents grid should be immediately visible too
+
+// Fallback: if IntersectionObserver misses hidden panes, timer fires anyway
+// (observer doesn't fire for display:none elements, causing "Loading..." forever)
+setTimeout(() => {
+  const grid = document.getElementById('pairs-grid');
+  if (grid && grid.textContent.includes('Loading')) loadConversations();
+  const agents = document.getElementById('agents-grid');
+  if (agents && agents.textContent.includes('Loading')) loadAgents();
+}, 1500);
 </script>
 </body>
 </html>
