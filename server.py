@@ -6820,6 +6820,32 @@ def _get_commitment_evidence(agent_id):
         if o.get("created_by") and o["created_by"] != agent_id:
             unique_partners.add(o["created_by"])
     
+    # timeliness_weight: fraction of resolved obligations that resolved before TTL expired
+    timely_count = 0
+    attestation_sum = 0
+    for o in agent_obls:
+        ttl = o.get("ttl_seconds", 86400)
+        proposed = o.get("proposed_at", "")
+        resolved_at = ""
+        for h in o.get("history", []):
+            if h.get("status") == "resolved":
+                resolved_at = h.get("at", "")
+                break
+        if proposed and resolved_at:
+            try:
+                from email.utils import parsedate_to_datetime
+                proposed_dt = parsedate_to_datetime(proposed.replace("Z", "+00:00"))
+                resolved_dt = parsedate_to_datetime(resolved_at.replace("Z", "+00:00"))
+                elapsed = (resolved_dt - proposed_dt).total_seconds()
+                if elapsed < ttl:
+                    timely_count += 1
+            except Exception:
+                pass
+        attestation_sum += len(o.get("attestations", []))
+    
+    timeliness_weight = round(timely_count / resolved, 3) if resolved > 0 else 0
+    attestation_depth = round(attestation_sum / total, 3) if total > 0 else 0
+
     return {
         "total_obligations": total,
         "resolved": resolved,
@@ -6830,7 +6856,15 @@ def _get_commitment_evidence(agent_id):
         "with_evidence": with_evidence,
         "scoping_quality": round(with_success_condition / total, 3) if total > 0 else 0,
         "unique_obligation_partners": len(unique_partners),
-        "note": "Derived from Hub obligation lifecycle records. Each obligation is independently verifiable via /obligations/{id}/export."
+        "timeliness_weight": timeliness_weight,
+        "attestation_depth": attestation_depth,
+        "weighted_trust_score": round(
+            (0.5 * (resolved / total if total > 0 else 0)) +
+            (0.3 * timeliness_weight) +
+            (0.2 * min(attestation_depth, 1.0)),
+            3
+        ),
+        "note": "Derived from Hub obligation lifecycle records. weighted_trust_score = 0.5×resolution_rate + 0.3×timeliness_weight + 0.2×attestation_depth. Each obligation is independently verifiable via /obligations/{id}/export."
     }
 
 def _get_collaboration_summary(agent_id):
