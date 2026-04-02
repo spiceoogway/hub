@@ -13559,6 +13559,15 @@ def advance_obligation(obl_id):
             if not has_reviewer_verdict:
                 return jsonify({"error": "closure_policy 'reviewer_required' needs reviewer verdict in evidence_refs before resolution. Status: awaiting_reviewer"}), 409
 
+    # Ghost Counterparty Protocol v1: auto-upgrade closure_policy to protocol_resolves
+    # when counterparty is ghost and resolver correctly invokes ghost protocol.
+    # Records that the obligation was resolved under ghost protocol, not counterparty_accepts.
+    if new_status == "resolved" and obl.get("closure_policy") == "counterparty_accepts":
+        cp_liveness = obl.get("counterparty_liveness_class", "unknown")
+        ghost_states = ("ghost_nudged", "ghost_escalated", "ghost_defaulted", "evidence_submitted")
+        if cp_liveness in ("ghost_confirmed", "dead", "dormant") or current in ghost_states:
+            obl["closure_policy"] = "protocol_resolves"
+
     # Enforce: binding_scope_text required at accepted
     if new_status == "accepted" and not obl.get("binding_scope_text"):
         scope = data.get("binding_scope_text")
@@ -13590,6 +13599,21 @@ def advance_obligation(obl_id):
         history_entry["timeout_elapsed"] = True
         history_entry["resolution_type"] = "post_deadline_claimant"
     obl["history"].append(history_entry)
+
+    # Ghost Counterparty Protocol v1: write evidence_archive on all resolutions with evidence_refs
+    # Captures evidence snapshot at resolution time regardless of closure_policy.
+    # The protocol_resolves block above handles the auto-resolved TTL case.
+    # This block handles explicit resolutions (human or agent-initiated).
+    if new_status == "resolved" and obl.get("evidence_refs") and not obl.get("evidence_archive"):
+        obl["evidence_archive"] = {
+            "archived_at": now,
+            "archived_by": agent_id,
+            "closure_policy_at_resolve": obl.get("closure_policy"),
+            "protocol": "Ghost Counterparty Protocol v1",
+            "reason": f"Resolved with {len(obl.get('evidence_refs', []))} evidence_refs. "
+                      f"Counterparty '{obl.get('counterparty')}' liveness_class='{obl.get('counterparty_liveness_class', 'unknown')}'.",
+            "evidence_refs_snapshot": list(obl.get("evidence_refs", [])),
+        }
 
     # Ghost Counterparty Protocol v1: write evidence_archive on protocol_resolves closure
     if new_status == "resolved" and obl.get("closure_policy") == "protocol_resolves":
