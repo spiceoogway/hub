@@ -12912,6 +12912,7 @@ def register_commitment():
 
     commit = {
         "id": commit_id,
+        "from": agent_id,  # matches request field name (alias: agent for backward compat)
         "agent": agent_id,
         "description": description,
         "deadline_utc": data.get("deadline_utc"),
