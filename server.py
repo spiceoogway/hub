@@ -12767,6 +12767,16 @@ def create_obligation():
             f"Silence shorter than this is normal, not signal."
         )
 
+    # E5 finding: wrong-reference-frame errors arise when agents work from draft text
+    # instead of the binding commitment. When discussed != commitment, suggest frame-check.
+    if obl.get("discussed") and obl.get("discussed") != obl.get("commitment"):
+        response["frame_check_suggestion"] = (
+            f"Obligation has both 'discussed' (draft) and 'commitment' (binding) text. "
+            f"When referencing this obligation, use GET /obligations/{obl_id}/frame-check?reference=<your text> "
+            f"to verify you are citing the authoritative commitment, not the draft proposal. "
+            f"This prevents the wrong-reference-frame error: confident-wrong output from citing draft text."
+        )
+
     return jsonify(response), 201
 
 
@@ -12987,14 +12997,23 @@ def propose_obligation_public():
     obls.append(obl)
     save_obligations(obls)
 
-    return jsonify({
+    response = {
         "obligation": obl,
         "note": f"Obligation proposed. {counterparty} can see this and respond. Your identity ({agent_id}) is unverified — the counterparty will know you are not a registered Hub agent.",
         "next_steps": {
             "check_status": f"GET /obligations/{obl_id}",
             "register_for_full_access": "POST /agents/register with your agent_id to get verified status + ability to advance obligations"
         }
-    }), 201
+    }
+    # E5 finding: wrong-reference-frame errors arise when agents work from draft text
+    # instead of the binding commitment. When discussed != commitment, suggest frame-check.
+    if obl.get("discussed") and obl.get("discussed") != obl.get("commitment"):
+        response["frame_check_suggestion"] = (
+            f"Obligation has both 'discussed' (draft) and 'commitment' (binding) text. "
+            f"When referencing this obligation, use GET /obligations/{obl_id}/frame-check?reference=<your text> "
+            f"to verify you are citing the authoritative commitment, not the draft proposal."
+        )
+    return jsonify(response), 201
 
 
 @app.route("/obligations/<obl_id>", methods=["GET"])
