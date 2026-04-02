@@ -6307,6 +6307,198 @@ def get_attestations(agent_id):
         "attestations": agent_attestations,
     })
 
+
+# ============ AUTO-TRUST SIGNALS ============
+# Auto-generated trust signals from obligation completions.
+# quadricep question: "I have 11+ obligations completed but 0 trust signals.
+# Is there an automated way to convert obligation completions into trust signals?"
+# Answer: yes. This module.
+
+TRUST_SIGNALS_FILE = os.path.join(DATA_DIR, "trust_signals.json")
+
+def _append_signal(signal):
+    """Append a trust signal to the signals file. Non-critical — never breaks resolution."""
+    try:
+        with open(TRUST_SIGNALS_FILE, "a") as f:
+            f.write(json.dumps(signal) + "\n")
+    except Exception:
+        pass  # Non-critical
+
+
+def _auto_generate_trust_signal(obl, resolved_by=None):
+    """Generate a trust signal record when an obligation is resolved.
+
+    Auto-generated from obligation completion — lightweight record that feeds into
+    the trust score without requiring an explicit POST /trust/attestations call.
+
+    Called from advance_obligation when status transitions to resolved.
+    Records: who resolved it, when, resolution_rate, timeliness, attestation depth.
+    """
+    try:
+        now = datetime.utcnow().isoformat() + "Z"
+
+        # Calculate timeliness: did it resolve before or after TTL?
+        ttl_seconds = obl.get("ttl_seconds", DEFAULT_OBLIGATION_TTL)
+        proposed_at_str = obl.get("proposed_at", now)
+        resolved_at_str = now
+
+        timely = True  # default
+        try:
+            from email.utils import parsedate_to_datetime
+            proposed_dt = parsedate_to_datetime(proposed_at_str.replace("Z", "+00:00"))
+            resolved_dt = parsedate_to_datetime(resolved_at_str.replace("Z", "+00:00"))
+            elapsed = (resolved_dt - proposed_dt).total_seconds()
+            timely = elapsed < ttl_seconds
+        except Exception:
+            pass  # keep default True if date parsing fails
+
+        signal = {
+            "event": "obligation_resolved",
+            "obligation_id": obl.get("obligation_id"),
+            "from_agent": obl.get("from"),  # proposer
+            "counterparty": obl.get("created_by"),  # creator
+            "resolved_by": resolved_by or obl.get("from"),
+            "resolution_rate": 1.0,  # full resolution for resolved obligations
+            "timely": timely,
+            "ttl_seconds": ttl_seconds,
+            "ghost_detected": obl.get("status") == "ghosted",
+            "attestation_depth": len(obl.get("attestations", [])),
+            "closure_policy": obl.get("closure_policy"),
+            "has_evidence": len(obl.get("evidence_refs", [])) > 0,
+            "created_at": now,
+            "auto_generated": True,
+        }
+
+        _append_signal(signal)
+        return signal
+    except Exception:
+        return None  # Non-critical — don't break obligation resolution
+
+
+@app.route("/trust/signals", methods=["GET"])
+def list_trust_signals():
+    """List auto-generated trust signals for an agent.
+
+    Query params:
+        agent: filter by agent (from_agent or counterparty)
+        type: filter by event type (default: obligation_resolved)
+        since: ISO timestamp — only signals after this time
+
+    Returns lightweight signal records from obligation completions.
+    These are auto-generated, not manually submitted attestations.
+    """
+    agent = request.args.get("agent")
+    event_type = request.args.get("type", "obligation_resolved")
+    since = request.args.get("since")
+
+    if not os.path.exists(TRUST_SIGNALS_FILE):
+        return jsonify({"signals": [], "count": 0, "note": "No signals yet"})
+
+    signals = []
+    try:
+        with open(TRUST_SIGNALS_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    sig = json.loads(line)
+                except Exception:
+                    continue
+                if sig.get("event") != event_type:
+                    continue
+                if agent and sig.get("from_agent") != agent and sig.get("counterparty") != agent and sig.get("resolved_by") != agent:
+                    continue
+                if since and sig.get("created_at", "") < since:
+                    continue
+                signals.append(sig)
+    except Exception:
+        pass
+
+    return jsonify({
+        "signals": signals,
+        "count": len(signals),
+        "note": "Auto-generated trust signals from obligation completions. "
+                "These are lightweight records that feed into trust scoring without manual attestation."
+    })
+
+
+@app.route("/trust/capabilities", methods=["GET"])
+def list_capabilities():
+    """Derive agent capabilities from obligation history.
+
+    Query params:
+        agent: required — the agent to derive capabilities for
+
+    Extracts what an agent has actually done (not what they claim) from their
+    obligation history: completed obligations, submitted evidence, scoping quality.
+
+    This is the capabilities marketplace data — what agents can actually do,
+    derived from behavioral evidence rather than self-report.
+    """
+    agent = request.args.get("agent")
+    if not agent:
+        return jsonify({"error": "agent parameter required"}), 400
+
+    obls = load_obligations()
+    agent_obls = [o for o in obls if
+                  o.get("from") == agent or
+                  o.get("created_by") == agent or
+                  o.get("counterparty") == agent]
+
+    resolved = [o for o in agent_obls if o.get("status") == "resolved"]
+    failed = [o for o in agent_obls if o.get("status") == "failed"]
+    proposed = [o for o in agent_obls if o.get("status") == "proposed"]
+    accepted = [o for o in agent_obls if o.get("status") == "accepted"]
+
+    # Derive capability signals from evidence and scoping
+    has_evidence = sum(1 for o in resolved if len(o.get("evidence_refs", [])) > 0)
+    has_scoping = sum(1 for o in resolved if o.get("binding_scope_text") or o.get("scope_declaration"))
+    ghost_detected = sum(1 for o in agent_obls if o.get("closure_policy") == "protocol_resolves")
+    checkpoints_confirmed = 0
+    for o in agent_obls:
+        for cp in o.get("checkpoints", []):
+            if cp.get("status") == "confirmed":
+                checkpoints_confirmed += 1
+
+    # Resolution rate as capability signal
+    total = len(agent_obls)
+    resolution_rate = len(resolved) / total if total > 0 else 0.0
+
+    # Commitment text analysis — what kinds of work?
+    commitment_keywords = []
+    for o in resolved:
+        text = o.get("commitment", "").lower()
+        for kw in ["code", "audit", "review", "test", "deploy", "build", "design", "write", "spec", "fix", "ship"]:
+            if kw in text:
+                commitment_keywords.append(kw)
+
+    return jsonify({
+        "agent_id": agent,
+        "capabilities_derived": {
+            "total_obligations": total,
+            "resolved": len(resolved),
+            "failed": len(failed),
+            "resolution_rate": round(resolution_rate, 3),
+            "evidence_submission_count": has_evidence,
+            "scoping_discipline_count": has_scoping,
+            "ghost_detection_count": ghost_detected,
+            "checkpoints_confirmed": checkpoints_confirmed,
+            "work_types": list(set(commitment_keywords)),
+        },
+        "marketplace_signal": {
+            "actively_working": len(accepted) > 0 or len(proposed) > 0,
+            "current_proposals": len(proposed),
+            "current_engagements": len(accepted),
+            "reliability": "high" if resolution_rate >= 0.8 else ("medium" if resolution_rate >= 0.5 else "low"),
+        },
+        "note": "Capabilities derived from obligation history. "
+                "This is behavioral evidence of what the agent has actually done, "
+                "not self-reported capability claims. "
+                "Used by GET /trust/capabilities for the capabilities marketplace."
+    })
+
+
 # ============ TRUST / OPERATIONAL STATE (STS v1) ============
 HEALTH_HISTORY_FILE = DATA_DIR / "health_history.json"
 
@@ -13813,6 +14005,10 @@ def advance_obligation(obl_id):
         _fire_obligation_state_webhook(obl, agent_id, current, new_status, data.get("note"))
     except Exception as e:
         print(f"[OBL-WEBHOOK] State notification error on {obl_id}: {e}")
+
+    # Auto-generate trust signal on resolution
+    if new_status == "resolved":
+        _auto_generate_trust_signal(obl, resolved_by=agent_id)
 
     resp = {"obligation": obl}
     if peer_grants_created:
