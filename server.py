@@ -178,6 +178,30 @@ def _update_agent_liveness(agent_id, field):
         pass  # Non-critical — don't break the request on liveness tracking failure
 
 
+def _log_frame_check(obl_id, match_type, commitment_similarity, discussed_similarity, has_warning):
+    """Log frame-check invocations for wrong-reference-frame detection analytics.
+    
+    Tracks: how often frame-check is called, what match types appear, 
+    and how often it detects wrong-reference-frame errors (warnings).
+    """
+    event = {
+        "event": "frame_check",
+        "obl_id": obl_id,
+        "ts": datetime.utcnow().isoformat(),
+        "match_type": match_type,
+        "commitment_similarity": commitment_similarity,
+        "discussed_similarity": discussed_similarity,
+        "has_warning": has_warning,
+        "wrong_frame_detected": has_warning,  # alias for dashboards
+    }
+    log_file = ANALYTICS_DIR / "frame_check.jsonl"
+    try:
+        with open(log_file, "a") as f:
+            f.write(json.dumps(event) + "\n")
+    except Exception:
+        pass  # Non-critical — don't break the request on frame-check
+
+
 def _agent_delivery_capability(agent_info):
     """Compute delivery capability from agent config and liveness data.
     
@@ -324,6 +348,58 @@ def collaboration_track_summary():
         "by_source_surface": dict(by_source),
         "follow_on_actions": dict(by_follow_on),
         "top_targets": by_target.most_common(20),
+    })
+
+
+@app.route("/analytics/frame-check", methods=["GET"])
+def frame_check_analytics():
+    """Frame-check endpoint usage analytics — measures wrong-reference-frame detection rate.
+    
+    E5 finding: agents cite draft/proposed text instead of binding commitment,
+    producing confident-wrong outputs. Frame-check detects this mismatch.
+    
+    This endpoint tracks: call volume, match type distribution, and 
+    wrong-frame detection rate (fraction of calls that generate warnings).
+    """
+    from datetime import datetime, timedelta
+    from collections import Counter
+    days = int(request.args.get("days", 14))
+    since = datetime.utcnow() - timedelta(days=days)
+    log_file = ANALYTICS_DIR / "frame_check.jsonl"
+    if not log_file.exists():
+        return jsonify({
+            "period_days": days,
+            "total_calls": 0,
+            "by_match_type": {},
+            "wrong_frame_detected": 0,
+            "detection_rate": None,
+            "note": "No frame-check calls recorded yet"
+        })
+
+    by_match = Counter()
+    total = 0
+    wrong_frame = 0
+    with open(log_file) as f:
+        for line in f:
+            try:
+                row = json.loads(line)
+                ts = datetime.fromisoformat(row.get("ts", "").split("+")[0])
+                if ts < since:
+                    continue
+                total += 1
+                by_match[row.get("match_type", "unknown")] += 1
+                if row.get("wrong_frame_detected"):
+                    wrong_frame += 1
+            except Exception:
+                continue
+
+    return jsonify({
+        "period_days": days,
+        "total_calls": total,
+        "by_match_type": dict(by_match),
+        "wrong_frame_detected": wrong_frame,
+        "detection_rate": round(wrong_frame / total, 3) if total > 0 else None,
+        "detection_rate_pct": f"{round(100 * wrong_frame / total, 1)}%" if total > 0 else None,
     })
 
 
@@ -13123,6 +13199,11 @@ def check_obligation_frame(obl_id):
     if discussed and match_type in ("commitment", "commitment_only") and commitment != discussed:
         # Reference correctly cites commitment, but obligation has a draft — note it
         pass  # Informational only, no warning needed
+
+    # Track frame-check invocations for wrong-reference-frame analytics
+    _log_frame_check(obl_id, match_type, round(commitment_sim, 3),
+                     round(discussed_sim, 3) if discussed else None,
+                     bool(warnings))
 
     return jsonify({
         "obligation_id": obl_id,
