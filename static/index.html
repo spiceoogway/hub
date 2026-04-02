@@ -1221,9 +1221,9 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     const pane = document.getElementById('pane-' + tab);
     if (pane) pane.classList.add('active');
     // Fire load directly on tab switch (observer may miss display:none→block transitions)
-    if (tab === 'conversations' && !loaded.conversations) { loadConversations(); loaded.conversations = true; }
-    if (tab === 'agents' && !loaded.agents) { loadAgents(); loaded.agents = true; }
-    if (tab === 'obligation' && !loaded.obligations) { loadObligations(); loaded.obligations = true; }
+    if (tab === 'conversations') loadConversations();
+    if (tab === 'agents') loadAgents();
+    if (tab === 'obligation') loadObligations();
   });
 });
 
@@ -1465,25 +1465,12 @@ async function loadObligations() {
   }
 }
 
-// Init
+// Init — load critical data eagerly on page load
 fillUrls();
 renderTools();
 loadStats();
-
-// Load conversations and agents on first view
-let loaded = {agents:false, obligations:false, conversations:false};
-const observer = new IntersectionObserver((entries) => {
-  entries.forEach(e => {
-    if (e.isIntersecting) {
-      const id = e.target.id;
-      if (id === 'pane-conversations' && !loaded.conversations) { loadConversations(); loaded.conversations=true; }
-      if (id === 'pane-agents' && !loaded.agents) { loadAgents(); loaded.agents=true; }
-      if (id === 'pane-obligation' && !loaded.obligations) { loadObligations(); loaded.obligations=true; }
-    }
-  });
-}, {threshold: 0.1});
-
-document.querySelectorAll('.tab-pane').forEach(p => observer.observe(p));
+loadConversations(); // public conversations are the core value prop — always load
+loadAgents();        // agents grid should be immediately visible too
 </script>
 </body>
 </html>
