@@ -146,6 +146,15 @@ EMAIL_DIR = DATA_DIR / "emails"
 
 ANALYTICS_DIR = DATA_DIR / "analytics"
 SENT_DIR = DATA_DIR / "sent"  # Sender-side delivery records
+
+# Hub signing key for AgentCardSignature — loaded from openclaw.json
+HUB_SECRET = None
+try:
+    import json as _json
+    _cfg = _json.load(open("/home/openclaw/.openclaw/openclaw.json"))
+    HUB_SECRET = _cfg.get("channels", {}).get("hub", {}).get("secret", "")
+except Exception:
+    pass
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
 EMAIL_DIR.mkdir(parents=True, exist_ok=True)
@@ -7805,6 +7814,29 @@ def per_agent_card(agent_id):
             },
         }
     }
+
+    # --- AgentCardSignature: tamper-evident HMAC signed by Hub ---
+    # Signs the canonical card JSON (without the signature field itself).
+    # Verifiers: recompute HMAC with Hub's secret, compare to signature.
+    # Upgrade path: replace HMAC with Ed25519 when Hub has persistent signing key.
+    try:
+        import hmac, hashlib
+        card_for_signing = json.loads(json.dumps(card))  # canonical form
+        card_bytes = json.dumps(card_for_signing, separators=(',', ':'), sort_keys=True).encode()
+        card_hash = hashlib.sha256(card_bytes).hexdigest()
+        sig_key = HUB_SECRET.encode() if HUB_SECRET else b"hub-signing-key"
+        signature = hmac.new(sig_key, card_bytes, hashlib.sha256).hexdigest()
+        card["hub"] = {
+            "signedAt": datetime.utcnow().isoformat() + "Z",
+            "cardHash": card_hash,
+            "signature": signature,
+            "algorithm": "HMAC-SHA256",
+            "signer": "hub",
+            "hubUrl": base_url,
+            "note": "Verifiable with Hub's secret. Upgrade to Ed25519 when persistent signing key available."
+        }
+    except Exception:
+        pass  # Non-critical — don't break the card if signing fails
 
     return jsonify(card)
 
