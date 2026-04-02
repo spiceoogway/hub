@@ -13009,6 +13009,118 @@ def get_obligation(obl_id):
     return jsonify({"obligation": obl})
 
 
+@app.route("/obligations/<obl_id>/frame-check", methods=["GET"])
+def check_obligation_frame(obl_id):
+    """Check whether a given reference text is consistent with the authoritative obligation record.
+    
+    Problem: agents citing draft/proposed text instead of the binding commitment produce
+    confident-wrong outputs (E5 finding). This endpoint detects that mismatch.
+    
+    Query params:
+        reference: url-encoded text the agent is citing
+        match_threshold: 0.0-1.0 minimum similarity to count as a match (default 0.6)
+    
+    Returns:
+        match status against commitment and discussed fields
+        warnings if reference appears to cite draft instead of binding text
+        the authoritative fields for verification
+    """
+    import math
+    from urllib.parse import unquote
+    
+    obls = load_obligations()
+    if _expire_obligations(obls):
+        save_obligations(obls)
+    obl = next((o for o in obls if o["obligation_id"] == obl_id), None)
+    if not obl:
+        return jsonify({"error": "not found"}), 404
+
+    reference = request.args.get("reference", "").strip()
+    if not reference:
+        return jsonify({"error": "reference query param required"}), 400
+    
+    reference = unquote(reference)
+    threshold = float(request.args.get("match_threshold", 0.6))
+    threshold = max(0.0, min(1.0, threshold))
+
+    commitment = obl.get("commitment", "") or ""
+    discussed = obl.get("discussed") or ""
+    
+    def similarity(a, b):
+        """Jaccard-like substring similarity: what fraction of reference appears in target."""
+        if not a or not b:
+            return 0.0
+        a_lower, b_lower = a.lower(), b.lower()
+        # Check if reference is a substring of target
+        if a_lower in b_lower:
+            return 1.0
+        if b_lower in a_lower:
+            return float(len(b_lower)) / float(len(a_lower))
+        # Word overlap
+        a_words = set(a_lower.split())
+        b_words = set(b_lower.split())
+        if not a_words or not b_words:
+            return 0.0
+        intersection = len(a_words & b_words)
+        union = len(a_words | b_words)
+        return float(intersection) / float(union) if union > 0 else 0.0
+
+    commitment_sim = similarity(reference, commitment)
+    discussed_sim = similarity(reference, discussed) if discussed else 0.0
+
+    commitment_match = commitment_sim >= threshold
+    discussed_match = discussed_sim >= threshold
+    
+    # Determine match type
+    if commitment_match and (not discussed or discussed_match):
+        match_type = "commitment"
+        match_confidence = "high" if commitment_sim >= 0.85 else "medium"
+    elif commitment_match and not discussed_match and discussed:
+        match_type = "commitment_only"
+        match_confidence = "medium"
+    elif discussed_match and not commitment_match:
+        match_type = "discussed_only"
+        match_confidence = "low"
+        # This is the wrong-reference-frame case
+    elif not commitment_match and not discussed_match:
+        match_type = "unrelated"
+        match_confidence = "none"
+    else:
+        match_type = "unclear"
+        match_confidence = "low"
+
+    # Build warnings
+    warnings = []
+    if match_type == "discussed_only":
+        warnings.append(
+            f"WARNING: Your reference appears to cite the draft/proposed text, not the binding commitment. "
+            f"The authoritative commitment is: {commitment[:200]}"
+        )
+    elif match_type == "unrelated":
+        warnings.append(
+            "WARNING: Your reference does not match either the binding commitment or the draft. "
+            "Verify you are citing the correct obligation."
+        )
+    if discussed and match_type in ("commitment", "commitment_only") and commitment != discussed:
+        # Reference correctly cites commitment, but obligation has a draft — note it
+        pass  # Informational only, no warning needed
+
+    return jsonify({
+        "obligation_id": obl_id,
+        "match_type": match_type,
+        "reference_matches_commitment": commitment_match,
+        "reference_matches_discussed": discussed_match if discussed else None,
+        "commitment_similarity": round(commitment_sim, 3),
+        "discussed_similarity": round(discussed_sim, 3) if discussed else None,
+        "match_confidence": match_confidence,
+        "reference_text": reference[:500],  # Echo back for verification
+        "authoritative_commitment": commitment,
+        "discussed_text": discussed if discussed else None,
+        "warnings": warnings if warnings else None,
+        "threshold_used": threshold,
+    })
+
+
 def _sign_obligation_export(export_data):
     """Sign an obligation export with Hub's Ed25519 private key.
     Returns signature dict with base64 signature and public key, or None."""
