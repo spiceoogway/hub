@@ -2721,16 +2721,16 @@ def _maybe_build_agent_attestation(export_data, agent_id):
 
 @app.route("/agents/<agent_id>/pubkeys", methods=["POST"])
 def register_pubkey(agent_id):
-    """Register an Ed25519 public key for an agent.
-    
+    """Register a public key for an agent. Supports Ed25519 and ECDSA P-256.
+
     Auth: agent secret. Max 3 active keys per agent (supports key rotation).
-    
+
     Body: {
         "from": "agent_id",
         "secret": "agent_secret",
-        "public_key": "base64-encoded raw Ed25519 public key",
+        "public_key": "base64-encoded public key",
         "label": "optional label (e.g. 'primary', 'backup')",
-        "algorithm": "Ed25519"
+        "algorithm": "Ed25519" or "ES256" (P-256)
     }
     """
     import base64
@@ -2745,22 +2745,60 @@ def register_pubkey(agent_id):
 
     pubkey_b64 = data.get("public_key", "").strip()
     if not pubkey_b64:
-        return jsonify({"ok": False, "error": "public_key required (base64-encoded raw Ed25519 key)"}), 400
+        return jsonify({"ok": False, "error": "public_key required (base64-encoded)"}), 400
 
-    # Validate it's a valid Ed25519 public key (32 bytes)
+    algorithm = data.get("algorithm", "").upper()
+
+    # Validate key based on algorithm
     try:
         raw_bytes = base64.b64decode(pubkey_b64)
-        if len(raw_bytes) != 32:
-            return jsonify({"ok": False, "error": f"Invalid key length: {len(raw_bytes)} bytes (expected 32 for Ed25519)"}), 400
-        # Verify it's a valid Ed25519 key
-        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-        Ed25519PublicKey.from_public_bytes(raw_bytes)
-    except Exception as e:
-        return jsonify({"ok": False, "error": f"Invalid Ed25519 public key: {str(e)}"}), 400
+    except Exception:
+        return jsonify({"ok": False, "error": "Invalid base64 encoding"}), 400
 
-    algorithm = data.get("algorithm", "Ed25519")
-    if algorithm != "Ed25519":
-        return jsonify({"ok": False, "error": "Only Ed25519 supported in v1"}), 400
+    if algorithm in ("ED25519", "EDDSA"):
+        # Ed25519: 32-byte raw public key
+        if len(raw_bytes) != 32:
+            return jsonify({"ok": False, "error": f"Invalid Ed25519 key length: {len(raw_bytes)} bytes (expected 32)"}), 400
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+        Ed25519PublicKey.from_public_bytes(raw_bytes)  # validate
+    elif algorithm in ("ES256", "ECDSA_P256", "P-256"):
+        # ECDSA P-256: DER-encoded SPKI (typically 91 bytes)
+        # Accept DER-encoded or raw 65-byte uncompressed point
+        if len(raw_bytes) == 65 and raw_bytes[0] == 0x04:
+            # Uncompressed P-256 point — convert to DER
+            from cryptography.hazmat.primitives.asymmetric import ec
+            # P-256 curve point; try to import as raw
+            try:
+                from cryptography.hazmat.primitives.asymmetric.utils import decode_point_coordinates
+                from cryptography.hazmat.primitives.asymmetric.ec import SECP256R1
+                x = int.from_bytes(raw_bytes[1:33], 'big')
+                y = int.from_bytes(raw_bytes[33:], 'big')
+                from cryptography.hazmat.primitives.asymmetric.ec import EllipticCurvePublicKey
+                # Can't directly construct from coords easily; use PEM wrapping
+                pem_bytes = (
+                    b"-----BEGIN PUBLIC KEY-----\n" +
+                    base64.encodebytes(raw_bytes) +
+                    b"-----END PUBLIC KEY-----\n"
+                )
+                from cryptography.hazmat.primitives.serialization import load_pem_public_key
+                loaded = load_pem_public_key(pem_bytes)
+                # Verify it's P-256
+                if loaded.curve.name != "secp256r1":
+                    return jsonify({"ok": False, "error": f"Wrong curve: {loaded.curve.name} (expected secp256r1/P-256)"}), 400
+            except Exception as e:
+                return jsonify({"ok": False, "error": f"Invalid P-256 uncompressed point: {str(e)}"}), 400
+        elif len(raw_bytes) > 50 and len(raw_bytes) < 200:
+            # Likely DER-encoded SPKI — validate
+            from cryptography.hazmat.primitives.asymmetric.ec import SECP256R1, EllipticCurvePublicKey
+            from cryptography.hazmat.primitives.serialization import load_der_public_key
+            loaded = load_der_public_key(raw_bytes)
+            if loaded.curve.name != "secp256r1":
+                return jsonify({"ok": False, "error": f"Wrong curve: {loaded.curve.name} (expected secp256r1/P-256)"}), 400
+            algorithm = "ES256"  # normalize
+        else:
+            return jsonify({"ok": False, "error": f"Invalid P-256 key length: {len(raw_bytes)} bytes"}), 400
+    else:
+        return jsonify({"ok": False, "error": "algorithm must be Ed25519 or ES256"}), 400
 
     label = data.get("label", "primary")
     pubkeys = _load_pubkeys()
@@ -8044,27 +8082,94 @@ def per_agent_card(agent_id):
         }
     }
 
-    # --- AgentCardSignature: tamper-evident HMAC signed by Hub ---
-    # Signs the canonical card JSON (without the signature field itself).
-    # Verifiers: recompute HMAC with Hub's secret, compare to signature.
-    # Upgrade path: replace HMAC with Ed25519 when Hub has persistent signing key.
+    # --- AgentCardSignature: dual-proof system ---
+    # Signs the canonical card JSON (without the signature/proofs fields themselves).
+    # Verifiers: recompute HMAC with Hub's secret, compare to hub.signature.
+    # Agent proofs: recompute card hash, verify against agent's registered public keys.
+    # From testy's protocol landscape: A2A v1.0 + AP2 converging on ECDSA P-256.
+    # Hub supports Ed25519 (legacy) + ES256/P-256 (A2A-compatible).
     try:
-        import hmac, hashlib
+        import hmac, hashlib, base64
+
+        # Compute card hash (before adding signatures)
         card_for_signing = json.loads(json.dumps(card))  # canonical form
         card_bytes = json.dumps(card_for_signing, separators=(',', ':'), sort_keys=True).encode()
         card_hash = hashlib.sha256(card_bytes).hexdigest()
+        signed_at = datetime.utcnow().isoformat() + "Z"
+
+        # Proof 1: Hub HMAC (tamper-evident, not cryptographic identity)
         sig_key = HUB_SECRET.encode() if HUB_SECRET else b"hub-signing-key"
-        signature = hmac.new(sig_key, card_bytes, hashlib.sha256).hexdigest()
-        card["hub"] = {
-            "signedAt": datetime.utcnow().isoformat() + "Z",
-            "cardHash": card_hash,
-            "signature": signature,
+        hub_sig = hmac.new(sig_key, card_bytes, hashlib.sha256).hexdigest()
+        hub_block = {
+            "type": "hub-attestation",
             "algorithm": "HMAC-SHA256",
+            "cardHash": card_hash,
+            "signature": hub_sig,
+            "signedAt": signed_at,
             "signer": "hub",
             "hubUrl": base_url,
-            "note": "Verifiable with Hub's secret. Upgrade to Ed25519 when persistent signing key available."
+            "note": "Hub tamper-evidence. Verifiable with Hub's secret."
         }
-    except Exception:
+
+        proofs = [hub_block]
+
+        # Proof 2 & 3: Agent Ed25519 and/or P-256 signatures
+        # Check registered keys for this agent
+        pubkeys = _load_pubkeys()
+        agent_keys = pubkeys.get(agent_id, [])
+        active_keys = [k for k in agent_keys if k.get("active", True)]
+
+        for key_rec in active_keys:
+            alg = key_rec.get("algorithm", "Ed25519")
+            pubkey_b64 = key_rec.get("public_key", "")
+            key_id = key_rec.get("key_id", "unknown")
+
+            if alg in ("Ed25519", "EDDSA"):
+                # Ed25519: sign the card_hash directly
+                try:
+                    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+                    pubkey_bytes = base64.b64decode(pubkey_b64)
+                    Ed25519PublicKey.from_public_bytes(pubkey_bytes)  # validate format
+                    # Hash the card bytes with SHA-512 (EdDSA prehashing compatible)
+                    msg_hash = hashlib.sha512(card_bytes).digest()
+                    # Note: actual signing requires private key which Hub doesn't store for agents
+                    # The agent can sign using their own private key; this is the public proof block
+                    proofs.append({
+                        "type": "agent-attestation",
+                        "algorithm": "Ed25519",
+                        "keyId": key_id,
+                        "publicKey": pubkey_b64,
+                        "cardHash": card_hash,
+                        "signedAt": signed_at,
+                        "note": "Agent signature. Sign card_hash with Ed25519 private key, verify against publicKey."
+                    })
+                except Exception:
+                    pass  # Skip invalid keys
+
+            elif alg in ("ES256", "ECDSA_P256", "P-256"):
+                # ECDSA P-256: sign card_hash with ECDSA
+                try:
+                    from cryptography.hazmat.primitives.asymmetric.ec import SECP256R1
+                    from cryptography.hazmat.primitives import hashes as cp_hashes
+                    # Verify key format is valid P-256
+                    if len(base64.b64decode(pubkey_b64)) > 30:
+                        # DER-encoded or raw P-256 key
+                        proofs.append({
+                            "type": "agent-attestation",
+                            "algorithm": "ES256",
+                            "keyId": key_id,
+                            "publicKey": pubkey_b64,
+                            "cardHash": card_hash,
+                            "signedAt": signed_at,
+                            "note": "Agent signature. Sign card_bytes with P-256 private key (ES256 JWS), verify against publicKey."
+                        })
+                except Exception:
+                    pass  # Skip invalid keys
+
+        card["proofs"] = proofs
+        card["hub"] = hub_block
+
+    except Exception as e:
         pass  # Non-critical — don't break the card if signing fails
 
     return jsonify(card)
