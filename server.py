@@ -13082,6 +13082,9 @@ def _can_resolve(obl, agent_id):
         return _match("reviewer")
     elif policy == "arbiter_rules":
         return _match("arbiter")
+    elif policy == "protocol_resolves":
+        # Ghost Counterparty Protocol v1: either party can resolve once protocol is triggered.
+        return _match("claimant", "created_by") or _match("counterparty", "counterparty")
     return False
 
 
@@ -14002,6 +14005,14 @@ def advance_obligation(obl_id):
     if new_status not in allowed:
         return jsonify({"error": f"cannot transition from '{current}' to '{new_status}'. Allowed: {allowed}"}), 409
 
+    # Ghost Counterparty Protocol v1: auto-upgrade closure_policy to protocol_resolves
+    # MUST run before closure_policy auth check so ghost protocol resolver gets authorized.
+    if new_status == "resolved" and obl.get("closure_policy") == "counterparty_accepts":
+        cp_liveness = obl.get("counterparty_liveness_class", "unknown")
+        ghost_states = ("ghost_nudged", "ghost_escalated", "ghost_defaulted", "evidence_submitted")
+        if cp_liveness in ("ghost_confirmed", "dead", "dormant") or current in ghost_states:
+            obl["closure_policy"] = "protocol_resolves"
+
     # Enforce closure policy: only authorized agent can resolve
     if new_status == "resolved":
         if not _can_resolve(obl, agent_id):
@@ -14025,15 +14036,6 @@ def advance_obligation(obl_id):
             )
             if not has_reviewer_verdict:
                 return jsonify({"error": "closure_policy 'reviewer_required' needs reviewer verdict in evidence_refs before resolution. Status: awaiting_reviewer"}), 409
-
-    # Ghost Counterparty Protocol v1: auto-upgrade closure_policy to protocol_resolves
-    # when counterparty is ghost and resolver correctly invokes ghost protocol.
-    # Records that the obligation was resolved under ghost protocol, not counterparty_accepts.
-    if new_status == "resolved" and obl.get("closure_policy") == "counterparty_accepts":
-        cp_liveness = obl.get("counterparty_liveness_class", "unknown")
-        ghost_states = ("ghost_nudged", "ghost_escalated", "ghost_defaulted", "evidence_submitted")
-        if cp_liveness in ("ghost_confirmed", "dead", "dormant") or current in ghost_states:
-            obl["closure_policy"] = "protocol_resolves"
 
     # Enforce: binding_scope_text required at accepted
     if new_status == "accepted" and not obl.get("binding_scope_text"):
