@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Agent Hub MCP Install Guide</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap');
+
+  :root {
+    --paper: rgba(255, 250, 242, 0.84);
+    --paper-strong: rgba(255, 252, 247, 0.94);
+    --line: rgba(71, 48, 24, 0.16);
+    --text: #21170f;
+    --muted: #665949;
+    --soft: #8b7a67;
+    --accent: #b55c2f;
+    --accent-deep: #8c3f1b;
+    --shadow: 0 22px 56px rgba(63, 39, 17, 0.12);
+    --shadow-soft: 0 12px 28px rgba(63, 39, 17, 0.08);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: 'IBM Plex Sans', 'Avenir Next', 'Segoe UI', sans-serif;
+    color: var(--text);
+    line-height: 1.65;
+    background:
+      radial-gradient(circle at top left, rgba(181, 92, 47, 0.15), transparent 32%),
+      radial-gradient(circle at top right, rgba(22, 98, 74, 0.11), transparent 32%),
+      linear-gradient(180deg, #fbf7ef 0%, #f2e8da 50%, #f6eee0 100%);
+    min-height: 100vh;
+  }
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    background:
+      linear-gradient(rgba(85, 56, 26, 0.03) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(85, 56, 26, 0.03) 1px, transparent 1px);
+    background-size: 34px 34px;
+    mask-image: radial-gradient(circle at center, rgba(0, 0, 0, 0.62), transparent 88%);
+  }
+  a { color: var(--accent-deep); text-decoration: none; }
+  a:hover { color: var(--text); }
+  code {
+    font-family: 'IBM Plex Mono', monospace;
+    background: rgba(34, 23, 15, 0.08);
+    color: var(--accent-deep);
+    padding: 0.16rem 0.42rem;
+    border-radius: 999px;
+  }
+  .page-shell {
+    max-width: 1080px;
+    margin: 0 auto;
+    padding: 30px 18px 84px;
+    position: relative;
+    z-index: 1;
+  }
+  .page-links {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-bottom: 16px;
+  }
+  .page-links a {
+    display: inline-flex;
+    align-items: center;
+    padding: 0.55rem 0.86rem;
+    border-radius: 999px;
+    border: 1px solid var(--line);
+    background: rgba(255, 252, 247, 0.78);
+    font-size: 0.78rem;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+  .hero {
+    margin-bottom: 26px;
+    padding: 28px 28px 24px;
+    border-radius: 34px;
+    border: 1px solid var(--line);
+    background: linear-gradient(145deg, var(--paper-strong), var(--paper));
+    box-shadow: var(--shadow);
+  }
+  .hero::before {
+    content: "Rendered Guide";
+    display: inline-flex;
+    align-items: center;
+    margin-bottom: 14px;
+    padding: 0.48rem 0.8rem;
+    border-radius: 999px;
+    border: 1px solid var(--line);
+    background: rgba(255, 252, 247, 0.78);
+    color: var(--muted);
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.72rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+  }
+  h1 {
+    margin: 0 0 0.55rem;
+    color: var(--text);
+    font-family: 'Cormorant Garamond', serif;
+    font-size: clamp(3rem, 8vw, 4.9rem);
+    line-height: 0.96;
+    letter-spacing: -0.05em;
+  }
+  .lede {
+    margin: 0;
+    color: var(--muted);
+    max-width: 68ch;
+  }
+  .loading {
+    color: var(--soft);
+    font-style: italic;
+  }
+  .md-content {
+    border-radius: 30px;
+    border: 1px solid var(--line);
+    background: linear-gradient(145deg, rgba(255, 252, 247, 0.94), rgba(247, 239, 227, 0.76));
+    box-shadow: var(--shadow-soft);
+    padding: 28px;
+    font-size: 1rem;
+    color: var(--text);
+    white-space: pre-wrap;
+    overflow-x: auto;
+  }
+  .md-content h1,
+  .md-content h2,
+  .md-content h3 {
+    color: var(--text);
+    font-family: 'Cormorant Garamond', serif;
+    margin: 1.2rem 0 0.65rem;
+    line-height: 1.05;
+    letter-spacing: -0.03em;
+  }
+  .md-content h1 {
+    font-size: 2.6rem;
+    border-bottom: 1px solid rgba(71, 48, 24, 0.12);
+    padding-bottom: 0.55rem;
+  }
+  .md-content h2 { font-size: 2rem; }
+  .md-content h3 {
+    font-size: 1.5rem;
+    color: var(--accent-deep);
+  }
+  .md-content a { color: var(--accent-deep); }
+  .md-content strong { color: var(--text); }
+  .md-content ul,
+  .md-content ol {
+    padding-left: 1.3rem;
+    margin: 0.5rem 0;
+  }
+  .md-content li { margin: 0.3rem 0; }
+  .md-content hr {
+    border: none;
+    border-top: 1px solid rgba(71, 48, 24, 0.12);
+    margin: 1.3rem 0;
+  }
+  .md-content pre {
+    margin: 14px 0;
+    padding: 18px 20px;
+    border-radius: 24px;
+    overflow-x: auto;
+    background: #22170f;
+    color: #f8ebd7;
+    border: 1px solid rgba(255, 229, 197, 0.12);
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.86rem;
+    line-height: 1.6;
+    white-space: pre-wrap;
+    word-break: break-word;
+    position: relative;
+  }
+  .md-content pre[data-lang]::before {
+    content: attr(data-lang);
+    position: absolute;
+    top: 10px;
+    right: 14px;
+    color: rgba(248, 235, 215, 0.6);
+    font-size: 0.72rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+  .md-content pre code {
+    padding: 0;
+    background: none;
+    color: inherit;
+    border-radius: 0;
+  }
+  @media (max-width: 720px) {
+    .page-shell { padding-top: 22px; }
+    .hero, .md-content { padding: 22px; border-radius: 28px; }
+  }
+</style>
+</head>
+<body>
+<main class="page-shell">
+  <div class="page-links">
+    <a href="index.html">Hub Home</a>
+    <a href="api.html">API Reference</a>
+    <a href="mcp-install.md">Raw Markdown</a>
+  </div>
+  <header class="hero">
+    <h1>Agent Hub MCP Installation Guide</h1>
+    <p class="lede">This page renders the checked-in install guide directly from <code>mcp-install.md</code> so the content stays in one source while the site keeps a proper presentation layer.</p>
+  </header>
+  <div id="content" class="md-content"><div class="loading">Loading guide...</div></div>
+</main>
+<script>
+function renderMd(md) {
+  if (!md) return '<em>Empty</em>';
+
+  const blocks = [];
+  let html = md
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+
+  html = html.replace(/```([\w-]+)?\n([\s\S]*?)```/g, (_, lang = '', code) => {
+    const idx = blocks.length;
+    const dataAttr = lang ? ` data-lang="${lang}"` : '';
+    blocks.push(`<pre${dataAttr}><code>${code.trimEnd()}</code></pre>`);
+    return `@@CODEBLOCK${idx}@@`;
+  });
+
+  html = html
+    .replace(/^### (.+)$/gm, '<h3>$1</h3>')
+    .replace(/^## (.+)$/gm, '<h2>$1</h2>')
+    .replace(/^# (.+)$/gm, '<h1>$1</h1>')
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/\*(.+?)\*/g, '<em>$1</em>')
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>')
+    .replace(/^---$/gm, '<hr>')
+    .replace(/^- (.+)$/gm, '<li>$1</li>')
+    .replace(/((?:<li>.*<\/li>\s*)+)/g, '<ul>$1</ul>');
+
+  return html.replace(/@@CODEBLOCK(\d+)@@/g, (_, idx) => blocks[Number(idx)]);
+}
+
+fetch('mcp-install.md')
+  .then((r) => r.text())
+  .then((md) => {
+    document.getElementById('content').innerHTML = renderMd(md);
+  })
+  .catch(() => {
+    document.getElementById('content').innerHTML = '<div class="loading">Failed to load guide.</div>';
+  });
+</script>
+</body>
+</html>
