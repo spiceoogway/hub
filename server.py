@@ -2366,6 +2366,127 @@ def get_agent_profile(agent_id):
     return jsonify(profile)
 
 
+@app.route("/agents/<agent_id>/behavioral-history", methods=["GET"])
+def get_agent_behavioral_history(agent_id):
+    """Return behavioral history projections for an agent.
+    
+    Projection modes:
+    - trust_trajectory: time series of trust score changes based on obligation resolution
+    - delivery_profile: obligation completion stats segmented by counterparty and status
+    - both (default): full response
+    
+    Used by the W3C DID BehavioralHistoryService endpoint registration example.
+    Hub deployment: GET https://admin.slate.ceo/oc/brain/agents/{agent_id}/behavioral-history
+    """
+    projection = request.args.get("projection", "both")
+    
+    agents = load_agents()
+    if agent_id not in agents:
+        return jsonify(_behavioral_404("agent")), 404
+    
+    obligations = load_obligations()
+    _expire_obligations(obligations)
+    
+    # Filter obligations where this agent is a party
+    agent_obligations = [
+        obl for obl in obligations
+        if obl.get("proposer") == agent_id or obl.get("counterparty") == agent_id
+    ]
+    
+    result = {}
+    
+    if projection in ("trust_trajectory", "both"):
+        # Compute trust trajectory: obligations resolved over time
+        resolved = [o for o in agent_obligations if o.get("status") == "resolved"]
+        failed = [o for o in agent_obligations if o.get("status") == "failed"]
+        proposed = [o for o in agent_obligations if o.get("status") == "proposed"]
+        active = [o for o in agent_obligations if o.get("status") in ("accepted", "evidence_submitted")]
+        
+        total = len(agent_obligations)
+        resolution_rate = round(len(resolved) / total, 3) if total > 0 else None
+        
+        # Time-bucketed trajectory (monthly)
+        from collections import defaultdict
+        monthly = defaultdict(lambda: {"resolved": 0, "failed": 0, "total": 0})
+        for o in agent_obligations:
+            ts = o.get("created_at", "")[:7]  # YYYY-MM
+            monthly[ts]["total"] += 1
+            if o.get("status") == "resolved":
+                monthly[ts]["resolved"] += 1
+            elif o.get("status") == "failed":
+                monthly[ts]["failed"] += 1
+        
+        trajectory = []
+        cumulative_resolved = 0
+        for month in sorted(monthly.keys()):
+            bucket = monthly[month]
+            cumulative_resolved += bucket["resolved"]
+            trajectory.append({
+                "period": month,
+                "resolved": bucket["resolved"],
+                "failed": bucket["failed"],
+                "total": bucket["total"],
+                "cumulative_resolved": cumulative_resolved
+            })
+        
+        # Counterparties worked with
+        counterparties = list(set(
+            o.get("counterparty") for o in agent_obligations
+            if o.get("counterparty") and o.get("counterparty") != agent_id
+        ))
+        
+        result["trust_trajectory"] = {
+            "agent_id": agent_id,
+            "total_obligations": total,
+            "resolved": len(resolved),
+            "failed": len(failed),
+            "active": len(active),
+            "resolution_rate": resolution_rate,
+            "counterparties": counterparties,
+            "trajectory": trajectory
+        }
+    
+    if projection in ("delivery_profile", "both"):
+        # Delivery profile: stats segmented by counterparty
+        by_counterparty = defaultdict(lambda: {"total": 0, "resolved": 0, "failed": 0, "active": 0})
+        for o in agent_obligations:
+            cp = o.get("counterparty", "unknown")
+            by_counterparty[cp]["total"] += 1
+            s = o.get("status")
+            if s == "resolved":
+                by_counterparty[cp]["resolved"] += 1
+            elif s == "failed":
+                by_counterparty[cp]["failed"] += 1
+            elif s in ("accepted", "evidence_submitted"):
+                by_counterparty[cp]["active"] += 1
+        
+        delivery_breakdown = []
+        for cp, stats in sorted(by_counterparty.items(), key=lambda x: -x[1]["total"]):
+            rate = round(stats["resolved"] / stats["total"], 3) if stats["total"] > 0 else None
+            delivery_breakdown.append({
+                "counterparty": cp,
+                "total": stats["total"],
+                "resolved": stats["resolved"],
+                "failed": stats["failed"],
+                "active": stats["active"],
+                "resolution_rate": rate
+            })
+        
+        # Status distribution
+        status_dist = defaultdict(int)
+        for o in agent_obligations:
+            status_dist[o.get("status", "unknown")] += 1
+        
+        result["delivery_profile"] = {
+            "agent_id": agent_id,
+            "status_distribution": dict(status_dist),
+            "by_counterparty": delivery_breakdown,
+            "total_obligations": len(agent_obligations)
+        }
+    
+    return jsonify(result)
+
+
 @app.route("/agents/<agent_id>/permissions", methods=["GET"])
 def get_agent_permissions(agent_id):
     """Return current permission constraints + trust-adjusted effective limits.
