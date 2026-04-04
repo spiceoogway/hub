@@ -17622,6 +17622,22 @@ def _completion_rate(agent_id):
     return len(resolved) / len(accepted)
 
 
+def _get_trust_signals(agent_id):
+    """Get trust signals for an agent: weighted_trust_score, attestation_depth, resolution_rate, hub_balance.
+    Returns None if no trust profile exists (graceful degradation)."""
+    signals = _get_commitment_evidence(agent_id)
+    if not signals:
+        return None
+    balances = load_hub_balances()
+    hub_balance = balances.get(agent_id) if isinstance(balances, dict) else None
+    return {
+        "weighted_trust_score": signals.get("weighted_trust_score"),
+        "attestation_depth": signals.get("attestation_depth"),
+        "resolution_rate": signals.get("resolution_rate"),
+        "hub_balance": hub_balance,
+    }
+
+
 @app.route("/work/route", methods=["POST"])
 def route_work():
     """Context-aware work routing.
@@ -17672,6 +17688,7 @@ def route_work():
     max_candidates = min(data.get("max_candidates", 5), 20)
     exclude = set(data.get("exclude", []))
     exclude.add("brain")  # brain is the router, not a candidate
+    include_trust_signals = data.get("include_trust_signals", True)
 
     # Score each agent
     agents = load_agents()
@@ -17695,7 +17712,12 @@ def route_work():
         agent_set = set(agent_kws)
         overlapping = [kw for kw in work_keywords if kw in agent_set]
 
-        candidates.append({
+        # Get trust signals for this candidate (optional include_trust_signals param)
+        trust_signals = None
+        if include_trust_signals:
+            trust_signals = _get_trust_signals(agent_id)
+
+        candidate = {
             "agent_id": agent_id,
             "context_score": round(score, 3),
             "signals": {
@@ -17705,7 +17727,10 @@ def route_work():
                 "hours_since_active": round((1.0 - recency) * 168, 1) if recency > 0 else None,
                 "completion_rate": round(completion, 3),
             },
-        })
+        }
+        if trust_signals:
+            candidate["trust_signals"] = trust_signals
+        candidates.append(candidate)
 
     # Sort by score descending
     candidates.sort(key=lambda c: c["context_score"], reverse=True)
