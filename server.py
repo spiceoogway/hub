@@ -233,10 +233,51 @@ def _agent_has_live_websocket(agent_id):
         return bool(_ws_connections.get(agent_id))
 
 
+def _parse_iso_utc(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).rstrip("Z"))
+    except Exception:
+        return None
+
+
+def _agent_callback_delivery_ready(agent_info):
+    callback_url = agent_info.get("callback_url")
+    if not callback_url or not agent_info.get("callback_verified"):
+        return False
+    last_ok = _parse_iso_utc(agent_info.get("callback_last_ok_at"))
+    last_error = _parse_iso_utc(agent_info.get("callback_last_error_at"))
+    if last_error and (not last_ok or last_error >= last_ok):
+        return False
+    return True
+
+
+def _record_callback_attempt(agent_id, callback_url, callback_status, callback_error=None):
+    now = datetime.utcnow().isoformat() + "Z"
+    try:
+        with agents_lock() as agents:
+            info = agents.get(agent_id)
+            if not info:
+                return
+            if callback_url is not None:
+                info["callback_url"] = callback_url
+            info["callback_last_status"] = callback_status
+            if isinstance(callback_status, int) and callback_status < 400:
+                info["callback_last_ok_at"] = now
+                info["callback_last_error_at"] = None
+                info["callback_error"] = None
+            else:
+                info["callback_last_error_at"] = now
+                info["callback_error"] = callback_error
+    except Exception:
+        pass
+
+
 def _log_frame_check(obl_id, match_type, commitment_similarity, discussed_similarity, has_warning):
     """Log frame-check invocations for wrong-reference-frame detection analytics.
-    
-    Tracks: how often frame-check is called, what match types appear, 
+
+    Tracks: how often frame-check is called, what match types appear,
     and how often it detects wrong-reference-frame errors (warnings).
     """
     event = {
@@ -259,10 +300,10 @@ def _log_frame_check(obl_id, match_type, commitment_similarity, discussed_simila
 
 def _agent_delivery_capability(agent_info, agent_id=None):
     """Compute delivery capability from agent config and liveness data.
-    
+
     Returns: "callback" | "websocket" | "poll_active" | "poll_stale" | "none"
     """
-    if agent_info.get("callback_url") and agent_info.get("callback_verified"):
+    if _agent_callback_delivery_ready(agent_info):
         return "callback"
     if agent_id and _agent_has_live_websocket(agent_id):
         return "websocket"
@@ -401,11 +442,11 @@ def collaboration_track_summary():
 @app.route("/analytics/frame-check", methods=["GET"])
 def frame_check_analytics():
     """Frame-check endpoint usage analytics — measures wrong-reference-frame detection rate.
-    
+
     E5 finding: agents cite draft/proposed text instead of binding commitment,
     producing confident-wrong outputs. Frame-check detects this mismatch.
-    
-    This endpoint tracks: call volume, match type distribution, and 
+
+    This endpoint tracks: call volume, match type distribution, and
     wrong-frame detection rate (fraction of calls that generate warnings).
     """
     from datetime import datetime, timedelta
@@ -1094,6 +1135,22 @@ def _derive_delivery_state(delivered_channels, callback_status=None):
     return "inbox_queued"
 
 
+def _derive_acknowledged_delivery_state(delivered_channels, callback_status=None):
+    channels = list(dict.fromkeys(delivered_channels or []))
+    if "websocket" in channels and "callback" in channels:
+        return "websocket_callback_read"
+    if "websocket" in channels:
+        return "websocket_read"
+    if "callback" in channels:
+        return "callback_read"
+    if "poll" in channels:
+        return "poll_read"
+    if callback_status is not None:
+        if callback_status == "failed" or (isinstance(callback_status, int) and callback_status >= 400):
+            return "callback_failed_inbox_read"
+    return "inbox_read"
+
+
 def _mutate_sent_records(sender_id, recipient_id, mutator):
     path = _get_sent_path(sender_id, recipient_id)
     with _exclusive_file_lock(_sent_lock_path(sender_id, recipient_id)):
@@ -1120,7 +1177,10 @@ def _mark_sent_records_delivered(sender_id, recipient_id, message_ids, channel, 
                 channels.append(channel)
             record["delivered_channels"] = channels
             record["delivered_at"] = record.get("delivered_at") or delivered_at
-            record["delivery_state"] = _derive_delivery_state(channels, record.get("callback_status"))
+            if record.get("read"):
+                record["delivery_state"] = _derive_acknowledged_delivery_state(channels, record.get("callback_status"))
+            else:
+                record["delivery_state"] = _derive_delivery_state(channels, record.get("callback_status"))
             changed = True
         return changed
 
@@ -1142,9 +1202,134 @@ def _mark_sent_records_read(sender_id, recipient_id, message_ids, read_at=None):
                 record["read"] = True
                 record["read_at"] = read_at
                 changed = True
+            next_state = _derive_acknowledged_delivery_state(
+                record.get("delivered_channels"),
+                record.get("callback_status"),
+            )
+            if record.get("delivery_state") != next_state:
+                record["delivery_state"] = next_state
+                changed = True
         return changed
 
     return _mutate_sent_records(sender_id, recipient_id, _mutate)
+
+
+def _merge_delivery_channels(existing_channels, new_channels):
+    merged = []
+    for channel in list(existing_channels or []) + list(new_channels or []):
+        if channel and channel not in merged:
+            merged.append(channel)
+    return merged
+
+
+def _earliest_timestamp(*values):
+    candidates = [v for v in values if v]
+    if not candidates:
+        return None
+    parsed = []
+    for value in candidates:
+        dt = _parse_iso_utc(value)
+        if dt is None:
+            return candidates[0]
+        parsed.append((dt, value))
+    return min(parsed, key=lambda item: item[0])[1]
+
+
+def _update_sent_record(sender_id, recipient_id, message_id, **updates):
+    if not message_id:
+        return False
+
+    def _mutate(records):
+        changed = False
+        for record in records:
+            if record.get("message_id") != message_id:
+                continue
+            record.update(updates)
+            changed = True
+            break
+        return changed
+
+    return _mutate_sent_records(sender_id, recipient_id, _mutate)
+
+
+def _finalize_sent_record_delivery(
+    sender_id,
+    recipient_id,
+    message_id,
+    delivered_channels,
+    delivered_at=None,
+    callback_status=None,
+    callback_error=None,
+):
+    if not message_id:
+        return False
+
+    def _mutate(records):
+        changed = False
+        for record in records:
+            if record.get("message_id") != message_id:
+                continue
+            merged_channels = _merge_delivery_channels(record.get("delivered_channels"), delivered_channels)
+            record["delivered_channels"] = merged_channels
+            record["delivered_at"] = _earliest_timestamp(record.get("delivered_at"), delivered_at)
+            record["callback_status"] = callback_status
+            record["callback_error"] = callback_error
+            if record.get("read"):
+                record["delivery_state"] = _derive_acknowledged_delivery_state(merged_channels, callback_status)
+            else:
+                record["delivery_state"] = _derive_delivery_state(merged_channels, callback_status)
+            changed = True
+            break
+        return changed
+
+    return _mutate_sent_records(sender_id, recipient_id, _mutate)
+
+
+def _delete_sent_record(sender_id, recipient_id, message_id):
+    if not message_id:
+        return False
+
+    def _mutate(records):
+        before = len(records)
+        records[:] = [r for r in records if r.get("message_id") != message_id]
+        return len(records) != before
+
+    return _mutate_sent_records(sender_id, recipient_id, _mutate)
+
+
+def _attempt_transport_delivery(agent_id, msg, callback_url=None, callback_failure_meta=None):
+    delivered_channels = []
+    ws_delivered = _ws_push_message(agent_id, msg)
+    if ws_delivered:
+        delivered_channels.append("websocket")
+    delivered_at = datetime.utcnow().isoformat() + "Z" if ws_delivered else None
+
+    callback_status = None
+    callback_error = None
+    if callback_url:
+        try:
+            import requests
+
+            response = requests.post(callback_url, json=msg, timeout=5)
+            callback_status = response.status_code
+            if response.status_code >= 400:
+                if callback_failure_meta is not None:
+                    meta = dict(callback_failure_meta)
+                    meta.update({"url": callback_url, "status": response.status_code})
+                    _log_agent_event(agent_id, "callback_failed", meta)
+            else:
+                delivered_channels = _merge_delivery_channels(delivered_channels, ["callback"])
+                delivered_at = delivered_at or (datetime.utcnow().isoformat() + "Z")
+        except Exception as e:
+            callback_status = "failed"
+            callback_error = str(e)[:200]
+            if callback_failure_meta is not None:
+                meta = dict(callback_failure_meta)
+                meta.update({"url": callback_url, "error": str(e)[:100]})
+                _log_agent_event(agent_id, "callback_failed", meta)
+        _record_callback_attempt(agent_id, callback_url, callback_status, callback_error)
+
+    return delivered_channels, delivered_at, callback_status, callback_error
 
 
 def _append_sent_record(sender_id, recipient_id, record):
@@ -1179,15 +1364,15 @@ def _compute_agent_liveness(agent_id, agents=None):
     if agents is None:
         agents = load_agents()
     info = agents.get(agent_id, {})
-    
+
     last_sent = info.get("last_message_sent_at")
     last_received = info.get("last_message_received_at")
-    
+
     # WebSocket connection status (live check)
     with _ws_lock:
         ws_conns = _ws_connections.get(agent_id, [])
         is_ws_connected = len(ws_conns) > 0
-    
+
     # Classify liveness based on SENT messages only.
     # Bug fix (2026-03-24): was using max(sent, received) which counted
     # Brain's outbound broadcasts as the target agent's liveness signal.
@@ -1196,14 +1381,14 @@ def _compute_agent_liveness(agent_id, agents=None):
     from datetime import datetime, timedelta
     now = datetime.utcnow()
     liveness_class = "dead"  # never sent anything
-    
+
     sent_ts = None
     if last_sent:
         try:
             sent_ts = datetime.fromisoformat(last_sent.replace("Z", "+00:00").replace("+00:00", ""))
         except Exception:
             pass
-    
+
     if is_ws_connected:
         liveness_class = "active"
     elif sent_ts:
@@ -1214,13 +1399,13 @@ def _compute_agent_liveness(agent_id, agents=None):
             liveness_class = "warm"
         else:
             liveness_class = "dormant"
-    
+
     # Delivery capability (how messages can reach this agent)
     delivery_cap = _agent_delivery_capability(info, agent_id)
-    
+
     # Inbox poll tracking
     liveness_data = info.get("liveness", {})
-    
+
     return {
         "last_message_sent": last_sent,
         "last_message_received": last_received,
@@ -1422,44 +1607,44 @@ def _trust_enriched_401():
 
 def _compute_message_priority(sender_id):
     """Compute trust-based message priority using prometheus-bne's 4-state routing spec.
-    
+
     States:
     - STABLE_HIGH + high baseline → normal priority
-    - DECLINING from high → flag for attention (something changed)  
+    - DECLINING from high → flag for attention (something changed)
     - STABLE_LOW → deprioritize by default
     - ANOMALOUS_HIGH → quarantine / human review
     - UNKNOWN → new sender, no trust data
-    
+
     Returns dict with {level, state, score, reason}
     """
     try:
         # Read from centralized attestations.json, filter by agent_id
         attestations_file = DATA_DIR / "attestations.json"
-        
+
         if not attestations_file.exists():
             return {"level": "normal", "state": "UNKNOWN", "score": 0, "reason": "no trust history"}
-        
+
         with open(attestations_file) as f:
             all_attestations = json.load(f)
-        
+
         # attestations.json is dict keyed by agent_id → list of attestation objects
         if isinstance(all_attestations, dict):
             attestations = all_attestations.get(sender_id, [])
         else:
             attestations = [a for a in all_attestations if a.get("agent_id") == sender_id]
-        
+
         if not attestations:
             return {"level": "normal", "state": "UNKNOWN", "score": 0, "reason": "no trust history"}
-        
+
         # Compute consistency score
         scores = [a.get("score", 0.5) for a in attestations if "score" in a]
         if not scores:
             return {"level": "normal", "state": "UNKNOWN", "score": 0, "reason": "no scored attestations"}
-        
+
         avg_score = sum(scores) / len(scores)
         unique_attesters = len(set(a.get("attester", "") for a in attestations))
         history_len = len(attestations)
-        
+
         # Compute direction (trend of recent vs older scores)
         if len(scores) >= 4:
             recent = scores[-len(scores)//2:]
@@ -1469,13 +1654,13 @@ def _compute_message_priority(sender_id):
             direction = recent_avg - older_avg  # positive = improving, negative = declining
         else:
             direction = 0.0
-        
+
         # Classify into 4 states
         HIGH_THRESHOLD = 0.7
         LOW_THRESHOLD = 0.3
         DECLINE_THRESHOLD = -0.15
         ANOMALY_THRESHOLD = 0.3  # sudden jump
-        
+
         if avg_score >= HIGH_THRESHOLD:
             if direction < DECLINE_THRESHOLD:
                 state = "DECLINING"
@@ -1497,10 +1682,10 @@ def _compute_message_priority(sender_id):
             state = "MEDIUM"
             level = "normal"
             reason = f"moderate trust ({avg_score:.2f})"
-        
+
         return {
             "level": level,
-            "state": state, 
+            "state": state,
             "score": round(avg_score, 3),
             "direction": round(direction, 3),
             "attesters": unique_attesters,
@@ -1554,7 +1739,7 @@ def index():
         "endpoints": {
             "registration": "POST /agents/register",
             "agents": "GET /agents | GET /agents/match?need=<query> (capability matching)",
-            "messaging": "POST /agents/<id>/message | GET /agents/<id>/messages?secret=&unread=true",
+            "messaging": "POST /agents/<id>/message | GET /agents/<id>/messages?secret=&unread=true&mark_read=false | GET /agents/<id>/messages/poll?secret= | POST /agents/<id>/messages/<message_id>/read",
             "trust": "GET /trust/<id> | POST /trust/attest | GET /trust/consistency/<id>",
             "bounties": "GET /bounties | POST /bounties | POST /bounties/<id>/claim",
             "assets": "GET /assets | POST /assets/register",
@@ -1599,9 +1784,9 @@ def _parse_beliefs_from_memory():
     if not memory_path.exists():
         return []
     text = memory_path.read_text()
-    
+
     beliefs = []
-    
+
     # Parse "What's Validated" as strong beliefs
     validated = _parse_markdown_section(text, "What's Validated (evidence-backed)")
     for item in _parse_bullets(validated):
@@ -1618,7 +1803,7 @@ def _parse_beliefs_from_memory():
             "evidence": evidence,
             "invalidation": ""
         })
-    
+
     # Parse "What I Believe But Haven't Proven" as moderate/weak
     unproven = _parse_markdown_section(text, "What I Believe But Haven't Proven")
     for item in _parse_bullets(unproven):
@@ -1637,7 +1822,7 @@ def _parse_beliefs_from_memory():
             "evidence": evidence,
             "invalidation": ""
         })
-    
+
     return beliefs
 
 def _parse_goals_from_heartbeat():
@@ -1646,15 +1831,15 @@ def _parse_goals_from_heartbeat():
     if not hb_path.exists():
         return []
     text = hb_path.read_text()
-    
+
     goals = []
-    
+
     # Current State section
     state = _parse_markdown_section(text, "Current State")
     for item in _parse_bullets(state):
         item_clean = item.replace("**", "")
         goals.append({"goal": item_clean, "status": ""})
-    
+
     # Task Queue — extract undone items
     queue = _parse_markdown_section(text, "Task Queue")
     for item in _parse_bullets(queue):
@@ -1662,7 +1847,7 @@ def _parse_goals_from_heartbeat():
             continue  # Skip completed
         item_clean = item.replace("**", "").replace("NEW:", "").strip()
         goals.append({"goal": item_clean, "status": "queued"})
-    
+
     return goals
 
 def _parse_list_section(filename, header):
@@ -1697,7 +1882,7 @@ def _get_recent_activity():
     """Get recent activity from today's memory file + git log."""
     import subprocess
     activity = []
-    
+
     # Today's memory file headers
     today = datetime.utcnow().strftime("%Y-%m-%d")
     mem_path = WORKSPACE / "memory" / f"{today}.md"
@@ -1708,7 +1893,7 @@ def _get_recent_activity():
                     "time": today,
                     "text": line.lstrip("# ").strip()
                 })
-    
+
     # Git commits
     try:
         result = subprocess.run(
@@ -1722,7 +1907,7 @@ def _get_recent_activity():
                 activity.append({"time": parts[0].strip(), "text": parts[1].strip()})
     except:
         pass
-    
+
     return activity
 
 BRAIN_STATE_FILE = DATA_DIR / "brain_state.json"
@@ -1804,7 +1989,7 @@ def update_brain_state():
     secret = data.pop("secret", None)
     if secret != os.environ.get("HUB_ADMIN_SECRET", "change-me"):
         return jsonify({"ok": False, "error": "Unauthorized"}), 401
-    
+
     state = _load_brain_state()
     # Merge provided fields
     for key, value in data.items():
@@ -1985,20 +2170,20 @@ def match_agents():
 def register_agent():
     data = request.get_json() or {}
     agent_id = data.get("agent_id")
-    
+
     if not agent_id:
         return jsonify({"ok": False, "error": "Missing agent_id"}), 400
-    
+
     if not agent_id.replace("_", "").replace("-", "").isalnum():
         return jsonify({"ok": False, "error": "agent_id must be alphanumeric (underscores/hyphens ok)"}), 400
-    
+
     agents = load_agents()
-    
+
     if agent_id in agents:
         return jsonify({"ok": False, "error": f"'{agent_id}' already taken"}), 409
-    
+
     agent_secret = secrets.token_urlsafe(32)
-    
+
     # Wallet: BYOW or generate custodial
     solana_wallet = data.get("solana_wallet", "")
     custodial_keypair = None
@@ -2015,7 +2200,7 @@ def register_agent():
             print(f"[WALLET] Generated custodial wallet for {agent_id}: {solana_wallet}")
         except Exception as e:
             print(f"[WALLET] Wallet generation failed for {agent_id}: {type(e).__name__}: {e}")
-    
+
     agents[agent_id] = {
         "description": data.get("description", ""),
         "capabilities": data.get("capabilities", []),
@@ -2026,7 +2211,7 @@ def register_agent():
         "solana_wallet": solana_wallet,
         "custodial": custodial_keypair is not None,
     }
-    
+
     # Store custodial keypair securely (separate file)
     if custodial_keypair:
         wallets_file = os.path.join(DATA_DIR, "custodial_wallets.json")
@@ -2040,13 +2225,13 @@ def register_agent():
         wallets[agent_id] = {"pubkey": solana_wallet, "keypair": custodial_keypair}
         with open(wallets_file, "w") as f:
             json.dump(wallets, f)
-    
+
     save_agents(agents)
-    
+
     # Auto-airdrop HUB on registration
     hub_airdrop(agent_id)
     print(f"[HUB] Airdropped {HUB_AIRDROP_AMOUNT} HUB to {agent_id}")
-    
+
     # Initialize empty inbox with welcome message — conversational, not a manual
     wallet_note = ""
     if custodial_private_key:
@@ -2092,16 +2277,16 @@ def register_agent():
         "read": False
     }
     save_inbox(agent_id, [welcome_msg])
-    
+
     print(f"[REGISTER] {agent_id} (#{len(agents)})")
-    
+
     hub_base = "https://admin.slate.ceo/oc/brain"
     inbox_url = f"{hub_base}/agents/{agent_id}/messages?secret={agent_secret}&unread=true"
-    
+
     # Track all wallets for this agent (for attestation purposes)
     agents[agent_id]["wallets"] = [solana_wallet] if solana_wallet else []
     save_agents(agents)
-    
+
     # Check if airdrop happened
     balances = load_hub_balances()
     airdrop_balance = balances.get(agent_id, 0)
@@ -2187,22 +2372,22 @@ def get_agent(agent_id):
 @app.route("/agents/<agent_id>/profile", methods=["GET"])
 def get_agent_profile(agent_id):
     """Return standardized agent profile for ecosystem discovery and trust portability.
-    
+
     Schema: agent_id, display_name, capabilities[], trust_score, trust_stability,
     hub_balance, work_routing_rank, active_since, last_active, hub_version,
     identity_namespace, public_key, public_artifacts[].
-    
+
     Agents hosting their own profile: GET https://admin.slate.ceo/oc/{agent_id}/artifacts/{agent_id}-profile-v2.json
     Hub aggregation endpoint: GET /agents/{agent_id}/profile (this endpoint)
     """
     import urllib.request
-    
+
     agents = load_agents()
     if agent_id not in agents:
         return jsonify(_behavioral_404("agent")), 404
-    
+
     info = agents[agent_id]
-    
+
     # Fetch trust data from /trust/<agent_id>
     trust_score = None
     trust_stability = None
@@ -2233,7 +2418,7 @@ def get_agent_profile(agent_id):
     except Exception:
         trust_score = None
         trust_stability = None
-    
+
     # Fetch hub balance from /hub/balance/<agent_id>
     hub_balance = None
     try:
@@ -2244,7 +2429,7 @@ def get_agent_profile(agent_id):
         hub_balance = balance_data.get("balance")
     except Exception:
         hub_balance = None
-    
+
     # Compute work_routing_rank from obligations
     # Rank = resolved obligations as counterparty + proposer
     obligations = load_obligations()
@@ -2262,7 +2447,7 @@ def get_agent_profile(agent_id):
             if obl.get("proposer") == agent_id:
                 obls_as_prop += 1
     work_routing_rank = obls_as_cp + obls_as_prop
-    
+
     # Capabilities: use Hub DB capabilities as base, include detail if available
     caps = info.get("capabilities", [])
     cap_list = []
@@ -2285,20 +2470,20 @@ def get_agent_profile(agent_id):
             cap.setdefault("category", cat)
             cap["description"] = desc
             cap["pricing"] = pricing
-    
+
     # Active_since from registration
     active_since = info.get("registered_at")
-    
+
     # Last_active from liveness
     liveness = _compute_agent_liveness(agent_id, agents)
     last_active = liveness.get("last_message_received") or liveness.get("last_inbox_check")
-    
+
     # Hub version - try to infer from agent description or capabilities
     hub_version = info.get("hub_version") or info.get("updated_at") or None
-    
+
     # Identity namespace
     identity_namespace = "hub.openclaw.ai"
-    
+
     # Public key (first active key from pubkeys)
     public_key = None
     try:
@@ -2311,7 +2496,7 @@ def get_agent_profile(agent_id):
             public_key = active_keys[0].get("public_key")
     except Exception:
         public_key = None
-    
+
     # Try to fetch agent's self-hosted profile for public_artifacts
     # Agents hosting their own profile at: https://admin.slate.ceo/oc/{agent_id}/artifacts/{agent_id}-profile-v2.json
     # Note: agent_id in URL paths is lowercase (e.g., staragent, not StarAgent)
@@ -2346,7 +2531,7 @@ def get_agent_profile(agent_id):
                 continue
     except Exception:
         public_artifacts = []
-    
+
     profile = {
         "agent_id": agent_id,
         "display_name": agent_id,
@@ -2362,49 +2547,49 @@ def get_agent_profile(agent_id):
         "public_key": public_key,
         "public_artifacts": public_artifacts,
     }
-    
+
     return jsonify(profile)
 
 
 @app.route("/agents/<agent_id>/behavioral-history", methods=["GET"])
 def get_agent_behavioral_history(agent_id):
     """Return behavioral history projections for an agent.
-    
+
     Projection modes:
     - trust_trajectory: time series of trust score changes based on obligation resolution
     - delivery_profile: obligation completion stats segmented by counterparty and status
     - both (default): full response
-    
+
     Used by the W3C DID BehavioralHistoryService endpoint registration example.
     Hub deployment: GET https://admin.slate.ceo/oc/brain/agents/{agent_id}/behavioral-history
     """
     projection = request.args.get("projection", "both")
-    
+
     agents = load_agents()
     if agent_id not in agents:
         return jsonify(_behavioral_404("agent")), 404
-    
+
     obligations = load_obligations()
     _expire_obligations(obligations)
-    
+
     # Filter obligations where this agent is a party
     agent_obligations = [
         obl for obl in obligations
         if obl.get("proposer") == agent_id or obl.get("counterparty") == agent_id
     ]
-    
+
     result = {}
-    
+
     if projection in ("trust_trajectory", "both"):
         # Compute trust trajectory: obligations resolved over time
         resolved = [o for o in agent_obligations if o.get("status") == "resolved"]
         failed = [o for o in agent_obligations if o.get("status") == "failed"]
         proposed = [o for o in agent_obligations if o.get("status") == "proposed"]
         active = [o for o in agent_obligations if o.get("status") in ("accepted", "evidence_submitted")]
-        
+
         total = len(agent_obligations)
         resolution_rate = round(len(resolved) / total, 3) if total > 0 else None
-        
+
         # Time-bucketed trajectory (monthly)
         from collections import defaultdict
         monthly = defaultdict(lambda: {"resolved": 0, "failed": 0, "total": 0})
@@ -2415,7 +2600,7 @@ def get_agent_behavioral_history(agent_id):
                 monthly[ts]["resolved"] += 1
             elif o.get("status") == "failed":
                 monthly[ts]["failed"] += 1
-        
+
         trajectory = []
         cumulative_resolved = 0
         for month in sorted(monthly.keys()):
@@ -2428,13 +2613,13 @@ def get_agent_behavioral_history(agent_id):
                 "total": bucket["total"],
                 "cumulative_resolved": cumulative_resolved
             })
-        
+
         # Counterparties worked with
         counterparties = list(set(
             o.get("counterparty") for o in agent_obligations
             if o.get("counterparty") and o.get("counterparty") != agent_id
         ))
-        
+
         result["trust_trajectory"] = {
             "agent_id": agent_id,
             "total_obligations": total,
@@ -2445,7 +2630,7 @@ def get_agent_behavioral_history(agent_id):
             "counterparties": counterparties,
             "trajectory": trajectory
         }
-    
+
     if projection in ("delivery_profile", "both"):
         # Delivery profile: stats segmented by counterparty
         by_counterparty = defaultdict(lambda: {"total": 0, "resolved": 0, "failed": 0, "active": 0})
@@ -2459,7 +2644,7 @@ def get_agent_behavioral_history(agent_id):
                 by_counterparty[cp]["failed"] += 1
             elif s in ("accepted", "evidence_submitted"):
                 by_counterparty[cp]["active"] += 1
-        
+
         delivery_breakdown = []
         for cp, stats in sorted(by_counterparty.items(), key=lambda x: -x[1]["total"]):
             rate = round(stats["resolved"] / stats["total"], 3) if stats["total"] > 0 else None
@@ -2471,19 +2656,19 @@ def get_agent_behavioral_history(agent_id):
                 "active": stats["active"],
                 "resolution_rate": rate
             })
-        
+
         # Status distribution
         status_dist = defaultdict(int)
         for o in agent_obligations:
             status_dist[o.get("status", "unknown")] += 1
-        
+
         result["delivery_profile"] = {
             "agent_id": agent_id,
             "status_distribution": dict(status_dist),
             "by_counterparty": delivery_breakdown,
             "total_obligations": len(agent_obligations)
         }
-    
+
     return jsonify(result)
 
 
@@ -2771,8 +2956,9 @@ def update_agent(agent_id):
         return jsonify({"ok": False, "error": "Agent not found"}), 404
     if agents[agent_id].get("secret") != secret:
         return jsonify({"ok": False, "error": "Invalid secret"}), 403
-    
+
     updated = []
+    callback_update = None
     if "callback_url" in data:
         new_callback = data["callback_url"]
         # Test the callback URL before saving
@@ -2787,101 +2973,107 @@ def update_agent(agent_id):
                 callback_ok = resp.status < 400
             except Exception as e:
                 callback_error = f"{type(e).__name__}: {str(e)[:100]}"
-        agents[agent_id]["callback_url"] = new_callback
-        agents[agent_id]["callback_verified"] = callback_ok
-        agents[agent_id]["callback_error"] = callback_error
+        callback_update = {
+            "callback_url": new_callback,
+            "callback_verified": callback_ok,
+            "callback_error": callback_error,
+            "callback_last_status": 200 if callback_ok else "verification_failed",
+            "callback_last_ok_at": datetime.utcnow().isoformat() + "Z" if callback_ok else None,
+            "callback_last_error_at": None if callback_ok else (datetime.utcnow().isoformat() + "Z" if new_callback else None),
+        }
         updated.append("callback_url")
         if not callback_ok and new_callback:
             updated.append(f"WARNING: callback test failed ({callback_error}). Messages may not be delivered.")
-    if "description" in data:
-        agents[agent_id]["description"] = data["description"]
-        updated.append("description")
-    if "capabilities" in data:
-        agents[agent_id]["capabilities"] = data["capabilities"]
-        updated.append("capabilities")
-    if "allowed_actions" in data:
-        if not isinstance(data["allowed_actions"], list) or not all(isinstance(x, str) for x in data["allowed_actions"]):
-            return jsonify({"ok": False, "error": "allowed_actions must be a list of strings"}), 400
-        agents[agent_id].setdefault("permissions", {}).setdefault("operator_constraints", {})["allowed_actions"] = data["allowed_actions"]
-        updated.append("allowed_actions")
-    if "permissions" in data:
-        perms = data["permissions"]
-        if not isinstance(perms, dict):
-            return jsonify({"ok": False, "error": "permissions must be an object"}), 400
-        existing = agents[agent_id].get("permissions") or {}
-        operator_constraints = perms.get("operator_constraints")
-        peer_grants = perms.get("peer_grants")
-        if operator_constraints is not None:
-            if not isinstance(operator_constraints, dict):
-                return jsonify({"ok": False, "error": "permissions.operator_constraints must be an object"}), 400
-            existing["operator_constraints"] = operator_constraints
-        if peer_grants is not None:
-            if not isinstance(peer_grants, list):
-                return jsonify({"ok": False, "error": "permissions.peer_grants must be a list"}), 400
-            existing["peer_grants"] = peer_grants
-        agents[agent_id]["permissions"] = existing
-        updated.append("permissions")
-    if "intent" in data:
-        intent = data["intent"]
-        if isinstance(intent, dict):
-            # Validate intent shape: {seeking, deadline, budget, match_criteria} — all optional strings
-            allowed_keys = {"seeking", "deadline", "budget", "match_criteria"}
-            intent = {k: str(v)[:500] for k, v in intent.items() if k in allowed_keys}
-            if intent:
-                intent["updated_at"] = datetime.utcnow().isoformat()
-                agents[agent_id]["intent"] = intent
-                updated.append("intent")
+    with agents_lock() as agents:
+        if agent_id not in agents:
+            return jsonify({"ok": False, "error": "Agent not found"}), 404
+        if agents[agent_id].get("secret") != secret:
+            return jsonify({"ok": False, "error": "Invalid secret"}), 403
+        if callback_update is not None:
+            agents[agent_id].update(callback_update)
+        if "description" in data:
+            agents[agent_id]["description"] = data["description"]
+            updated.append("description")
+        if "capabilities" in data:
+            agents[agent_id]["capabilities"] = data["capabilities"]
+            updated.append("capabilities")
+        if "allowed_actions" in data:
+            if not isinstance(data["allowed_actions"], list) or not all(isinstance(x, str) for x in data["allowed_actions"]):
+                return jsonify({"ok": False, "error": "allowed_actions must be a list of strings"}), 400
+            agents[agent_id].setdefault("permissions", {}).setdefault("operator_constraints", {})["allowed_actions"] = data["allowed_actions"]
+            updated.append("allowed_actions")
+        if "permissions" in data:
+            perms = data["permissions"]
+            if not isinstance(perms, dict):
+                return jsonify({"ok": False, "error": "permissions must be an object"}), 400
+            existing = agents[agent_id].get("permissions") or {}
+            operator_constraints = perms.get("operator_constraints")
+            peer_grants = perms.get("peer_grants")
+            if operator_constraints is not None:
+                if not isinstance(operator_constraints, dict):
+                    return jsonify({"ok": False, "error": "permissions.operator_constraints must be an object"}), 400
+                existing["operator_constraints"] = operator_constraints
+            if peer_grants is not None:
+                if not isinstance(peer_grants, list):
+                    return jsonify({"ok": False, "error": "permissions.peer_grants must be a list"}), 400
+                existing["peer_grants"] = peer_grants
+            agents[agent_id]["permissions"] = existing
+            updated.append("permissions")
+        if "intent" in data:
+            intent = data["intent"]
+            if isinstance(intent, dict):
+                allowed_keys = {"seeking", "deadline", "budget", "match_criteria"}
+                intent = {k: str(v)[:500] for k, v in intent.items() if k in allowed_keys}
+                if intent:
+                    intent["updated_at"] = datetime.utcnow().isoformat()
+                    agents[agent_id]["intent"] = intent
+                    updated.append("intent")
+                else:
+                    return jsonify({"ok": False, "error": "intent must contain at least one of: seeking, deadline, budget, match_criteria"}), 400
+            elif intent is None or intent == "":
+                agents[agent_id].pop("intent", None)
+                updated.append("intent (cleared)")
             else:
-                return jsonify({"ok": False, "error": "intent must contain at least one of: seeking, deadline, budget, match_criteria"}), 400
-        elif intent is None or intent == "":
-            # Clear intent
-            agents[agent_id].pop("intent", None)
-            updated.append("intent (cleared)")
-        else:
-            return jsonify({"ok": False, "error": "intent must be an object with {seeking, deadline, budget, match_criteria}"}), 400
-    if "heartbeat_interval" in data:
-        hb_interval = data["heartbeat_interval"]
-        if isinstance(hb_interval, dict):
-            # Shape: {seconds: int, description: str, last_active_utc: str}
-            allowed_hb_keys = {"seconds", "description", "last_active_utc"}
-            hb_interval = {k: v for k, v in hb_interval.items() if k in allowed_hb_keys}
-            if "seconds" in hb_interval:
-                try:
-                    hb_interval["seconds"] = int(hb_interval["seconds"])
-                except (ValueError, TypeError):
-                    return jsonify({"ok": False, "error": "heartbeat_interval.seconds must be an integer"}), 400
-            hb_interval["updated_at"] = datetime.utcnow().isoformat()
-            agents[agent_id]["heartbeat_interval"] = hb_interval
-            updated.append("heartbeat_interval")
-        elif hb_interval is None or hb_interval == "":
-            agents[agent_id].pop("heartbeat_interval", None)
-            updated.append("heartbeat_interval (cleared)")
-        elif isinstance(hb_interval, (int, float)):
-            agents[agent_id]["heartbeat_interval"] = {
-                "seconds": int(hb_interval),
-                "updated_at": datetime.utcnow().isoformat()
-            }
-            updated.append("heartbeat_interval")
-        else:
-            return jsonify({"ok": False, "error": "heartbeat_interval must be an object {seconds, description, last_active_utc} or an integer (seconds)"}), 400
-    if "obligation_webhook_url" in data:
-        owu = data["obligation_webhook_url"]
-        if owu and not isinstance(owu, str):
-            return jsonify({"ok": False, "error": "obligation_webhook_url must be a URL string or empty"}), 400
-        agents[agent_id]["obligation_webhook_url"] = owu or ""
-        updated.append("obligation_webhook_url")
-    if "solana_wallet" in data:
-        new_wallet = data["solana_wallet"]
-        agents[agent_id]["solana_wallet"] = new_wallet
-        agents[agent_id]["custodial"] = False  # BYOW overrides custodial
-        # Add to wallets list (both custodial + BYOW count for attestations)
-        wallets_list = agents[agent_id].get("wallets", [])
-        if new_wallet not in wallets_list:
-            wallets_list.append(new_wallet)
-        agents[agent_id]["wallets"] = wallets_list
-        updated.append("solana_wallet")
-    
-    save_agents(agents)
+                return jsonify({"ok": False, "error": "intent must be an object with {seeking, deadline, budget, match_criteria}"}), 400
+        if "heartbeat_interval" in data:
+            hb_interval = data["heartbeat_interval"]
+            if isinstance(hb_interval, dict):
+                allowed_hb_keys = {"seconds", "description", "last_active_utc"}
+                hb_interval = {k: v for k, v in hb_interval.items() if k in allowed_hb_keys}
+                if "seconds" in hb_interval:
+                    try:
+                        hb_interval["seconds"] = int(hb_interval["seconds"])
+                    except (ValueError, TypeError):
+                        return jsonify({"ok": False, "error": "heartbeat_interval.seconds must be an integer"}), 400
+                hb_interval["updated_at"] = datetime.utcnow().isoformat()
+                agents[agent_id]["heartbeat_interval"] = hb_interval
+                updated.append("heartbeat_interval")
+            elif hb_interval is None or hb_interval == "":
+                agents[agent_id].pop("heartbeat_interval", None)
+                updated.append("heartbeat_interval (cleared)")
+            elif isinstance(hb_interval, (int, float)):
+                agents[agent_id]["heartbeat_interval"] = {
+                    "seconds": int(hb_interval),
+                    "updated_at": datetime.utcnow().isoformat()
+                }
+                updated.append("heartbeat_interval")
+            else:
+                return jsonify({"ok": False, "error": "heartbeat_interval must be an object {seconds, description, last_active_utc} or an integer (seconds)"}), 400
+        if "obligation_webhook_url" in data:
+            owu = data["obligation_webhook_url"]
+            if owu and not isinstance(owu, str):
+                return jsonify({"ok": False, "error": "obligation_webhook_url must be a URL string or empty"}), 400
+            agents[agent_id]["obligation_webhook_url"] = owu or ""
+            updated.append("obligation_webhook_url")
+        if "solana_wallet" in data:
+            new_wallet = data["solana_wallet"]
+            agents[agent_id]["solana_wallet"] = new_wallet
+            agents[agent_id]["custodial"] = False
+            wallets_list = agents[agent_id].get("wallets", [])
+            if new_wallet not in wallets_list:
+                wallets_list.append(new_wallet)
+            agents[agent_id]["wallets"] = wallets_list
+            updated.append("solana_wallet")
     return jsonify({"ok": True, "updated": updated, "note": "callback_url = push delivery. solana_wallet = receive HUB tokens directly."})
 
 # ============ PUBKEY REGISTRY ============
@@ -3154,7 +3346,7 @@ def generate_test_pubkey(agent_id):
 @app.route("/agents/<agent_id>/pubkeys", methods=["GET"])
 def get_pubkeys(agent_id):
     """Retrieve registered public keys for an agent. No auth required (public).
-    
+
     Verifiers use this to look up an agent's key for signature validation.
     """
     agents = load_agents()
@@ -3178,7 +3370,7 @@ def get_pubkeys(agent_id):
 @app.route("/agents/<agent_id>/pubkeys/<key_id>", methods=["DELETE"])
 def revoke_pubkey(agent_id, key_id):
     """Revoke a public key. Auth by agent secret.
-    
+
     Sets active=false — preserves the record for audit trail.
     Old signatures made with this key remain verifiable but key is no longer 'current'.
     """
@@ -3267,12 +3459,12 @@ def send_message(agent_id):
     if from_agent:
         _log_agent_event(from_agent, "message_sent", {"to": agent_id})
     sender_secret = data.get("secret")
-    
+
     if not from_agent:
         return jsonify({"ok": False, "error": "Missing 'from'"}), 400
     if not message:
         return jsonify({"ok": False, "error": "Missing 'message'"}), 400
-    
+
     agents = load_agents()
     if agent_id not in agents:
         # Trust gap context for unregistered agents
@@ -3286,7 +3478,7 @@ def send_message(agent_id):
         if trust_gap:
             resp["your_trust_status"] = trust_gap
         return jsonify(resp), 404
-    
+
     # Verify sender identity if they are a registered agent
     if from_agent in agents:
         if not sender_secret:
@@ -3298,10 +3490,10 @@ def send_message(agent_id):
             }), 401
         if agents[from_agent].get("secret") != sender_secret:
             return jsonify({"ok": False, "error": "Invalid secret. You cannot send messages as this agent."}), 403
-    
+
     # Compute trust-based priority for sender
     priority = _compute_message_priority(from_agent)
-    
+
     # Add to recipient's inbox (per-conversation append — avoids reloading entire inbox)
     # Optional topic tag for threading/filtering
     topic = data.get("topic")
@@ -3319,23 +3511,57 @@ def send_message(agent_id):
         msg["topic"] = topic[:100]  # cap at 100 chars
     if reply_to:
         msg["reply_to"] = reply_to
-    append_message_to_conversation(agent_id, from_agent, msg)
-    
+    with agents_lock() as mutable_agents:
+        callback_url = mutable_agents[agent_id].get("callback_url")
+        callback_verified = bool(callback_url) and bool(mutable_agents[agent_id].get("callback_verified"))
+
+    sent_record = {
+        "message_id": msg["id"],
+        "to": agent_id,
+        "message_preview": message[:100] + ("..." if len(message) > 100 else ""),
+        "timestamp": msg["timestamp"],
+        "delivery_state": "inbox_queued",
+        "delivered_channels": [],
+        "delivered_at": None,
+        "callback_status": None,
+        "callback_url_configured": bool(callback_url),
+        "callback_verified": callback_verified,
+        "callback_error": None,
+        "read": False,
+        "read_at": None,
+    }
+    if topic:
+        sent_record["topic"] = msg["topic"]
+    if reply_to:
+        sent_record["reply_to"] = reply_to
+    try:
+        _append_sent_record(from_agent, agent_id, sent_record)
+    except Exception as e:
+        print(f"[SENT] Failed to persist sent record for {from_agent}->{agent_id}: {e}")
+        return jsonify({"ok": False, "error": "Failed to persist sender delivery record"}), 500
+
+    try:
+        append_message_to_conversation(agent_id, from_agent, msg)
+    except Exception:
+        try:
+            _delete_sent_record(from_agent, agent_id, msg["id"])
+        except Exception as cleanup_error:
+            print(f"[SENT] Failed to cleanup precreated sent record for {from_agent}->{agent_id}: {cleanup_error}")
+        raise
+
     with agents_lock() as mutable_agents:
         mutable_agents[agent_id]["messages_received"] = mutable_agents[agent_id].get("messages_received", 0) + 1
         mutable_agents[agent_id]["last_message_received_at"] = datetime.utcnow().isoformat()
         if from_agent in mutable_agents:
             mutable_agents[from_agent]["last_message_sent_at"] = datetime.utcnow().isoformat()
-        callback_url = mutable_agents[agent_id].get("callback_url")
-        callback_verified = bool(callback_url) and bool(mutable_agents[agent_id].get("callback_verified"))
-    
+
     print(f"[MSG] {from_agent} -> {agent_id}: {message[:50]}...")
-    
+
     # WebSocket push (real-time delivery to connected clients)
     ws_delivered = _ws_push_message(agent_id, msg)
     delivered_channels = ["websocket"] if ws_delivered else []
     delivered_at = datetime.utcnow().isoformat() + "Z" if ws_delivered else None
-    
+
     # Telegram push notification
     notify = _load_notify_settings()
     if agent_id in notify:
@@ -3343,7 +3569,7 @@ def send_message(agent_id):
         if chat_id:
             preview = message[:200] + ("..." if len(message) > 200 else "")
             _send_telegram_notification(chat_id, f"📬 *Hub message from {from_agent}:*\n{preview}")
-    
+
     # Notify Brain via OpenClaw webhook (triggers immediate heartbeat)
     # Rate limit: max 1 webhook per sender per 60 seconds to prevent spam loops
     if agent_id == "brain":
@@ -3368,7 +3594,7 @@ def send_message(agent_id):
                 print(f"[NOTIFY] Sent OpenClaw webhook for Hub message from {from_agent}")
             except Exception as e:
                 print(f"[NOTIFY] Webhook failed: {e}")
-    
+
     # Optional: try callback if configured
     callback_status = None
     callback_error = None
@@ -3387,33 +3613,21 @@ def send_message(agent_id):
             callback_status = "failed"
             callback_error = str(e)[:200]
             _log_agent_event(agent_id, "callback_failed", {"url": callback_url, "error": str(e)[:100], "from": from_agent})
+        _record_callback_attempt(agent_id, callback_url, callback_status, callback_error)
 
     delivery_state = _derive_delivery_state(delivered_channels, callback_status)
-
-    # Persist sender-side delivery record
-    sent_record = {
-        "message_id": msg["id"],
-        "to": agent_id,
-        "message_preview": message[:100] + ("..." if len(message) > 100 else ""),
-        "timestamp": msg["timestamp"],
-        "delivery_state": delivery_state,
-        "delivered_channels": delivered_channels,
-        "delivered_at": delivered_at,
-        "callback_status": callback_status,
-        "callback_url_configured": bool(callback_url),
-        "callback_verified": callback_verified,
-        "callback_error": callback_error,
-        "read": False,
-        "read_at": None,
-    }
-    if topic:
-        sent_record["topic"] = msg["topic"]
-    if reply_to:
-        sent_record["reply_to"] = reply_to
     try:
-        _append_sent_record(from_agent, agent_id, sent_record)
+        _finalize_sent_record_delivery(
+            from_agent,
+            agent_id,
+            msg["id"],
+            delivered_channels,
+            delivered_at=delivered_at,
+            callback_status=callback_status,
+            callback_error=callback_error,
+        )
     except Exception as e:
-        print(f"[SENT] Failed to persist sent record for {from_agent}->{agent_id}: {e}")
+        print(f"[SENT] Failed to update sent record for {from_agent}->{agent_id}: {e}")
 
     return jsonify({
         "ok": True,
@@ -3436,14 +3650,14 @@ def poll_messages(agent_id):
     import time as _time
     secret = request.args.get("secret") or request.headers.get("X-Agent-Secret")
     timeout = min(int(request.args.get("timeout", 30)), 60)  # Max 60s
-    
+
     agents = load_agents()
     if agent_id not in agents:
         return jsonify({"ok": False, "error": "Not found"}), 404
     if agents[agent_id].get("secret") != secret:
         return jsonify({"ok": False, "error": "Invalid secret"}), 403
     _log_agent_event(agent_id, "inbox_poll")
-    
+
     # Reject excess concurrent polls for this agent
     current = _active_poll_count.get(agent_id, 0)
     if current >= _MAX_CONCURRENT_POLLS:
@@ -3457,25 +3671,25 @@ def poll_messages(agent_id):
             "retry_after": timeout,
             "note": f"Too many concurrent polls ({current}). Wait and retry."
         }), 200
-    
+
     _active_poll_count[agent_id] = current + 1
-    
+
     try:
         # Track last seen message to detect new ones
         last_offset = request.args.get("offset", type=int)  # Message index offset
-        
+
         # Check once up front, then sleep longer between checks
         poll_interval = 2  # seconds between disk reads
         deadline = _time.time() + timeout
-        
+
         while _time.time() < deadline:
             inbox = load_inbox(agent_id)
             unread = [m for m in inbox if not m.get("read")]
-            
+
             # If offset provided, only return messages after that offset
             if last_offset is not None:
                 unread = [m for m in unread if inbox.index(m) > last_offset]
-            
+
             if unread:
                 delivered_at = datetime.utcnow().isoformat() + "Z"
                 delivered_by_sender = {}
@@ -3488,7 +3702,7 @@ def poll_messages(agent_id):
                         _mark_sent_records_delivered(sender_id, agent_id, msg_ids, "poll", delivered_at)
                     except Exception as e:
                         print(f"[SENT] Failed to record poll delivery for {sender_id}: {e}")
-                
+
                 # Map fields for channel adapter compatibility
                 adapted = []
                 for m in unread:
@@ -3498,16 +3712,16 @@ def poll_messages(agent_id):
                         "text": m.get("message", ""),
                         "timestamp": m.get("timestamp", ""),
                     })
-                
+
                 return jsonify({
                     "ok": True,
                     "messages": adapted,
                     "count": len(adapted),
                     "next_offset": len(inbox) - 1,
                 })
-            
+
             _time.sleep(poll_interval)
-        
+
         # Timeout — no new messages
         return jsonify({"ok": True, "messages": [], "count": 0})
     finally:
@@ -3516,7 +3730,7 @@ def poll_messages(agent_id):
 @sock.route("/agents/<agent_id>/ws")
 def ws_messages(ws, agent_id):
     """WebSocket endpoint for real-time message push.
-    
+
     Connect: ws://host/agents/{agent_id}/ws
     Send auth immediately: {"secret": "your_secret"}
     Receive: {"type": "message", "data": {...}} for each new message
@@ -3634,17 +3848,17 @@ def _ws_push_message(agent_id: str, message: dict):
 @app.route("/agents/<agent_id>/messages", methods=["GET"])
 def get_messages(agent_id):
     secret = request.args.get("secret") or request.headers.get("X-Agent-Secret")
-    
+
     agents = load_agents()
     if agent_id not in agents:
         return jsonify({"ok": False, "error": "Not found"}), 404
-    
+
     if agents[agent_id].get("secret") != secret:
         return jsonify({"ok": False, "error": "Invalid secret"}), 403
-    
+
     # Track inbox poll for analytics
     _log_agent_event(agent_id, "inbox_poll")
-    
+
     full_inbox = load_inbox(agent_id)
 
     # Optional: only unread
@@ -3670,14 +3884,15 @@ def get_messages(agent_id):
     # Mark as read behavior:
     # - explicit mark_read=true -> mark returned messages as read
     # - explicit mark_read=false -> never mark
-    # - default for unread=true -> mark returned messages as read (consume semantics)
+    # - default -> do not mark; explicit read acknowledgements should flow through
+    #   POST /agents/<id>/messages/<message_id>/read or mark_read=true.
     mr = request.args.get("mark_read", "").lower()
     if mr in ("true", "1", "yes"):
         should_mark_read = True
     elif mr in ("false", "0", "no"):
         should_mark_read = False
     else:
-        should_mark_read = unread_only
+        should_mark_read = False
 
     if should_mark_read and messages:
         message_ids = {m.get("id") for m in messages}
@@ -3778,30 +3993,28 @@ def delete_inbox_message(agent_id, message_id):
     if agents[agent_id].get("secret") != secret:
         return jsonify({"ok": False, "error": "Invalid secret"}), 403
 
-    # Remove from per-conversation files
-    conv_dir = get_conversation_dir(agent_id)
     found = False
-    if conv_dir.exists():
-        for conv_file in conv_dir.glob("*.json"):
-            msgs = _safe_load_json_list(conv_file)
+    with _exclusive_file_lock(_inbox_lock_path(agent_id)):
+        conv_dir = get_conversation_dir(agent_id)
+        if conv_dir.exists():
+            for conv_file in conv_dir.glob("*.json"):
+                msgs = _safe_load_json_list(conv_file)
+                before = len(msgs)
+                msgs = [m for m in msgs if m.get("id") != message_id]
+                if len(msgs) < before:
+                    found = True
+                    _atomic_json_dump(conv_file, msgs)
+                    break
+
+        # Also remove from flat inbox if it exists (legacy)
+        flat_path = MESSAGES_DIR / f"{agent_id}.json"
+        if flat_path.exists():
+            msgs = _safe_load_json_list(flat_path)
             before = len(msgs)
             msgs = [m for m in msgs if m.get("id") != message_id]
             if len(msgs) < before:
                 found = True
-                with open(conv_file, "w") as f:
-                    json.dump(msgs, f, indent=2)
-                break
-
-    # Also remove from flat inbox if it exists (legacy)
-    flat_path = MESSAGES_DIR / f"{agent_id}.json"
-    if flat_path.exists():
-        msgs = _safe_load_json_list(flat_path)
-        before = len(msgs)
-        msgs = [m for m in msgs if m.get("id") != message_id]
-        if len(msgs) < before:
-            found = True
-            with open(flat_path, "w") as f:
-                json.dump(msgs, f, indent=2)
+                _atomic_json_dump(flat_path, msgs)
 
     if not found:
         return jsonify({"ok": False, "error": "Message not found"}), 404
@@ -3830,14 +4043,14 @@ def delete_sent_message(agent_id, message_id):
     found = False
     if sent_dir.exists():
         for sent_file in sent_dir.glob("*.json"):
-            records = _safe_load_json_list(sent_file)
-            before = len(records)
-            records = [r for r in records if r.get("message_id") != message_id]
-            if len(records) < before:
-                found = True
-                with open(sent_file, "w") as f:
-                    json.dump(records, f, indent=2)
-                break
+            with _exclusive_file_lock(_sent_lock_path(agent_id, sent_file.stem)):
+                records = _safe_load_json_list(sent_file)
+                before = len(records)
+                records = [r for r in records if r.get("message_id") != message_id]
+                if len(records) < before:
+                    found = True
+                    _write_sent_records_unlocked(agent_id, sent_file.stem, records)
+                    break
 
     if not found:
         return jsonify({"ok": False, "error": "Sent record not found"}), 404
@@ -3875,20 +4088,21 @@ def bulk_delete_sent(agent_id):
     for sent_file in files:
         if not sent_file.exists():
             continue
-        records = _safe_load_json_list(sent_file)
-        before_len = len(records)
+        recipient_id = sent_file.stem
+        with _exclusive_file_lock(_sent_lock_path(agent_id, recipient_id)):
+            records = _safe_load_json_list(sent_file)
+            before_len = len(records)
 
-        if message_ids:
-            id_set = set(message_ids)
-            records = [r for r in records if r.get("message_id") not in id_set]
-        elif before_filter:
-            records = [r for r in records if r.get("timestamp", "") >= before_filter]
-        else:
-            continue
+            if message_ids:
+                id_set = set(message_ids)
+                records = [r for r in records if r.get("message_id") not in id_set]
+            elif before_filter:
+                records = [r for r in records if r.get("timestamp", "") >= before_filter]
+            else:
+                continue
 
-        deleted_count += before_len - len(records)
-        with open(sent_file, "w") as f:
-            json.dump(records, f, indent=2)
+            deleted_count += before_len - len(records)
+            _write_sent_records_unlocked(agent_id, recipient_id, records)
 
     return jsonify({"ok": True, "deleted_count": deleted_count})
 
@@ -3952,14 +4166,14 @@ def get_sent_messages(agent_id):
 @app.route("/agents/<agent_id>/messages", methods=["DELETE"])
 def clear_messages(agent_id):
     secret = request.args.get("secret") or request.headers.get("X-Agent-Secret")
-    
+
     agents = load_agents()
     if agent_id not in agents:
         return jsonify({"ok": False, "error": "Not found"}), 404
-    
+
     if agents[agent_id].get("secret") != secret:
         return jsonify({"ok": False, "error": "Invalid secret"}), 403
-    
+
     save_inbox(agent_id, [])
     return jsonify({"ok": True, "message": "Inbox cleared"})
 
@@ -3975,21 +4189,21 @@ def broadcast():
     secret = data.get("secret") or request.headers.get("X-Agent-Secret")
     msg_type = data.get("type", "broadcast")
     payload = data.get("payload", {})
-    
+
     if not from_agent:
         return jsonify({"ok": False, "error": "Missing 'from'"}), 400
-    
+
     agents = load_agents()
-    
+
     # Verify sender
     if from_agent not in agents:
         resp = _behavioral_404("agent")
         resp["error"] = f"Sender '{from_agent}' not registered"
         return jsonify(resp), 404
-    
+
     if agents[from_agent].get("secret") != secret:
         return jsonify({"ok": False, "error": "Invalid secret"}), 403
-    
+
     # Build broadcast message
     broadcast_msg = {
         "type": "broadcast",
@@ -3998,14 +4212,16 @@ def broadcast():
         "payload": payload,
         "ts": datetime.utcnow().isoformat()
     }
-    
+
     # Deliver to all agents except sender
     delivered = []
-    for agent_id in agents:
+    delivered_stats = []
+    for agent_id in list(agents.keys()):
         if agent_id == from_agent:
             continue
-        
-        inbox = load_inbox(agent_id)
+        callback_url = agents.get(agent_id, {}).get("callback_url")
+        callback_verified = bool(callback_url) and bool(agents.get(agent_id, {}).get("callback_verified"))
+
         msg = {
             "id": secrets.token_hex(8),
             "from": from_agent,
@@ -4014,20 +4230,67 @@ def broadcast():
             "read": False,
             "is_broadcast": True
         }
-        inbox.append(msg)
-        save_inbox(agent_id, inbox)
+        sent_record = {
+            "message_id": msg["id"],
+            "to": agent_id,
+            "message_preview": msg["message"][:100] + ("..." if len(msg["message"]) > 100 else ""),
+            "timestamp": msg["timestamp"],
+            "delivery_state": "inbox_queued",
+            "delivered_channels": [],
+            "delivered_at": None,
+            "callback_status": None,
+            "callback_url_configured": bool(agents.get(agent_id, {}).get("callback_url")),
+            "callback_verified": bool(agents.get(agent_id, {}).get("callback_verified")),
+            "callback_error": None,
+            "read": False,
+            "read_at": None,
+            "is_broadcast": True,
+            "broadcast_type": msg_type,
+        }
+        try:
+            _append_sent_record(from_agent, agent_id, sent_record)
+        except Exception as e:
+            print(f"[BROADCAST] Failed to persist sent record for {from_agent}->{agent_id}: {e}")
+            continue
+        try:
+            append_message_to_conversation(agent_id, from_agent, msg)
+        except Exception:
+            try:
+                _delete_sent_record(from_agent, agent_id, msg["id"])
+            except Exception as cleanup_error:
+                print(f"[BROADCAST] Failed to cleanup sent record for {from_agent}->{agent_id}: {cleanup_error}")
+            continue
+        delivered_channels, delivered_at, callback_status, callback_error = _attempt_transport_delivery(
+            agent_id,
+            msg,
+            callback_url=callback_url,
+            callback_failure_meta={"from": from_agent, "broadcast_type": msg_type},
+        )
+        try:
+            _finalize_sent_record_delivery(
+                from_agent,
+                agent_id,
+                msg["id"],
+                delivered_channels,
+                delivered_at=delivered_at,
+                callback_status=callback_status,
+                callback_error=callback_error,
+            )
+        except Exception as e:
+            print(f"[BROADCAST] Failed to update sent record for {from_agent}->{agent_id}: {e}")
         delivered.append(agent_id)
-        
-        # Update stats
-        agents[agent_id]["messages_received"] = agents[agent_id].get("messages_received", 0) + 1
-        agents[agent_id]["last_message_received_at"] = datetime.utcnow().isoformat()
-    
-    if from_agent in agents:
-        agents[from_agent]["last_message_sent_at"] = datetime.utcnow().isoformat()
-    save_agents(agents)
-    
+        delivered_stats.append(agent_id)
+
+    with agents_lock() as mutable_agents:
+        for delivered_agent_id in delivered_stats:
+            if delivered_agent_id in mutable_agents:
+                mutable_agents[delivered_agent_id]["messages_received"] = mutable_agents[delivered_agent_id].get("messages_received", 0) + 1
+                mutable_agents[delivered_agent_id]["last_message_received_at"] = datetime.utcnow().isoformat()
+        if from_agent in mutable_agents:
+            mutable_agents[from_agent]["last_message_sent_at"] = datetime.utcnow().isoformat()
+
     print(f"[BROADCAST] {from_agent} -> {len(delivered)} agents: {msg_type}")
-    
+
     return jsonify({
         "ok": True,
         "broadcast_type": msg_type,
@@ -4041,14 +4304,14 @@ def announce():
     """
     Announce an endpoint is live for distributed verification.
     Triggers broadcast with structured payload for listeners to auto-verify.
-    
+
     Payload:
     - from: announcing agent (required)
     - secret: agent's secret (required)
     - endpoint: URL to verify (required)
     - expected_status: expected HTTP status code (default 200)
     - description: optional description of what's being announced
-    
+
     Listeners can:
     1. GET the endpoint
     2. Check status matches expected_status
@@ -4060,21 +4323,21 @@ def announce():
     endpoint = data.get("endpoint")
     expected_status = data.get("expected_status", 200)
     description = data.get("description", "")
-    
+
     if not from_agent:
         return jsonify({"ok": False, "error": "Missing 'from'"}), 400
     if not endpoint:
         return jsonify({"ok": False, "error": "Missing 'endpoint'"}), 400
-    
+
     agents = load_agents()
-    
+
     # Verify sender
     if from_agent not in agents:
         return jsonify({"ok": False, "error": f"Announcer '{from_agent}' not registered"}), 404
-    
+
     if agents[from_agent].get("secret") != secret:
         return jsonify({"ok": False, "error": "Invalid secret"}), 403
-    
+
     # Build announcement payload
     announcement = {
         "type": "endpoint_announcement",
@@ -4087,14 +4350,16 @@ def announce():
             __import__('datetime').timedelta(minutes=5)
         )).isoformat()  # 5 minute verification window
     }
-    
+
     # Deliver to all agents except sender
     delivered = []
-    for agent_id in agents:
+    delivered_stats = []
+    for agent_id in list(agents.keys()):
         if agent_id == from_agent:
             continue
-        
-        inbox = load_inbox(agent_id)
+        callback_url = agents.get(agent_id, {}).get("callback_url")
+        callback_verified = bool(callback_url) and bool(agents.get(agent_id, {}).get("callback_verified"))
+
         msg = {
             "id": secrets.token_hex(8),
             "from": from_agent,
@@ -4103,20 +4368,67 @@ def announce():
             "read": False,
             "is_announcement": True
         }
-        inbox.append(msg)
-        save_inbox(agent_id, inbox)
+        sent_record = {
+            "message_id": msg["id"],
+            "to": agent_id,
+            "message_preview": msg["message"][:100] + ("..." if len(msg["message"]) > 100 else ""),
+            "timestamp": msg["timestamp"],
+            "delivery_state": "inbox_queued",
+            "delivered_channels": [],
+            "delivered_at": None,
+            "callback_status": None,
+            "callback_url_configured": bool(agents.get(agent_id, {}).get("callback_url")),
+            "callback_verified": bool(agents.get(agent_id, {}).get("callback_verified")),
+            "callback_error": None,
+            "read": False,
+            "read_at": None,
+            "is_announcement": True,
+            "announcement_endpoint": endpoint,
+        }
+        try:
+            _append_sent_record(from_agent, agent_id, sent_record)
+        except Exception as e:
+            print(f"[ANNOUNCE] Failed to persist sent record for {from_agent}->{agent_id}: {e}")
+            continue
+        try:
+            append_message_to_conversation(agent_id, from_agent, msg)
+        except Exception:
+            try:
+                _delete_sent_record(from_agent, agent_id, msg["id"])
+            except Exception as cleanup_error:
+                print(f"[ANNOUNCE] Failed to cleanup sent record for {from_agent}->{agent_id}: {cleanup_error}")
+            continue
+        delivered_channels, delivered_at, callback_status, callback_error = _attempt_transport_delivery(
+            agent_id,
+            msg,
+            callback_url=callback_url,
+            callback_failure_meta={"from": from_agent, "announcement_endpoint": endpoint},
+        )
+        try:
+            _finalize_sent_record_delivery(
+                from_agent,
+                agent_id,
+                msg["id"],
+                delivered_channels,
+                delivered_at=delivered_at,
+                callback_status=callback_status,
+                callback_error=callback_error,
+            )
+        except Exception as e:
+            print(f"[ANNOUNCE] Failed to update sent record for {from_agent}->{agent_id}: {e}")
         delivered.append(agent_id)
-        
-        # Update stats
-        agents[agent_id]["messages_received"] = agents[agent_id].get("messages_received", 0) + 1
-        agents[agent_id]["last_message_received_at"] = datetime.utcnow().isoformat()
-    
-    if from_agent in agents:
-        agents[from_agent]["last_message_sent_at"] = datetime.utcnow().isoformat()
-    save_agents(agents)
-    
+        delivered_stats.append(agent_id)
+
+    with agents_lock() as mutable_agents:
+        for delivered_agent_id in delivered_stats:
+            if delivered_agent_id in mutable_agents:
+                mutable_agents[delivered_agent_id]["messages_received"] = mutable_agents[delivered_agent_id].get("messages_received", 0) + 1
+                mutable_agents[delivered_agent_id]["last_message_received_at"] = datetime.utcnow().isoformat()
+        if from_agent in mutable_agents:
+            mutable_agents[from_agent]["last_message_sent_at"] = datetime.utcnow().isoformat()
+
     print(f"[ANNOUNCE] {from_agent} -> {endpoint} (delivered to {len(delivered)} agents)")
-    
+
     return jsonify({
         "ok": True,
         "announcement": announcement,
@@ -4137,26 +4449,26 @@ def receive_email():
 @app.route("/.well-known/agent-card.json", methods=["GET"])
 def a2a_agent_card():
     """A2A Agent Card — standard discovery mechanism for agent capabilities (A2A protocol).
-    
+
     Includes hubProfile: evidence-backed behavioral metrics computed from Hub data.
     Not self-reported — the platform computes it from observed behavior.
     """
     card_path = os.path.join(os.path.dirname(__file__), "static", ".well-known", "agent-card.json")
     if not os.path.exists(card_path):
         return jsonify({"error": "Agent card not found"}), 404
-    
+
     with open(card_path) as f:
         card = json.load(f)
-    
+
     # Compute hubProfile from live data
     try:
         agents = load_agents()
         obls = load_obligations()
         artifacts = _load_conversation_artifacts()
-        
+
         resolved = sum(1 for o in obls if o.get("status") == "resolved")
         total_obls = len(obls)
-        
+
         card["hubProfile"] = {
             "description": "Evidence-backed behavioral metrics computed from Hub observation. Not self-reported.",
             "perAgentEndpoint": "/collaboration/capabilities?agent={agent_id}",
@@ -4179,7 +4491,7 @@ def a2a_agent_card():
         }
     except Exception:
         pass
-    
+
     return jsonify(card)
 
 
@@ -4187,7 +4499,7 @@ def a2a_agent_card():
 def health():
     # Enrich with ecosystem stats
     agents = load_agents()
-    
+
     bounties_file = os.path.join(DATA_DIR, "bounties.json")
     bounties = []
     if os.path.exists(bounties_file):
@@ -4196,7 +4508,7 @@ def health():
                 bounties = json.load(f)
         except:
             pass
-    
+
     balances_file = os.path.join(DATA_DIR, "hub_balances.json")
     balances = {}
     if os.path.exists(balances_file):
@@ -4205,7 +4517,7 @@ def health():
                 balances = json.load(f)
         except:
             pass
-    
+
     assets_file = os.path.join(DATA_DIR, "assets.json")
     assets = {}
     if os.path.exists(assets_file):
@@ -4214,10 +4526,10 @@ def health():
                 assets = json.load(f)
         except:
             pass
-    
+
     total_hub = sum(float(v) for v in balances.values() if isinstance(v, (int, float)) or (isinstance(v, str) and v.replace('.','',1).isdigit())) if balances else 0
     asset_count = sum(len(v) for v in assets.values())
-    
+
     # Count trust attestations
     signals = load_trust_signals()
     total_attestations = sum(len(v) if isinstance(v, list) else 0 for v in signals.values())
@@ -4266,7 +4578,7 @@ def add_restart():
     secret = data.get("secret", request.headers.get("Authorization", "").replace("Bearer ", ""))
     if secret != os.environ.get("HUB_ADMIN_SECRET", ""):
         return jsonify({"error": "Unauthorized"}), 401
-    
+
     import datetime
     restarts_file = os.path.join(DATA_DIR, "restarts.json")
     restarts_data = []
@@ -4276,17 +4588,17 @@ def add_restart():
                 restarts_data = json.load(f)
         except:
             pass
-    
+
     entry = {
         "timestamp": data.get("timestamp", datetime.datetime.utcnow().isoformat() + "Z"),
         "type": data.get("type", "session_start"),
         "note": data.get("note", "")
     }
     restarts_data.append(entry)
-    
+
     with open(restarts_file, "w") as f:
         json.dump(restarts_data, f, indent=2)
-    
+
     return jsonify({"ok": True, "entry": entry, "total": len(restarts_data)})
 
 @app.route("/collaboration", methods=["GET"])
@@ -4296,21 +4608,21 @@ def collaboration_intensity():
     conversation quality metrics, artifact indicators, temporal profiles,
     content classification, and interaction markers.
     Built for Tricep's mechanism design work.
-    
+
     Schema v0.3: adds temporal_profile per pair (timestamps, gap_distribution,
     burst_windows), artifact_types classification, and interaction_markers
     (unprompted_contribution detection)."""
     import glob, re
     from collections import defaultdict
     from datetime import datetime, timedelta
-    
+
     messages_dir = os.path.join(DATA_DIR, "messages")
     if not os.path.exists(messages_dir):
         return jsonify({"error": "No message data"}), 404
-    
+
     # Collect all messages across all inboxes
     pair_stats = defaultdict(lambda: {
-        "messages": 0, "first": None, "last": None, 
+        "messages": 0, "first": None, "last": None,
         "agents": set(), "initiator": None, "initiator_ts": None,
         "senders": defaultdict(int),
         "artifact_refs": 0,
@@ -4320,7 +4632,7 @@ def collaboration_intensity():
     })
     agent_stats = defaultdict(lambda: {"sent": 0, "received": 0, "unique_peers": set(), "conversations_initiated": 0})
     total_msgs = 0
-    
+
     # Artifact type patterns (v0.3: classified)
     artifact_patterns = {
         "github_commit": re.compile(r'(github\.com/.+/commit/|commit\s+[0-9a-f]{7,40})', re.IGNORECASE),
@@ -4336,10 +4648,10 @@ def collaboration_intensity():
         r'(https?://|github\.com|commit\s|\.md|\.json|\.py|/hub/|/docs/|endpoint|deployed|shipped|PR\s*#?\d)',
         re.IGNORECASE
     )
-    
+
     # URL/artifact extraction pattern for unprompted_contribution detection
     new_artifact_re = re.compile(r'(https?://\S+|github\.com/\S+|commit\s+[0-9a-f]{7,40}|\S+\.(py|js|ts|json|md|yaml)\b)', re.IGNORECASE)
-    
+
     for inbox_agent, m in iter_message_records(messages_dir):
         try:
             sender = m.get("from_agent", m.get("from", ""))
@@ -4356,41 +4668,41 @@ def collaboration_intensity():
             pair_stats[pair_key]["agents"] = {pair[0], pair[1]}
             pair_stats[pair_key]["senders"][sender] += 1
             pair_stats[pair_key]["timestamps"].append(ts)
-            
+
             # Store recent messages for interaction marker detection (last 50)
             pair_stats[pair_key]["msg_history"].append({
                 "sender": sender, "ts": ts, "content": content[:500]
             })
             if len(pair_stats[pair_key]["msg_history"]) > 200:
                 pair_stats[pair_key]["msg_history"] = pair_stats[pair_key]["msg_history"][-200:]
-            
+
             if pair_stats[pair_key]["first"] is None or ts < pair_stats[pair_key]["first"]:
                 pair_stats[pair_key]["first"] = ts
                 pair_stats[pair_key]["initiator"] = sender
                 pair_stats[pair_key]["initiator_ts"] = ts
             if pair_stats[pair_key]["last"] is None or ts > pair_stats[pair_key]["last"]:
                 pair_stats[pair_key]["last"] = ts
-            
+
             # Artifact detection + classification (v0.3)
             if content and artifact_pattern.search(content):
                 pair_stats[pair_key]["artifact_refs"] += 1
             for atype, apatt in artifact_patterns.items():
                 if content and apatt.search(content):
                     pair_stats[pair_key]["artifact_types"][atype] += 1
-            
+
             agent_stats[sender]["sent"] += 1
             agent_stats[inbox_agent]["received"] += 1
             agent_stats[sender]["unique_peers"].add(inbox_agent)
             agent_stats[inbox_agent]["unique_peers"].add(sender)
         except:
             continue
-    
+
     # Calculate initiation counts
     for pair_key, stats in pair_stats.items():
         initiator = stats.get("initiator")
         if initiator:
             agent_stats[initiator]["conversations_initiated"] += 1
-    
+
     def build_temporal_profile(timestamps):
         """v0.3: Build temporal profile from sorted timestamps."""
         if len(timestamps) < 2:
@@ -4405,13 +4717,13 @@ def collaboration_intensity():
                 continue
         if len(parsed) < 2:
             return None
-        
+
         # Gap distribution (hours between consecutive messages)
         gaps_hours = []
         for i in range(1, len(parsed)):
             gap = (parsed[i] - parsed[i-1]).total_seconds() / 3600
             gaps_hours.append(round(gap, 2))
-        
+
         # Burst detection: messages within 1 hour of each other
         bursts = []
         current_burst = [parsed[0]]
@@ -4432,7 +4744,7 @@ def collaboration_intensity():
                 "end": current_burst[-1].isoformat(),
                 "messages": len(current_burst)
             })
-        
+
         # Decay indicator: gap trend (increasing gaps = decay)
         if len(gaps_hours) >= 4:
             first_half_avg = sum(gaps_hours[:len(gaps_hours)//2]) / (len(gaps_hours)//2)
@@ -4440,11 +4752,11 @@ def collaboration_intensity():
             decay_ratio = round(second_half_avg / first_half_avg, 2) if first_half_avg > 0 else None
         else:
             decay_ratio = None
-        
+
         avg_gap = round(sum(gaps_hours) / len(gaps_hours), 2) if gaps_hours else None
         max_gap = round(max(gaps_hours), 2) if gaps_hours else None
         median_gap = round(sorted(gaps_hours)[len(gaps_hours)//2], 2) if gaps_hours else None
-        
+
         return {
             "first_msg": sorted_ts[0],
             "last_msg": sorted_ts[-1],
@@ -4457,7 +4769,7 @@ def collaboration_intensity():
             "decay_ratio": decay_ratio,
             "decay_note": "ratio of avg gap in second half vs first half. >2.0 suggests tapering. <0.5 suggests acceleration."
         }
-    
+
     def detect_interaction_markers(msg_history):
         """v0.3: Detect interaction markers from message history."""
         markers = {
@@ -4467,10 +4779,10 @@ def collaboration_intensity():
             "self_correction": 0,
         }
         examples = defaultdict(list)
-        
+
         for i, msg in enumerate(msg_history):
             content = msg["content"].lower()
-            
+
             # Unprompted contribution: message contains new artifact/URL
             # not referenced in prior 3 messages
             if i >= 1:
@@ -4479,7 +4791,7 @@ def collaboration_intensity():
                     prior_content = " ".join(
                         m["content"].lower() for m in msg_history[max(0,i-3):i]
                     )
-                    new_artifacts = [a for a in artifacts_in_msg 
+                    new_artifacts = [a for a in artifacts_in_msg
                                    if isinstance(a, tuple) and a[0].lower() not in prior_content
                                    or isinstance(a, str) and a.lower() not in prior_content]
                     if new_artifacts:
@@ -4490,9 +4802,9 @@ def collaboration_intensity():
                                 "ts": msg["ts"],
                                 "snippet": msg["content"][:120]
                             })
-            
+
             # Pushback: disagreement signals
-            pushback_signals = ["i disagree", "that's not", "actually,", "but that", 
+            pushback_signals = ["i disagree", "that's not", "actually,", "but that",
                               "wrong about", "not quite", "the problem with", "i don't think"]
             if any(sig in content for sig in pushback_signals):
                 markers["pushback"] += 1
@@ -4501,7 +4813,7 @@ def collaboration_intensity():
                         "sender": msg["sender"], "ts": msg["ts"],
                         "snippet": msg["content"][:120]
                     })
-            
+
             # Building on prior: explicit reference to what the other said
             build_signals = ["building on", "extending", "to add to", "your point about",
                            "following up on", "based on what you", "that connects to"]
@@ -4512,7 +4824,7 @@ def collaboration_intensity():
                         "sender": msg["sender"], "ts": msg["ts"],
                         "snippet": msg["content"][:120]
                     })
-            
+
             # Self-correction: agent corrects own prior statement
             correction_signals = ["i was wrong", "correction:", "actually I", "i need to correct",
                                 "revised:", "update:", "i misstated", "that was incorrect"]
@@ -4523,14 +4835,14 @@ def collaboration_intensity():
                         "sender": msg["sender"], "ts": msg["ts"],
                         "snippet": msg["content"][:120]
                     })
-        
+
         return {
             "counts": markers,
             "examples": dict(examples),
             "total_markers": sum(markers.values()),
             "marker_rate": round(sum(markers.values()) / len(msg_history), 3) if msg_history else 0
         }
-    
+
     # Filter to pairs with 3+ messages (signal vs noise)
     active_pairs = []
     bilateral_count = 0
@@ -4541,13 +4853,13 @@ def collaboration_intensity():
             is_bilateral = len([a for a in agents_in_pair if sender_counts.get(a, 0) > 0]) >= 2
             if is_bilateral:
                 bilateral_count += 1
-            
+
             # v0.3: temporal profile
             temporal = build_temporal_profile(stats["timestamps"])
-            
+
             # v0.3: interaction markers
             markers = detect_interaction_markers(stats["msg_history"])
-            
+
             pair_obj = {
                 "pair": pair_key,
                 "messages": stats["messages"],
@@ -4562,14 +4874,14 @@ def collaboration_intensity():
                 "interaction_markers": markers,  # v0.3
             }
             active_pairs.append(pair_obj)
-    
+
     # Thread survival rates
     total_pairs_1plus = len([p for p in pair_stats.values() if p["messages"] >= 1])
     survival_3 = len([p for p in pair_stats.values() if p["messages"] >= 3])
     survival_10 = len([p for p in pair_stats.values() if p["messages"] >= 10])
     survival_20 = len([p for p in pair_stats.values() if p["messages"] >= 20])
     survival_50 = len([p for p in pair_stats.values() if p["messages"] >= 50])
-    
+
     # Agent activity summary with initiation data
     agent_summary = []
     for agent, stats in sorted(agent_stats.items(), key=lambda x: x[1]["sent"] + x[1]["received"], reverse=True)[:20]:
@@ -4580,17 +4892,17 @@ def collaboration_intensity():
             "unique_peers": len(stats["unique_peers"]),
             "conversations_initiated": stats["conversations_initiated"],
         })
-    
+
     # Brain-initiated ratio (message volume)
     brain_sent = agent_stats.get("brain", {}).get("sent", 0)
     total_sent = sum(s["sent"] for s in agent_stats.values())
     brain_msg_ratio = round(brain_sent / total_sent, 3) if total_sent > 0 else 0
-    
+
     # Brain conversation-initiation ratio
     brain_initiated = agent_stats.get("brain", {}).get("conversations_initiated", 0)
     total_convos = len([p for p in pair_stats.values() if p["messages"] >= 1])
     brain_init_ratio = round(brain_initiated / total_convos, 3) if total_convos > 0 else 0
-    
+
     # Artifact production rate across all active pairs
     total_artifact_refs = sum(p["artifact_refs"] for p in pair_stats.values() if p["messages"] >= 3)
     total_active_msgs = sum(p["messages"] for p in pair_stats.values() if p["messages"] >= 3)
@@ -5673,7 +5985,7 @@ def collaboration_match(agent_id):
 def activity():
     """Public activity feed — what Brain is doing, thinking, and building."""
     import subprocess, os
-    
+
     # Recent git commits
     try:
         result = subprocess.run(
@@ -5684,14 +5996,14 @@ def activity():
         commits = result.stdout.strip().split("\n") if result.stdout.strip() else []
     except:
         commits = []
-    
+
     # Hub stats
     agents = load_agents()
     agent_count = len(agents)
     total_messages = sum(len(load_inbox(aid)) for aid in agents)
     attestations = load_attestations()
     attestation_count = sum(len(v) for v in attestations.values())
-    
+
     from datetime import datetime, timezone, timedelta
     from pathlib import Path
 
@@ -5778,7 +6090,7 @@ def activity():
         events.sort(key=lambda x: x[0], reverse=True)
         for t, txt in events[:12]:
             recent_activity.append(f"{t.strftime('%H:%M UTC')} — {txt}")
-    
+
     return jsonify({
         "agent": "Brain",
         "status": "active",
@@ -5816,18 +6128,18 @@ def discover_agent():
     """
     Register an agent by URL. We fetch their /.well-known/agent.json,
     verify endpoint is live, and add to directory.
-    
+
     POST /discover {"url": "https://a2a.example.com"}
     """
     data = request.get_json() or {}
     url = data.get("url", "").rstrip("/")
-    
+
     if not url:
         return jsonify({"ok": False, "error": "Missing 'url'"}), 400
-    
+
     if not url.startswith("https://"):
         return jsonify({"ok": False, "error": "URL must be https"}), 400
-    
+
     # Fetch agent card
     import requests as req
     agent_card_url = f"{url}/.well-known/agent.json"
@@ -5842,7 +6154,7 @@ def discover_agent():
         return jsonify({"ok": False, "error": f"Agent card at {agent_card_url} is not valid JSON"}), 422
     except Exception as e:
         return jsonify({"ok": False, "error": f"Failed to fetch agent card: {str(e)[:100]}"}), 502
-    
+
     # Verify health/liveness
     health_url = f"{url}/health"
     try:
@@ -5854,11 +6166,11 @@ def discover_agent():
     except:
         latency_ms = None
         health_ok = False
-    
+
     # Extract info from card
     agent_name = card.get("name", url)
     agent_id = agent_name.lower().replace(" ", "-").replace(".", "-")[:32]
-    
+
     # Store in discovered registry
     discovered = load_discovered()
     discovered[agent_id] = {
@@ -5875,9 +6187,9 @@ def discover_agent():
         "card": card
     }
     save_discovered(discovered)
-    
+
     print(f"[DISCOVER] {agent_name} at {url} (health: {'ok' if health_ok else 'fail'}, {latency_ms}ms)")
-    
+
     return jsonify({
         "ok": True,
         "agent_id": agent_id,
@@ -5914,9 +6226,9 @@ def search_discovered():
     search_term = q or capability
     if not search_term:
         return jsonify({"ok": False, "error": "Missing ?q= or ?capability= search query"}), 400
-    
+
     matches = []
-    
+
     # Search registered Hub agents
     agents = load_agents()
     for agent in (agents if isinstance(agents, list) else []):
@@ -5932,7 +6244,7 @@ def search_discovered():
                 "capabilities": caps,
                 "messages_received": agent.get("messages_received", 0),
             })
-    
+
     # Also handle dict format
     if isinstance(agents, dict):
         for aid, info in agents.items():
@@ -5947,7 +6259,7 @@ def search_discovered():
                     "capabilities": caps,
                     "messages_received": info.get("messages_received", 0),
                 })
-    
+
     # Search discovered (external) agents
     discovered = load_discovered()
     for aid, info in discovered.items():
@@ -5962,7 +6274,7 @@ def search_discovered():
                 "skills": info.get("skills", []),
                 "health_ok": info.get("health_ok"),
             })
-    
+
     return jsonify({"query": search_term, "count": len(matches), "agents": matches})
 
 # ============ ATTESTATIONS ============
@@ -6144,10 +6456,10 @@ def submit_attestation():
     evidence_type = data.get("evidence_type", "self-report")  # self-report, behavioral, financial, multi-party
     tx_hash = data.get("tx_hash", "")  # on-chain transaction hash (for financial evidence)
     corroborating_ids = data.get("corroborating_ids", [])  # attestation IDs that corroborate (for multi-party)
-    
+
     if not all([attester, secret, subject]):
         return jsonify({"ok": False, "error": "Required: from, secret, agent_id"}), 400
-    
+
     if score is not None:
         try:
             score = float(score)
@@ -6155,7 +6467,7 @@ def submit_attestation():
                 return jsonify({"ok": False, "error": "Score must be 0.0-1.0"}), 400
         except (ValueError, TypeError):
             return jsonify({"ok": False, "error": "Score must be a number 0.0-1.0"}), 400
-    
+
     # Verify attester
     agents = load_agents()
     agent_map = {}
@@ -6163,18 +6475,18 @@ def submit_attestation():
         agent_map = {a["agent_id"]: a for a in agents}
     elif isinstance(agents, dict):
         agent_map = agents
-    
+
     if attester not in agent_map:
         return jsonify({"ok": False, "error": "Attester not registered"}), 403
     if agent_map[attester].get("secret") != secret:
         return jsonify({"ok": False, "error": "Invalid secret"}), 403
     if attester == subject:
         return jsonify({"ok": False, "error": "Cannot attest yourself"}), 400
-    
+
     attestations = load_attestations()
     if subject not in attestations:
         attestations[subject] = []
-    
+
     # Compute forgery cost estimate from evidence type
     FC_ESTIMATES = {"self-report": 0, "behavioral": 1, "financial": 2, "multi-party": 3}
     evidence_type = evidence_type if evidence_type in FC_ESTIMATES else "self-report"
@@ -6183,7 +6495,7 @@ def submit_attestation():
         fc_estimate = max(fc_estimate, 2)  # tx hash bumps to at least financial
     if corroborating_ids and len(corroborating_ids) >= 2:
         fc_estimate = max(fc_estimate, 3)  # 2+ corroborations = multi-party
-    
+
     attestation = {
         "attester": attester,
         "category": category,
@@ -6197,7 +6509,7 @@ def submit_attestation():
     }
     attestations[subject].append(attestation)
     save_attestations(attestations)
-    
+
     return jsonify({
         "ok": True,
         "attestation": attestation,
@@ -6212,7 +6524,7 @@ def trust_consistency(agent_id):
     forgery cost gradient + temporal consistency as trust primitives."""
     attestations = load_attestations()
     agent_attestations = attestations.get(agent_id, [])
-    
+
     if not agent_attestations:
         return jsonify({
             "agent_id": agent_id,
@@ -6220,7 +6532,7 @@ def trust_consistency(agent_id):
             "reason": "no attestations",
             "attestation_count": 0,
         })
-    
+
     # Parse timestamps and sort
     import math
     now = datetime.utcnow()
@@ -6237,23 +6549,23 @@ def trust_consistency(agent_id):
         attesters.add(a.get("attester", ""))
         cat = a.get("category", "general")
         categories[cat] = categories.get(cat, 0) + 1
-    
+
     if not timestamps:
         return jsonify({"agent_id": agent_id, "consistency_score": 0.0, "reason": "no valid timestamps"})
-    
+
     timestamps.sort()
-    
+
     # Consistency factors:
     # 1. History length (days from first to now) - longer = better
     history_days = (now - timestamps[0]).total_seconds() / 86400
     history_score = min(1.0, math.log1p(history_days) / math.log1p(365))  # log scale, maxes at ~1yr
-    
+
     # 2. Unique attesters - more independent sources = harder to fake
     attester_score = min(1.0, len(attesters) / 5.0)  # 5+ unique attesters = max
-    
+
     # 3. Category diversity - attested across multiple dimensions
     diversity_score = min(1.0, len(categories) / 4.0)  # 4+ categories = max
-    
+
     # 4. Reinforcement - repeated attestations over time (not just one burst)
     if len(timestamps) >= 2:
         gaps = [(timestamps[i+1] - timestamps[i]).total_seconds() / 86400 for i in range(len(timestamps)-1)]
@@ -6262,7 +6574,7 @@ def trust_consistency(agent_id):
         spread_score = min(1.0, avg_gap / 7.0)  # weekly average = max
     else:
         spread_score = 0.0
-    
+
     # Weighted composite (consistency > recency)
     consistency_score = round(
         history_score * 0.30 +
@@ -6271,7 +6583,7 @@ def trust_consistency(agent_id):
         spread_score * 0.20,
         3
     )
-    
+
     return jsonify({
         "agent_id": agent_id,
         "consistency_score": consistency_score,
@@ -6305,7 +6617,7 @@ def trust_residual(agent_id):
     import math
     attestations = load_attestations()
     agent_attestations = attestations.get(agent_id, [])
-    
+
     if len(agent_attestations) < 2:
         return jsonify({
             "agent_id": agent_id,
@@ -6313,7 +6625,7 @@ def trust_residual(agent_id):
             "reason": "need 2+ attestations to build forward model",
             "model": "trust_residual_v0.1"
         })
-    
+
     # Parse and sort attestations
     now = datetime.utcnow()
     parsed = []
@@ -6321,16 +6633,16 @@ def trust_residual(agent_id):
         try:
             ts = datetime.fromisoformat(a["timestamp"].replace("Z", "+00:00")).replace(tzinfo=None)
             score = float(a.get("score", a.get("trust_score", 0.5)))
-            parsed.append({"ts": ts, "score": score, "attester": a.get("attester", ""), 
+            parsed.append({"ts": ts, "score": score, "attester": a.get("attester", ""),
                           "category": a.get("category", "general")})
         except (KeyError, ValueError):
             pass
-    
+
     if len(parsed) < 2:
         return jsonify({"agent_id": agent_id, "residual": None, "reason": "insufficient parseable attestations"})
-    
+
     parsed.sort(key=lambda x: x["ts"])
-    
+
     # Forward model: EWMA of scores (alpha=0.3) — predicts next score
     alpha = 0.3
     predicted = parsed[0]["score"]
@@ -6349,19 +6661,19 @@ def trust_residual(agent_id):
         })
         # Update forward model
         predicted = alpha * actual + (1 - alpha) * predicted
-    
+
     # Aggregate residual stats
     abs_residuals = [abs(r["residual"]) for r in residuals]
     mean_surprise = sum(abs_residuals) / len(abs_residuals)
     max_surprise = max(abs_residuals)
-    
+
     # Recent trend: last 3 residuals
     recent = residuals[-3:] if len(residuals) >= 3 else residuals
     recent_direction = sum(r["residual"] for r in recent) / len(recent)
-    
+
     # Predictability = 1 - mean_surprise (high = boring/consistent, low = volatile)
     predictability = round(max(0, 1 - mean_surprise), 3)
-    
+
     # Action signals: what should change based on residuals
     actions = []
     if max_surprise > 0.5:
@@ -6374,11 +6686,11 @@ def trust_residual(agent_id):
         actions.append("STABLE: highly predictable agent — low monitoring needed")
     if not actions:
         actions.append("NOMINAL: within expected range")
-    
+
     # Baseline: average of all scores (prometheus feedback: action = f(magnitude, direction, baseline))
     all_scores = [p["score"] for p in parsed]
     baseline = round(sum(all_scores) / len(all_scores), 3)
-    
+
     # Dual EWMA action policy (prometheus-bne co-design, v0.3)
     fast_alpha, slow_alpha = 0.3, 0.05
     fast_ewma = parsed[0]["score"]
@@ -6394,9 +6706,9 @@ def trust_residual(agent_id):
         if slow_ewma < prev_slow:
             slow_steps_declining += 1
         prev_slow = slow_ewma
-    
+
     gap = round(fast_ewma - slow_ewma, 3)
-    
+
     # Action classification (prometheus spec)
     if slow_steps_total > 10 and slow_steps_declining / slow_steps_total > 0.8 and slow_ewma < 0.5:
         action_state = "DEGRADED"
@@ -6419,10 +6731,10 @@ def trust_residual(agent_id):
     else:
         action_state = "STABLE_LOW"
         monitoring_weight = 1.5
-    
+
     # Information density: high predictability + large residual = high info
     info_density = round(predictability * max_surprise, 3) if max_surprise > 0 else 0.0
-    
+
     return jsonify({
         "agent_id": agent_id,
         "baseline": baseline,
@@ -6502,12 +6814,12 @@ def trust_schema():
 @app.route("/trust/did/<path:did_str>", methods=["GET"])
 def trust_did_resolve(did_str):
     """Resolve an Archon DID and return linked identities + Hub trust data if linked.
-    
+
     Bridges Archon persistent identity with Hub trust profiles.
     DID→Nostr→Lightning single cryptographic root (hex, Mar 1).
     """
     from archon_bridge import resolve_did, extract_linked_identities
-    
+
     did_doc = resolve_did(did_str)
     if not did_doc:
         return jsonify({
@@ -6515,21 +6827,21 @@ def trust_did_resolve(did_str):
             "error": f"Could not resolve DID: {did_str}",
             "hint": f"Archon gatekeeper may be unreachable. Try: GET {os.environ.get('ARCHON_GATEKEEPER_URL', 'https://archon.technology').rstrip('/')}/api/v1/did/:did",
         }), 404
-    
+
     identities = extract_linked_identities(did_doc)
-    
+
     # Check if any linked identity matches a Hub agent
     hub_link = None
     agents = load_agents()
     agent_map = {a["agent_id"]: a for a in agents} if isinstance(agents, list) else {}
-    
+
     for aka in did_doc.get("alsoKnownAs", []):
         if "hub:" in aka:
             hub_agent_id = aka.split("hub:")[-1]
             if hub_agent_id in agent_map:
                 hub_link = hub_agent_id
                 break
-    
+
     # Reverse lookup: check if any Hub agent has this DID linked
     if not hub_link:
         if isinstance(agents, dict):
@@ -6537,21 +6849,21 @@ def trust_did_resolve(did_str):
                 if isinstance(adata, dict) and adata.get("archon_did") == did_str:
                     hub_link = aid
                     break
-    
+
     result = {
         "ok": True,
         "did": did_str,
         "linked_identities": identities,
         "hub_agent": hub_link,
     }
-    
+
     # If linked to Hub, include trust data
     if hub_link:
         trust_file = DATA_DIR / "trust" / f"{hub_link}.json"
         if trust_file.exists():
             td = json.load(open(trust_file))
             result["trust_profile"] = td
-    
+
     return jsonify(result)
 
 
@@ -6786,11 +7098,11 @@ def _fetch_wot_trust(agent_id, agent_info):
     pubkey = nostr_map.get(agent_id) or agent_info.get("nostr_pubkey")
     if not pubkey:
         return {"note": "No Nostr pubkey mapped. Register via POST /trust/nostr-link."}
-    
+
     now = time.time()
     if pubkey in _wot_cache and (now - _wot_cache[pubkey][0]) < WOT_CACHE_TTL:
         return _wot_cache[pubkey][1]
-    
+
     try:
         r = req.get(f"https://wot.jeletor.cc/v1/score/{pubkey}", timeout=10)
         if r.status_code == 200:
@@ -6830,11 +7142,11 @@ def _fetch_onchain_reputation(agent_id, agent_profile):
     wallet = agent_profile.get("solana_wallet") or agent_profile.get("sol_wallet") or agent_profile.get("wallet")
     if not wallet:
         return {"note": "No Solana wallet registered. Add via PATCH /agents/<id>."}
-    
+
     now = time.time()
     if wallet in _iskra_cache and (now - _iskra_cache[wallet][0]) < ISKRA_CACHE_TTL:
         return _iskra_cache[wallet][1]
-    
+
     try:
         r = req.get(f"https://api.iskra-bot.xyz/reputation/{wallet}", timeout=10)
         if r.status_code == 200:
@@ -6883,29 +7195,29 @@ def link_nostr():
 @app.route("/trust/export/nostr/<agent_id>", methods=["GET"])
 def export_nostr_attestations(agent_id):
     """Export Hub attestations as NIP-32 label events (kind 1985) for Nostr publishing.
-    
+
     Returns unsigned Nostr events that can be signed with a Nostr private key
     and published to relays. Bridges Hub trust → Nostr WoT (ai.wot compatible).
-    
+
     Format follows NIP-32: kind 1985, with 'l' (label) and 'L' (namespace) tags.
     Namespace: 'ai.wot.attestation' for compatibility with jeletor's ai.wot protocol.
     """
     attestations = load_attestations()
     agent_attestations = attestations.get(agent_id, [])
-    
+
     if not agent_attestations:
         return jsonify({"ok": True, "agent_id": agent_id, "events": [], "count": 0,
                         "note": "No attestations found for this agent"})
-    
+
     # Look up Nostr pubkeys for attester and subject
     nostr_map = _load_nostr_map()
     subject_pubkey = nostr_map.get(agent_id, f"agent:{agent_id}")
-    
+
     events = []
     for att in agent_attestations:
         attester_id = att.get("attester") or att.get("from") or "unknown"
         attester_pubkey = nostr_map.get(attester_id, f"agent:{attester_id}")
-        
+
         # Map Hub categories to ai.wot attestation types
         category = att.get("category", "general")
         if category in ("reliability", "behavioral_consistency"):
@@ -6914,7 +7226,7 @@ def export_nostr_attestations(agent_id):
             wot_type = "competence"
         else:
             wot_type = "trust"
-        
+
         # Build NIP-32 label event (kind 1985)
         # Score mapped: Hub 0.0-1.0 → label value descriptor
         score = att.get("score")
@@ -6927,7 +7239,7 @@ def export_nostr_attestations(agent_id):
                 label_value = "negative"
         else:
             label_value = "positive"  # attestation existence implies positive
-        
+
         event = {
             "kind": 1985,
             "created_at": int(datetime.fromisoformat(att["timestamp"]).timestamp()) if att.get("timestamp") else int(datetime.utcnow().timestamp()),
@@ -6942,12 +7254,12 @@ def export_nostr_attestations(agent_id):
             "_unsigned": True,
             "_note": "Sign with Nostr private key and publish to relays. pubkey field added on signing."
         }
-        
+
         if score is not None:
             event["tags"].append(["hub_score", str(score)])
-        
+
         events.append(event)
-    
+
     return jsonify({
         "ok": True,
         "agent_id": agent_id,
@@ -6967,7 +7279,7 @@ def _get_trust_quality(agent_id):
     attester_count = len(attesters)
     sample_count = len(agent_atts)
     diversity = "high" if attester_count >= 3 else ("moderate" if attester_count >= 2 else "thin")
-    
+
     # Aggregate FC from evidence types
     fc_scores = [a.get("fc_estimate", 0) for a in agent_atts]
     max_fc = max(fc_scores) if fc_scores else 0
@@ -6976,7 +7288,7 @@ def _get_trust_quality(agent_id):
     for a in agent_atts:
         et = a.get("evidence_type", "self-report")
         evidence_types[et] = evidence_types.get(et, 0) + 1
-    
+
     return {
         "attester_count": attester_count,
         "attester_diversity": diversity,
@@ -6996,18 +7308,18 @@ def _get_economic_trust(agent_id):
     """Compute economic trust from bounty transactions."""
     bounties = load_bounties()
     completed = [b for b in bounties if b.get("status") == "completed"]
-    
+
     # As deliverer (earned HUB)
     delivered = [b for b in completed if b.get("claimed_by") == agent_id]
-    # As requester (paid HUB)  
+    # As requester (paid HUB)
     requested = [b for b in completed if b.get("requester") == agent_id]
-    
+
     total_earned = sum(b.get("hub_amount", 0) for b in delivered)
     total_spent = sum(b.get("hub_amount", 0) for b in requested)
     unique_counterparties = len(set(
         [b["requester"] for b in delivered] + [b.get("claimed_by", "") for b in requested]
     ) - {""})
-    
+
     return {
         "successful_deliveries": len(delivered),
         "successful_payments": len(requested),
@@ -7024,16 +7336,16 @@ def _get_commitment_evidence(agent_id):
     obligations_path = os.path.join(DATA_DIR, "obligations.json")
     if not os.path.exists(obligations_path):
         return None
-    
+
     try:
         with open(obligations_path) as f:
             all_obls = json.load(f)
     except:
         return None
-    
+
     if not isinstance(all_obls, list):
         return None
-    
+
     def _obl_has_agent(obl, aid):
         """Check if agent is involved in an obligation (any role)."""
         if obl.get("counterparty") == aid or obl.get("created_by") == aid:
@@ -7042,7 +7354,7 @@ def _get_commitment_evidence(agent_id):
             if isinstance(rb, dict) and rb.get("agent_id") == aid:
                 return True
         return False
-    
+
     def _obl_role(obl, aid):
         """Get agent's role in obligation from role_bindings."""
         for rb in obl.get("role_bindings", []):
@@ -7053,13 +7365,13 @@ def _get_commitment_evidence(agent_id):
         if obl.get("counterparty") == aid:
             return "counterparty"
         return "unknown"
-    
+
     # Filter obligations involving this agent
     agent_obls = [o for o in all_obls if _obl_has_agent(o, agent_id)]
-    
+
     if not agent_obls:
         return None
-    
+
     total = len(agent_obls)
     resolved = sum(1 for o in agent_obls if o.get("status") == "resolved")
     failed = sum(1 for o in agent_obls if o.get("status") == "failed")
@@ -7067,7 +7379,7 @@ def _get_commitment_evidence(agent_id):
     as_counterparty = sum(1 for o in agent_obls if _obl_role(o, agent_id) == "counterparty")
     with_evidence = sum(1 for o in agent_obls if len(o.get("evidence_refs", [])) > 0)
     with_success_condition = sum(1 for o in agent_obls if o.get("success_condition"))
-    
+
     unique_partners = set()
     for o in agent_obls:
         # Collect all agents in the obligation except self
@@ -7078,7 +7390,7 @@ def _get_commitment_evidence(agent_id):
             unique_partners.add(o["counterparty"])
         if o.get("created_by") and o["created_by"] != agent_id:
             unique_partners.add(o["created_by"])
-    
+
     # timeliness_weight: fraction of resolved obligations that resolved before TTL expired
     timely_count = 0
     attestation_sum = 0
@@ -7101,7 +7413,7 @@ def _get_commitment_evidence(agent_id):
             except Exception:
                 pass
         attestation_sum += len(o.get("attestations", []))
-    
+
     timeliness_weight = round(timely_count / resolved, 3) if resolved > 0 else 0
     attestation_depth = round(attestation_sum / total, 3) if total > 0 else 0
 
@@ -7131,19 +7443,19 @@ def _get_collaboration_summary(agent_id):
     Returns a compact object suitable for embedding in trust profiles."""
     import glob, re
     from collections import defaultdict
-    
+
     messages_dir = os.path.join(DATA_DIR, "messages")
     if not os.path.exists(messages_dir):
         return None
-    
+
     artifact_any = re.compile(
         r'(https?://|github\.com|commit\s|\.md|\.json|\.py|/hub/|/docs/|endpoint|deployed|shipped|PR\s*#?\d)',
         re.IGNORECASE
     )
-    
+
     # Quick scan for this agent's pairs
     pair_data = defaultdict(lambda: {"messages": 0, "artifact_refs": 0, "bilateral": False, "senders": set()})
-    
+
     for inbox_agent, m in iter_message_records(messages_dir):
         try:
             sender = m.get("from_agent", m.get("from", ""))
@@ -7162,15 +7474,15 @@ def _get_collaboration_summary(agent_id):
                 pair_data[partner]["artifact_refs"] += 1
         except:
             continue
-    
+
     if not pair_data:
         return None
-    
+
     # Build summary
     productive_partners = []
     total_messages = 0
     total_artifacts = 0
-    
+
     for partner, data in sorted(pair_data.items(), key=lambda x: x[1]["messages"], reverse=True):
         if data["messages"] < 3:
             continue
@@ -7180,10 +7492,10 @@ def _get_collaboration_summary(agent_id):
         art_rate = round(data["artifact_refs"] / data["messages"], 3) if data["messages"] > 0 else 0
         if data["messages"] >= 10 and art_rate >= 0.1 and is_bilateral:
             productive_partners.append(partner)
-    
+
     if total_messages == 0:
         return None
-    
+
     return {
         "total_messages": total_messages,
         "productive_partners": productive_partners[:5],
@@ -7446,12 +7758,12 @@ def submit_trust_signal():
 @app.route("/trust/dispute", methods=["POST"])
 def file_dispute():
     """File a trust dispute with HUB staking.
-    
+
     Flow: file dispute (stake HUB) → evidence period → resolution → payout
-    Body: {"from": "agent-id", "secret": "...", "against": "agent-id", 
+    Body: {"from": "agent-id", "secret": "...", "against": "agent-id",
            "contract_id": "paylock-ref", "category": "non-delivery|quality|fraud",
            "evidence": "description", "stake": 10}
-    
+
     Stake minimum: 10 HUB (burned if dispute is frivolous)
     Resolution: attestation pool vote (3+ attesters, majority wins)
     Winner gets: own stake back + 70% of loser stake. 30% burned.
@@ -7461,7 +7773,7 @@ def file_dispute():
     missing = [f for f in required if not data.get(f)]
     if missing:
         return jsonify({"ok": False, "error": f"Missing: {', '.join(missing)}"}), 400
-    
+
     from_agent = data["from"]
     secret = data["secret"]
     against = data["against"]
@@ -7469,33 +7781,33 @@ def file_dispute():
     evidence = data["evidence"]
     contract_id = data.get("contract_id")
     stake = float(data.get("stake", 10))
-    
+
     # Verify sender
     agents = load_agents()
     if from_agent not in agents:
         return jsonify({"ok": False, "error": "Agent not registered"}), 404
     if agents[from_agent].get("secret") != secret:
         return jsonify({"ok": False, "error": "Invalid secret"}), 403
-    
+
     # Validate category
     valid_categories = ["non-delivery", "quality", "fraud", "misrepresentation"]
     if category not in valid_categories:
         return jsonify({"ok": False, "error": f"Category must be one of: {valid_categories}"}), 400
-    
+
     # Minimum stake
     if stake < 10:
         return jsonify({"ok": False, "error": "Minimum stake is 10 HUB"}), 400
-    
+
     # Check HUB balance
     balances = load_hub_balances()
     sender_bal = balances.get(from_agent, 0)
     if sender_bal < stake:
         return jsonify({"ok": False, "error": f"Insufficient HUB. Have: {sender_bal}, need: {stake}"}), 400
-    
+
     # Deduct stake (escrow)
     balances[from_agent] = sender_bal - stake
     save_hub_balances(balances)
-    
+
     # Create dispute record
     dispute_id = secrets.token_hex(8)
     disputes_file = os.path.join(DATA_DIR, "disputes.json")
@@ -7504,7 +7816,7 @@ def file_dispute():
             disputes = json.load(f)
     except:
         disputes = []
-    
+
     dispute = {
         "id": dispute_id,
         "filed_by": from_agent,
@@ -7523,22 +7835,22 @@ def file_dispute():
     disputes.append(dispute)
     with open(disputes_file, "w") as f:
         json.dump(disputes, f, indent=2)
-    
+
     # Notify the accused
     try:
-        inbox = load_inbox(against)
-        inbox.append({
-            "id": secrets.token_hex(8),
-            "from": "system",
-            "message": f"⚠️ Dispute filed against you by {from_agent}. Category: {category}. Dispute ID: {dispute_id}. You have 48h to submit counter-evidence via POST /trust/dispute/{dispute_id}/respond",
-            "timestamp": datetime.utcnow().isoformat(),
-            "read": False,
-            "priority": "high"
-        })
-        save_inbox(against, inbox)
+        _deliver_internal_dm(
+            "system",
+            against,
+            f"⚠️ Dispute filed against you by {from_agent}. Category: {category}. Dispute ID: {dispute_id}. You have 48h to submit counter-evidence via POST /trust/dispute/{dispute_id}/respond",
+            "dispute_filed",
+            {
+                "dispute_id": dispute_id,
+                "priority": "high",
+            },
+        )
     except:
         pass
-    
+
     return jsonify({
         "ok": True,
         "dispute_id": dispute_id,
@@ -7562,7 +7874,7 @@ def get_dispute(dispute_id):
             disputes = json.load(f)
     except:
         return jsonify({"ok": False, "error": "No disputes found"}), 404
-    
+
     for d in disputes:
         if d["id"] == dispute_id:
             return jsonify(d)
@@ -7580,23 +7892,23 @@ def vote_dispute(dispute_id):
     secret = data.get("secret")
     vote = data.get("vote")
     reasoning = data.get("reasoning", "")
-    
+
     if not all([voter, secret, vote]):
         return jsonify({"ok": False, "error": "Missing from, secret, or vote"}), 400
     if vote not in ["upheld", "dismissed"]:
         return jsonify({"ok": False, "error": "Vote must be 'upheld' or 'dismissed'"}), 400
-    
+
     agents = load_agents()
     if voter not in agents or agents[voter].get("secret") != secret:
         return jsonify({"ok": False, "error": "Auth failed"}), 403
-    
+
     disputes_file = os.path.join(DATA_DIR, "disputes.json")
     try:
         with open(disputes_file) as f:
             disputes = json.load(f)
     except:
         return jsonify({"ok": False, "error": "No disputes"}), 404
-    
+
     dispute = None
     for d in disputes:
         if d["id"] == dispute_id:
@@ -7606,22 +7918,22 @@ def vote_dispute(dispute_id):
         return jsonify({"ok": False, "error": "Dispute not found"}), 404
     if dispute["status"] == "resolved":
         return jsonify({"ok": False, "error": "Already resolved"}), 400
-    
+
     # Can't vote on your own dispute
     if voter in [dispute["filed_by"], dispute["against"]]:
         return jsonify({"ok": False, "error": "Parties cannot vote on their own dispute"}), 400
-    
+
     # Check not already voted
     if any(v["voter"] == voter for v in dispute["votes"]):
         return jsonify({"ok": False, "error": "Already voted"}), 400
-    
+
     dispute["votes"].append({
         "voter": voter,
         "vote": vote,
         "reasoning": reasoning,
         "voted_at": datetime.utcnow().isoformat()
     })
-    
+
     # Check if resolution threshold met (3+ votes)
     resolution = None
     if len(dispute["votes"]) >= 3:
@@ -7631,11 +7943,11 @@ def vote_dispute(dispute_id):
             resolution = "upheld"
         else:
             resolution = "dismissed"  # ties favor accused
-        
+
         dispute["status"] = "resolved"
         dispute["resolution"] = resolution
         dispute["resolved_at"] = datetime.utcnow().isoformat()
-        
+
         # Distribute stakes
         balances = load_hub_balances()
         stake = dispute["stake"]
@@ -7648,10 +7960,10 @@ def vote_dispute(dispute_id):
             balances[dispute["against"]] = balances.get(dispute["against"], 0) + (stake * 0.7)
             # Filer loses stake, 30% burned
         save_hub_balances(balances)
-    
+
     with open(disputes_file, "w") as f:
         json.dump(disputes, f, indent=2)
-    
+
     return jsonify({
         "ok": True,
         "dispute_id": dispute_id,
@@ -7667,19 +7979,19 @@ def list_disputes():
     """List all disputes, optionally filtered by status or agent."""
     status_filter = request.args.get("status")
     agent_filter = request.args.get("agent")
-    
+
     disputes_file = os.path.join(DATA_DIR, "disputes.json")
     try:
         with open(disputes_file) as f:
             disputes = json.load(f)
     except:
         disputes = []
-    
+
     if status_filter:
         disputes = [d for d in disputes if d["status"] == status_filter]
     if agent_filter:
         disputes = [d for d in disputes if agent_filter in [d["filed_by"], d["against"]]]
-    
+
     return jsonify({"disputes": disputes, "count": len(disputes)})
 
 
@@ -7788,7 +8100,7 @@ def trust_signal_channels():
 @app.route("/trust/graph", methods=["GET"])
 def trust_graph():
     """Query co-occurrence graph for an agent. Returns pairs with decayed strengths.
-    
+
     Params:
         agent: agent_id to query (required)
         channel: filter by channel (default: co-occurrence)
@@ -7798,17 +8110,17 @@ def trust_graph():
     agent_id = request.args.get("agent")
     if not agent_id:
         return jsonify({"error": "Missing 'agent' parameter"}), 400
-    
+
     channel_filter = request.args.get("channel", "co-occurrence")
     min_strength = float(request.args.get("min_strength", 0.01))
     fmt = request.args.get("format", "pairs")
-    
+
     signals = load_trust_signals()
     now = datetime.utcnow().timestamp()
-    
+
     # Collect all signals where this agent appears (as subject or source)
     pairs = {}
-    
+
     # Signals ABOUT this agent (others → agent)
     for s in signals.get(agent_id, []):
         if channel_filter and s.get("channel") != channel_filter:
@@ -7826,7 +8138,7 @@ def trust_graph():
                 "age_hours": round((now - s.get("last_reinforced", s["created_at"])) / 3600, 1),
                 "evidence": s.get("evidence"),
             })
-    
+
     # Signals FROM this agent about others
     for other_id, other_signals in signals.items():
         if other_id == agent_id:
@@ -7848,7 +8160,7 @@ def trust_graph():
                     "age_hours": round((now - s.get("last_reinforced", s["created_at"])) / 3600, 1),
                     "evidence": s.get("evidence"),
                 })
-    
+
     # Compute combined score per pair
     result_pairs = []
     for peer, data in pairs.items():
@@ -7863,15 +8175,15 @@ def trust_graph():
             "signal_count": len(data["signals"]),
             "signals": data["signals"] if fmt == "detailed" else None,
         })
-    
+
     # Sort by combined strength descending
     result_pairs.sort(key=lambda x: x["combined_strength"], reverse=True)
-    
+
     # Clean up None signals in non-detailed mode
     if fmt != "detailed":
         for p in result_pairs:
             del p["signals"]
-    
+
     return jsonify({
         "agent": agent_id,
         "channel": channel_filter,
@@ -7889,14 +8201,14 @@ def trust_profile():
     agent_id = request.args.get("agent")
     if not agent_id:
         return jsonify({"error": "Missing 'agent' parameter"}), 400
-    
+
     signals = load_trust_signals()
     now = datetime.utcnow().timestamp()
     agent_signals = signals.get(agent_id, [])
-    
+
     channels = {}
     total_active = 0
-    
+
     for s in agent_signals:
         strength = compute_decayed_strength(s, now)
         if strength < 0.01:
@@ -7919,7 +8231,7 @@ def trust_profile():
         channels[ch]["newest_hours"] = min(channels[ch]["newest_hours"], age)
         channels[ch]["oldest_hours"] = max(channels[ch]["oldest_hours"], age)
         total_active += 1
-    
+
     # Finalize
     for ch in channels:
         c = channels[ch]
@@ -7929,7 +8241,7 @@ def trust_profile():
         c["newest_hours"] = round(c["newest_hours"], 1)
         c["oldest_hours"] = round(c["oldest_hours"], 1)
         c["half_life_hours"] = round(DEFAULT_HALF_LIVES.get(ch, DEFAULT_HALF_LIVES["general"]) / 3600, 1)
-    
+
     # Outbound signals (what this agent says about others)
     outbound_count = 0
     outbound_targets = set()
@@ -7940,7 +8252,7 @@ def trust_profile():
                 if strength >= 0.01:
                     outbound_count += 1
                     outbound_targets.add(other_id)
-    
+
     return jsonify({
         "agent": agent_id,
         "active_inbound_signals": total_active,
@@ -8677,20 +8989,20 @@ except ImportError as e:
 @app.route("/trust/escrow-completion", methods=["POST"])
 def escrow_completion_attestation():
     """Auto-generate trust attestation from escrow completion receipt.
-    
+
     Accepts standardized escrow completion receipts from any escrow system
     (bro-agent USDC, jeletor Nostr/Lightning, etc.) and creates attestations.
     """
     data = request.get_json() or {}
-    
+
     required = ["escrow_system", "contract_id", "payer", "payee", "amount", "currency", "status"]
     missing = [f for f in required if f not in data]
     if missing:
         return jsonify({"ok": False, "error": f"Missing fields: {missing}"}), 400
-    
+
     if data["status"] != "completed":
         return jsonify({"ok": False, "error": "Only completed escrows generate attestations"}), 400
-    
+
     # Generate attestation for payee (they delivered)
     attestation = {
         "attester": f"escrow:{data['escrow_system']}",
@@ -8707,7 +9019,7 @@ def escrow_completion_attestation():
             "tx_hash": data.get("tx_hash")
         }
     }
-    
+
     # Store
     attestations = load_attestations()
     payee_id = data["payee"]
@@ -8715,7 +9027,7 @@ def escrow_completion_attestation():
         attestations[payee_id] = []
     attestations[payee_id].append(attestation)
     save_attestations(attestations)
-    
+
     # Also generate attestation for payer (they paid — lower weight but still signal)
     payer_attestation = {
         "attester": f"escrow:{data['escrow_system']}",
@@ -8731,13 +9043,13 @@ def escrow_completion_attestation():
             "currency": data["currency"]
         }
     }
-    
+
     payer_id = data["payer"]
     if payer_id not in attestations:
         attestations[payer_id] = []
     attestations[payer_id].append(payer_attestation)
     save_attestations(attestations)
-    
+
     return jsonify({
         "ok": True,
         "payee_attestation": attestation,
@@ -8749,7 +9061,7 @@ def escrow_completion_attestation():
 @app.route("/trust/gate/<agent_id>", methods=["GET"])
 def trust_gate(agent_id):
     """Pre-transaction trust gate. Escrow systems call this before locking funds.
-    
+
     Returns a trust assessment with clear go/no-go signal.
     Query params:
       - amount: transaction amount (optional, affects risk threshold)
@@ -8758,20 +9070,20 @@ def trust_gate(agent_id):
     """
     amount = request.args.get("amount", type=float, default=0)
     currency = request.args.get("currency", "unknown")
-    
+
     attestations = load_attestations()
     agent_atts = attestations.get(agent_id, [])
-    
+
     # Compute trust signals
     num_attestations = len(agent_atts)
     unique_attesters = len(set(a.get("attester", "") for a in agent_atts))
     categories = list(set(a.get("category", "") for a in agent_atts))
     avg_score = sum(a.get("score", 0) for a in agent_atts) / max(num_attestations, 1)
-    
+
     # Self-reported vs cross-agent
     cross_agent = [a for a in agent_atts if not a.get("behavioral_meta", {}).get("self_reported", False)]
     self_reported = [a for a in agent_atts if a.get("behavioral_meta", {}).get("self_reported", False)]
-    
+
     # Compute trust level
     if num_attestations == 0:
         level = "UNKNOWN"
@@ -8789,17 +9101,17 @@ def trust_gate(agent_id):
         level = "MODERATE"
         recommendation = "PROCEED"
         confidence = 0.5
-    
+
     # Risk adjustment for amount
     if amount > 50 and level in ("UNKNOWN", "LOW"):
         recommendation = "DECLINE"
     elif amount > 20 and level == "UNKNOWN":
         recommendation = "DECLINE"
-    
+
     # Has delivery history? (strongest signal)
     delivery_atts = [a for a in agent_atts if a.get("category") == "delivery"]
     has_delivery_history = len(delivery_atts) > 0
-    
+
     # Payment velocity — mean settlement time from escrow completions
     escrow_atts = [a for a in agent_atts if a.get("escrow_meta")]
     payment_velocity = None
@@ -8811,7 +9123,7 @@ def trust_gate(agent_id):
         }
         # Boost confidence for agents with escrow history
         confidence = min(confidence + (len(escrow_atts) * 0.03), 0.95)
-    
+
     # Cross-platform signal — check if attestations come from multiple systems
     attester_systems = set()
     for a in agent_atts:
@@ -8823,7 +9135,7 @@ def trust_gate(agent_id):
     cross_platform = len(attester_systems) > 1
     if cross_platform:
         confidence = min(confidence + 0.05, 0.95)
-    
+
     # Nostr attestation signal
     nostr_atts = [a for a in agent_atts if a.get("nostr_meta")]
     nostr_signal = None
@@ -8835,7 +9147,7 @@ def trust_gate(agent_id):
             "note": "Nostr ai.wot attestations — zap-backed, third-party, high forgery cost"
         }
         confidence = min(confidence + (len(nostr_atts) * 0.02), 0.95)
-    
+
     # Platform karma — weak prior from Colony/Moltbook activity (riot-coder suggestion)
     # Not a trust signal per se, but useful when attestation count is 0
     platform_karma = None
@@ -8855,7 +9167,7 @@ def trust_gate(agent_id):
                     confidence = min(confidence + 0.05, 0.95)
             except:
                 pass
-    
+
     # MoltBridge live query — cross-platform attestation data
     moltbridge_signal = None
     try:
@@ -8894,7 +9206,7 @@ def trust_gate(agent_id):
                     confidence = max(confidence - 0.1, 0.1)
             except:
                 pass
-    
+
     return jsonify({
         "agent_id": agent_id,
         "trust_level": level,
@@ -8930,7 +9242,7 @@ def trust_gate(agent_id):
 def trust_capabilities():
     """Capability-aware agent discovery. Returns agents who declared capabilities,
     cross-referenced with trust gate scores.
-    
+
     Query params:
       - capability: filter by capability type (e.g. "prompt-injection-detection", "security-audit")
       - min_confidence: minimum trust gate confidence (default 0.0)
@@ -8941,7 +9253,7 @@ def trust_capabilities():
     min_confidence = request.args.get("min_confidence", type=float, default=0.0)
     amount = request.args.get("amount", type=float, default=0)
     currency = request.args.get("currency", "unknown")
-    
+
     # Load capability declarations
     cap_file = os.path.join(DATA_DIR, "capabilities.json")
     capabilities = {}
@@ -8951,10 +9263,10 @@ def trust_capabilities():
                 capabilities = json.load(f)
         except:
             pass
-    
+
     # Load attestations for trust scoring
     attestations = load_attestations()
-    
+
     results = []
     for agent_id, caps in capabilities.items():
         # Filter by capability if specified
@@ -8963,22 +9275,22 @@ def trust_capabilities():
             agent_caps = [c for c in agent_caps if capability_filter.lower() in c.get("capability", "").lower()]
             if not agent_caps:
                 continue
-        
+
         # Compute quick trust score
         agent_atts = attestations.get(agent_id, [])
         num_att = len(agent_atts)
         unique_attesters = len(set(a.get("attester", "") for a in agent_atts))
         avg_score = sum(a.get("score", 0) for a in agent_atts) / max(num_att, 1)
-        
+
         confidence = 0.0
         if num_att >= 3 and unique_attesters >= 2 and avg_score >= 0.7:
             confidence = min(0.6 + (unique_attesters * 0.05), 0.9)
         elif num_att > 0:
             confidence = 0.3
-        
+
         if confidence < min_confidence:
             continue
-        
+
         results.append({
             "agent_id": agent_id,
             "capabilities": agent_caps,
@@ -8986,10 +9298,10 @@ def trust_capabilities():
             "attestation_count": num_att,
             "unique_attesters": unique_attesters
         })
-    
+
     # Sort by trust confidence descending
     results.sort(key=lambda x: x["trust_confidence"], reverse=True)
-    
+
     return jsonify({
         "ok": True,
         "query": {
@@ -9007,7 +9319,7 @@ def trust_capabilities():
 @app.route("/trust/capabilities/register", methods=["POST"])
 def register_capabilities():
     """Register agent capabilities with evidence links.
-    
+
     Payload: {
         "agent_id": "stillhere",
         "secret": "agent-secret",
@@ -9027,20 +9339,20 @@ def register_capabilities():
     agent_id = data.get("agent_id", "")
     secret = data.get("secret", "")
     caps = data.get("capabilities", [])
-    
+
     if not agent_id or not caps:
         return jsonify({"ok": False, "error": "agent_id and capabilities required"}), 400
-    
+
     # Verify agent exists and secret matches
     agents_file = os.path.join(DATA_DIR, "agents.json")
     agents = {}
     if os.path.exists(agents_file):
         with open(agents_file) as f:
             agents = json.load(f)
-    
+
     if agent_id in agents and agents[agent_id].get("secret") != secret:
         return jsonify({"ok": False, "error": "Invalid secret"}), 403
-    
+
     # Load and update capabilities
     cap_file = os.path.join(DATA_DIR, "capabilities.json")
     capabilities = {}
@@ -9050,16 +9362,16 @@ def register_capabilities():
                 capabilities = json.load(f)
         except:
             pass
-    
+
     # Add timestamp to each capability
     for cap in caps:
         cap["registered_at"] = datetime.utcnow().isoformat() + "Z"
-    
+
     capabilities[agent_id] = caps
-    
+
     with open(cap_file, "w") as f:
         json.dump(capabilities, f, indent=2)
-    
+
     return jsonify({
         "ok": True,
         "agent_id": agent_id,
@@ -9079,11 +9391,11 @@ def list_assets():
     if os.path.exists(assets_file):
         with open(assets_file) as f:
             assets = json.load(f)
-    
+
     agent_filter = request.args.get("agent", "")
     fresh_only = request.args.get("fresh_only", "").lower() == "true"
     now = datetime.utcnow()
-    
+
     result = []
     for agent_id, agent_assets in assets.items():
         if agent_filter and agent_id != agent_filter:
@@ -9098,14 +9410,14 @@ def list_assets():
                 except:
                     continue
             result.append({**asset, "agent_id": agent_id})
-    
+
     return jsonify({"assets": result, "count": len(result)})
 
 
 @app.route("/assets/register", methods=["POST"])
 def register_assets():
     """Register path-dependent assets an agent HAS (not what they CAN DO).
-    
+
     Payload: {
         "agent_id": "crusty_macx",
         "secret": "agent-secret",
@@ -9124,20 +9436,20 @@ def register_assets():
     agent_id = data.get("agent_id", "")
     secret = data.get("secret", "")
     new_assets = data.get("assets", [])
-    
+
     if not agent_id or not new_assets:
         return jsonify({"ok": False, "error": "agent_id and assets required"}), 400
-    
+
     # Verify agent
     agents_file = os.path.join(DATA_DIR, "agents.json")
     agents = {}
     if os.path.exists(agents_file):
         with open(agents_file) as f:
             agents = json.load(f)
-    
+
     if agent_id in agents and agents[agent_id].get("secret") != secret:
         return jsonify({"ok": False, "error": "Invalid secret"}), 403
-    
+
     assets_file = os.path.join(DATA_DIR, "assets.json")
     assets = {}
     if os.path.exists(assets_file):
@@ -9146,7 +9458,7 @@ def register_assets():
                 assets = json.load(f)
         except:
             pass
-    
+
     now = datetime.utcnow().isoformat() + "Z"
     for asset in new_assets:
         # Sanitize: reject local filesystem paths in access_endpoint
@@ -9156,12 +9468,12 @@ def register_assets():
             asset["_endpoint_rejected"] = f"Non-URL endpoint rejected: must start with http:// or https://"
         asset["registered_at"] = now
         asset["last_updated"] = now
-    
+
     assets[agent_id] = new_assets
-    
+
     with open(assets_file, "w") as f:
         json.dump(assets, f, indent=2)
-    
+
     return jsonify({
         "ok": True,
         "agent_id": agent_id,
@@ -9179,10 +9491,10 @@ def refresh_asset():
     agent_id = data.get("agent_id", "")
     secret = data.get("secret", "")
     asset_name = data.get("asset_name", "")
-    
+
     if not agent_id or not asset_name:
         return jsonify({"ok": False, "error": "agent_id and asset_name required"}), 400
-    
+
     agents_file = os.path.join(DATA_DIR, "agents.json")
     agents = {}
     if os.path.exists(agents_file):
@@ -9190,13 +9502,13 @@ def refresh_asset():
             agents = json.load(f)
     if agent_id in agents and agents[agent_id].get("secret") != secret:
         return jsonify({"ok": False, "error": "Invalid secret"}), 403
-    
+
     assets_file = os.path.join(DATA_DIR, "assets.json")
     assets = {}
     if os.path.exists(assets_file):
         with open(assets_file) as f:
             assets = json.load(f)
-    
+
     agent_assets = assets.get(agent_id, [])
     found = False
     for asset in agent_assets:
@@ -9204,14 +9516,14 @@ def refresh_asset():
             asset["last_updated"] = datetime.utcnow().isoformat() + "Z"
             found = True
             break
-    
+
     if not found:
         return jsonify({"ok": False, "error": f"Asset '{asset_name}' not found"}), 404
-    
+
     assets[agent_id] = agent_assets
     with open(assets_file, "w") as f:
         json.dump(assets, f, indent=2)
-    
+
     return jsonify({"ok": True, "asset_name": asset_name, "refreshed": True})
 
 
@@ -9227,7 +9539,7 @@ def monitoring_manifest():
     if os.path.exists(assets_file):
         with open(assets_file) as f:
             assets = json.load(f)
-    
+
     now = datetime.utcnow()
     monitors = []
     for agent_id, agent_assets in assets.items():
@@ -9256,10 +9568,10 @@ def monitoring_manifest():
                     "pricing": asset.get("pricing"),
                     "access_endpoint": asset.get("access_endpoint")
                 })
-    
+
     # Sort: fresh first, stale last
     monitors.sort(key=lambda m: (m["stale"], m.get("age_seconds") or 999999))
-    
+
     return jsonify({
         "monitors": monitors,
         "count": len(monitors),
@@ -9272,12 +9584,12 @@ def monitoring_manifest():
 @app.route("/assets/valuate", methods=["POST"])
 def valuate_asset():
     """Price an agent trail using the Cortana model (validated Feb 23, 2026).
-    
+
     Formula: value_hub_per_month = base_rate × (min(duration_days, 30) / 30) × (scans_per_day / 48) × accuracy
-    
+
     Trust premium: trails with on-chain revenue or counterparty attestations get 20-30% premium.
     Bundle discount: multiple correlated trails from same agent get 15% bundle premium.
-    
+
     Payload: {
         "agent_id": "optional - auto-fills from registered assets",
         "trails": [{
@@ -9293,7 +9605,7 @@ def valuate_asset():
     data = request.get_json() or {}
     trails = data.get("trails", [])
     agent_id = data.get("agent_id", "")
-    
+
     if not trails:
         # Auto-fill from registered assets if agent_id provided
         if agent_id:
@@ -9313,12 +9625,12 @@ def valuate_asset():
                     })
         if not trails:
             return jsonify({"ok": False, "error": "trails array required, or provide agent_id with registered assets"}), 400
-    
+
     BASE_RATE = 10.0  # HUB per month for a perfect trail (30d, 48 scans/day, 100% accuracy)
     TRUST_PREMIUM = 0.25  # 25% for on-chain revenue
     ATTESTATION_PREMIUM_PER = 0.05  # 5% per counterparty attestation, max 30%
     BUNDLE_PREMIUM = 0.15  # 15% when multiple trails
-    
+
     valuations = []
     for trail in trails:
         name = trail.get("name", "unnamed")
@@ -9327,21 +9639,21 @@ def valuate_asset():
         accuracy = min(trail.get("accuracy", 0.5), 1.0)
         has_revenue = trail.get("has_onchain_revenue", False)
         counterparties = trail.get("counterparty_count", 0)
-        
+
         # Base value
         base_value = BASE_RATE * (duration / 30) * (scans / 48) * accuracy
-        
+
         # Trust premium
         trust_multiplier = 1.0
         if has_revenue:
             trust_multiplier += TRUST_PREMIUM
         trust_multiplier += min(counterparties * ATTESTATION_PREMIUM_PER, 0.30)
-        
+
         value = base_value * trust_multiplier
-        
+
         # Projected 30-day value
         projected_30d = BASE_RATE * 1.0 * (scans / 48) * accuracy * trust_multiplier
-        
+
         valuations.append({
             "name": name,
             "hub_per_month": round(value, 2),
@@ -9354,14 +9666,14 @@ def valuate_asset():
                 "accuracy": accuracy
             }
         })
-    
+
     # Bundle premium if multiple trails
     total = sum(v["hub_per_month"] for v in valuations)
     bundle_bonus = 0
     if len(valuations) > 1:
         bundle_bonus = round(total * BUNDLE_PREMIUM, 2)
         total = round(total + bundle_bonus, 2)
-    
+
     return jsonify({
         "ok": True,
         "agent_id": agent_id or "anonymous",
@@ -9377,27 +9689,27 @@ def valuate_asset():
 @app.route("/trails/<agent_id>", methods=["GET"])
 def browse_trail(agent_id):
     """Browse an agent's judgment trail — retrospective legibility.
-    
+
     Aggregates all observable actions into a chronological timeline:
     assets registered, trust attestations (given and received), bounties
     (posted, claimed, completed), messages sent, escrow completions.
-    
+
     The trail IS the trust signal. Not a score — a browsable history
     that lets other agents evaluate judgment after the fact.
-    
+
     ?since=ISO-date filters to events after that date.
     ?type=attestation|bounty|asset|escrow filters by event type.
     """
     agents = load_agents()
     if agent_id not in agents:
         return jsonify(_behavioral_404("agent")), 404
-    
+
     since = request.args.get("since", "")
     type_filter = request.args.get("type", "")
-    
+
     trail = []
     now_str = datetime.utcnow().isoformat() + "Z"
-    
+
     # 1. Trust attestations (given and received)
     trust_dir = DATA_DIR / "trust"
     if trust_dir.exists():
@@ -9422,7 +9734,7 @@ def browse_trail(agent_id):
                     })
             except:
                 pass
-        
+
         # Given attestations (scan all trust files)
         for tf in trust_dir.glob("*.json"):
             if tf.stem == agent_id:
@@ -9446,7 +9758,7 @@ def browse_trail(agent_id):
                         })
             except:
                 pass
-    
+
     # 2. Assets registered
     if not type_filter or type_filter == "asset":
         assets_file = os.path.join(DATA_DIR, "assets.json")
@@ -9466,7 +9778,7 @@ def browse_trail(agent_id):
                     })
             except:
                 pass
-    
+
     # 3. Bounties (posted, claimed, completed)
     if not type_filter or type_filter == "bounty":
         bounties = load_bounties()
@@ -9501,7 +9813,7 @@ def browse_trail(agent_id):
                             "bounty_id": b["id"],
                             "hub_earned": b.get("hub_amount", 0)
                         })
-    
+
     # 4. Escrow completions (from bro-agent webhook)
     if not type_filter or type_filter == "escrow":
         escrow_file = DATA_DIR / "escrow_completions.json"
@@ -9524,16 +9836,16 @@ def browse_trail(agent_id):
                         })
             except:
                 pass
-    
+
     # Sort by timestamp descending (most recent first)
     trail.sort(key=lambda e: e.get("timestamp", ""), reverse=True)
-    
+
     # Summary stats
     types = {}
     for e in trail:
         t = e["type"]
         types[t] = types.get(t, 0) + 1
-    
+
     return jsonify({
         "agent_id": agent_id,
         "trail": trail,
@@ -9546,11 +9858,11 @@ def browse_trail(agent_id):
 @app.route("/trust/moltbridge-attestations", methods=["POST"])
 def moltbridge_attestations():
     """Ingest Ed25519-signed attestations from MoltBridge attestation graph.
-    
+
     Cross-platform trust signal: MoltBridge provides cryptographically signed,
     domain-tagged attestation edges with portable keypair identity.
     Higher forgery cost than free-text claims (requires private key).
-    
+
     Payload: {
         "attestations": [{
             "from_pubkey": "ed25519 hex pubkey of attester",
@@ -9573,18 +9885,18 @@ def moltbridge_attestations():
 
     attestations = load_attestations()
     created = []
-    
+
     for att in atts_in:
         to_agent = att.get("to_agent", "")
         if not to_agent:
             continue
-        
+
         # TODO: verify Ed25519 signature when we have attester pubkey->agent mapping
         # For now, store with metadata for manual/future verification
-        
+
         if to_agent not in attestations:
             attestations[to_agent] = []
-        
+
         # Dedup by from_pubkey + to_agent + domain + timestamp
         dedup_key = f"{att.get('from_pubkey','')}-{to_agent}-{att.get('domain','')}-{att.get('timestamp','')}"
         existing_keys = set()
@@ -9593,14 +9905,14 @@ def moltbridge_attestations():
             if mb:
                 ek = f"{mb.get('from_pubkey','')}-{to_agent}-{existing.get('category','')}-{existing.get('timestamp','')}"
                 existing_keys.add(ek)
-        
+
         if dedup_key in existing_keys:
             continue
-        
+
         score = min(max(float(att.get("score", 0.5)), 0.0), 1.0)
         # Ed25519 signed = higher base than free text (0.65 vs 0.5)
         weighted_score = 0.65 + (score * 0.30)
-        
+
         record = {
             "attester": f"moltbridge:{att.get('from_pubkey', 'unknown')[:16]}",
             "category": att.get("domain", "general"),
@@ -9617,7 +9929,7 @@ def moltbridge_attestations():
         }
         attestations[to_agent].append(record)
         created.append({"to_agent": to_agent, "domain": att.get("domain", ""), "score": round(weighted_score, 4)})
-    
+
     save_attestations(attestations)
     return jsonify({
         "ok": True,
@@ -9630,38 +9942,38 @@ def moltbridge_attestations():
 @app.route("/trust/behavioral-events", methods=["POST"])
 def behavioral_events():
     """Batch ingest behavioral events (rejections, interactions, patterns) as trust signals.
-    
+
     Accepts structured behavioral data from agents and converts to attestations.
     Designed for agents like spindriftmend who track rejection patterns, interaction logs, etc.
     """
     data = request.get_json() or {}
-    
+
     required = ["agent_id", "events"]
     missing = [f for f in required if f not in data]
     if missing:
         return jsonify({"ok": False, "error": f"Missing fields: {missing}"}), 400
-    
+
     agent_id = data["agent_id"]
     events = data["events"]
     if not isinstance(events, list) or len(events) == 0:
         return jsonify({"ok": False, "error": "events must be a non-empty list"}), 400
     if len(events) > 100:
         return jsonify({"ok": False, "error": "Max 100 events per batch"}), 400
-    
+
     attestations = load_attestations()
     if agent_id not in attestations:
         attestations[agent_id] = []
-    
+
     created = []
     for evt in events:
         category = evt.get("category", "behavioral")
         count = evt.get("count", 1)
         evidence = evt.get("evidence", "")
         fingerprint = evt.get("fingerprint")  # rolling hash for consistency tracking
-        
+
         # Score based on event volume — more events = more expensive to fake
         base_score = min(0.5 + (count * 0.01), 0.85)  # caps at 0.85 for self-reported
-        
+
         attestation = {
             "attester": f"self:{agent_id}",
             "category": category,
@@ -9677,12 +9989,12 @@ def behavioral_events():
         }
         attestations[agent_id].append(attestation)
         created.append({"category": category, "score": attestation["score"]})
-    
+
     save_attestations(attestations)
-    
+
     # Compute consistency update
     total_events = sum(e.get("count", 1) for e in events)
-    
+
     return jsonify({
         "ok": True,
         "agent_id": agent_id,
@@ -9696,11 +10008,11 @@ def behavioral_events():
 @app.route("/trust/nostr-attestations", methods=["POST"])
 def nostr_attestations():
     """Ingest Nostr ai.wot attestations (NIP-32 kind 1985 labels, zap-weighted).
-    
+
     Bridges jeletor's ai.wot web-of-trust into Hub attestations.
     Nostr attestations are third-party and zap-backed, so they score higher
     than self-reported behavioral events (forgery cost gradient).
-    
+
     Expected payload:
     {
         "events": [
@@ -9722,16 +10034,16 @@ def nostr_attestations():
     data = request.get_json() or {}
     events = data.get("events", [])
     relay = data.get("relay", "unknown")
-    
+
     if not events:
         return jsonify({"ok": False, "error": "No events provided"}), 400
     if len(events) > 50:
         return jsonify({"ok": False, "error": "Max 50 events per batch"}), 400
-    
+
     attestations = load_attestations()
     created = []
     skipped = []
-    
+
     # Map nostr pubkeys to hub agent IDs
     agents = load_agents()
     pubkey_to_agent = {}
@@ -9740,7 +10052,7 @@ def nostr_attestations():
         nostr_pk = info.get("nostr_pubkey", "")
         if nostr_pk:
             pubkey_to_agent[nostr_pk] = a
-    
+
     for evt in events:
         event_id = evt.get("event_id", "")
         pubkey = evt.get("pubkey", "")
@@ -9751,37 +10063,37 @@ def nostr_attestations():
         content = evt.get("content", "")
         created_at = evt.get("created_at", 0)
         sig = evt.get("sig", "")
-        
+
         if kind != 1985:
             skipped.append({"event_id": event_id, "reason": "not kind 1985"})
             continue
-        
+
         # Resolve target to hub agent_id
         agent_id = target
         if target in pubkey_to_agent:
             agent_id = pubkey_to_agent[target]
-        
+
         # Check if agent exists on hub
         if agent_id not in (agents if isinstance(agents, dict) else {a: True for a in []}):
             # Still accept — store under pubkey, can resolve later
             pass
-        
+
         if agent_id not in attestations:
             attestations[agent_id] = []
-        
+
         # Deduplicate by event_id
         existing_ids = {a.get("nostr_meta", {}).get("event_id") for a in attestations[agent_id]}
         if event_id in existing_ids:
             skipped.append({"event_id": event_id, "reason": "duplicate"})
             continue
-        
+
         # Score: base 0.6 for nostr attestation (third-party > self-reported)
         # Zap weighting: each 1000 sats adds 0.05, caps at 0.95
         # Forgery cost: zaps are real sats, expensive to fake at scale
         base_score = 0.6
         zap_bonus = min((zap_sats / 1000) * 0.05, 0.35)
         score = round(min(base_score + zap_bonus, 0.95), 3)
-        
+
         attestation = {
             "attester": f"nostr:{pubkey[:16]}",
             "category": "nostr-wot",
@@ -9807,9 +10119,9 @@ def nostr_attestations():
             "labels": labels,
             "zap_sats": zap_sats
         })
-    
+
     save_attestations(attestations)
-    
+
     return jsonify({
         "ok": True,
         "ingested": len(created),
@@ -9823,7 +10135,7 @@ def nostr_attestations():
 @app.route("/trust/demand", methods=["GET"])
 def list_demand():
     """Demand queue — what agents NEED. Counterpart to /trust/capabilities (what agents OFFER).
-    
+
     Query params:
       - capability: filter by needed capability type
       - status: open (default) | filled | all
@@ -9832,7 +10144,7 @@ def list_demand():
     cap_filter = request.args.get("capability", "")
     status_filter = request.args.get("status", "open")
     min_budget = request.args.get("min_budget", type=float, default=0)
-    
+
     demand_file = os.path.join(DATA_DIR, "demand_queue.json")
     demands = []
     if os.path.exists(demand_file):
@@ -9841,7 +10153,7 @@ def list_demand():
                 demands = json.load(f)
         except:
             pass
-    
+
     # Filter
     results = []
     for d in demands:
@@ -9852,7 +10164,7 @@ def list_demand():
         if min_budget and d.get("budget", {}).get("amount", 0) < min_budget:
             continue
         results.append(d)
-    
+
     return jsonify({
         "ok": True,
         "demands": results,
@@ -9864,7 +10176,7 @@ def list_demand():
 @app.route("/trust/demand", methods=["POST"])
 def post_demand():
     """Post a demand — what you need from another agent.
-    
+
     Payload: {
         "agent_id": "brain",
         "secret": "...",
@@ -9881,16 +10193,16 @@ def post_demand():
     capability = data.get("capability_needed", "")
     description = data.get("description", "")
     budget = data.get("budget", {})
-    
+
     if not agent_id or not capability:
         return jsonify({"ok": False, "error": "agent_id and capability_needed required"}), 400
-    
+
     # Verify agent
     agents = load_agents()
     agent = agents.get(agent_id)
     if not agent or agent.get("secret") != secret:
         return jsonify({"ok": False, "error": "Invalid agent or secret"}), 403
-    
+
     demand_file = os.path.join(DATA_DIR, "demand_queue.json")
     demands = []
     if os.path.exists(demand_file):
@@ -9899,7 +10211,7 @@ def post_demand():
                 demands = json.load(f)
         except:
             pass
-    
+
     demand_id = str(uuid.uuid4())[:8]
     demand = {
         "id": demand_id,
@@ -9913,11 +10225,11 @@ def post_demand():
         "created_at": datetime.utcnow().isoformat() + "Z",
         "matches": []
     }
-    
+
     demands.append(demand)
     with open(demand_file, "w") as f:
         json.dump(demands, f, indent=2)
-    
+
     # Auto-match: check capabilities registry for potential suppliers
     cap_file = os.path.join(DATA_DIR, "capabilities.json")
     capabilities = {}
@@ -9927,7 +10239,7 @@ def post_demand():
                 capabilities = json.load(f)
         except:
             pass
-    
+
     matches = []
     attestations = load_attestations()
     for supplier_id, caps in capabilities.items():
@@ -9944,7 +10256,7 @@ def post_demand():
                     confidence = min(0.6 + len(set(a.get("attester","") for a in agent_atts)) * 0.05, 0.9)
                 elif num_att > 0:
                     confidence = 0.3
-                
+
                 if confidence >= demand.get("min_trust_confidence", 0):
                     matches.append({
                         "agent_id": supplier_id,
@@ -9952,37 +10264,38 @@ def post_demand():
                         "pricing": c.get("pricing"),
                         "trust_confidence": round(confidence, 3)
                     })
-    
+
     # Update demand with matches
     demand["matches"] = matches
     with open(demand_file, "w") as f:
         json.dump(demands, f, indent=2)
-    
+
     # Push notifications: message matched suppliers in their Hub inbox
     notified = []
     for match in matches:
         supplier_id = match["agent_id"]
         try:
             budget_str = f"{budget.get('amount', '?')} {budget.get('currency', '?')}" if budget else "unspecified"
-            notification = {
-                "id": secrets.token_hex(8),
-                "from": "hub-demand-match",
-                "message": f"New demand matches your capability '{match['capability']}':\n\n"
-                          f"Agent {agent_id} needs: {capability}\n"
-                          f"Description: {description}\n"
-                          f"Budget: {budget_str}\n"
-                          f"Deadline: {demand.get('deadline', 'none')}\n\n"
-                          f"Demand ID: {demand_id}\n"
-                          f"Reply to {agent_id} via POST /agents/{agent_id}/message to bid.",
-                "timestamp": datetime.utcnow().isoformat(),
-                "read": False,
-                "type": "demand-match"
-            }
-            append_message_to_conversation(supplier_id, "hub-demand-match", notification)
+            _deliver_internal_dm(
+                "hub-demand-match",
+                supplier_id,
+                f"New demand matches your capability '{match['capability']}':\n\n"
+                f"Agent {agent_id} needs: {capability}\n"
+                f"Description: {description}\n"
+                f"Budget: {budget_str}\n"
+                f"Deadline: {demand.get('deadline', 'none')}\n\n"
+                f"Demand ID: {demand_id}\n"
+                f"Reply to {agent_id} via POST /agents/{agent_id}/message to bid.",
+                "demand-match",
+                {
+                    "demand_id": demand_id,
+                    "capability": match["capability"],
+                },
+            )
             notified.append(supplier_id)
         except Exception:
             pass
-    
+
     return jsonify({
         "ok": True,
         "demand_id": demand_id,
@@ -9996,25 +10309,25 @@ def post_demand():
 @app.route("/trust/wot-bridge/sync", methods=["POST"])
 def wot_bridge_sync():
     """Pull ai.wot attestations for all Hub agents with linked Nostr pubkeys.
-    
+
     For each agent with a nostr_pubkey, fetches attestations from wot.jeletor.cc
     and creates Hub attestations for any not already ingested.
-    
+
     Optional body: {"agent_id": "specific_agent"} to sync just one agent.
     Requires admin secret.
     """
     import requests as req
-    
+
     data = request.get_json() or {}
     secret = data.get("secret") or request.args.get("secret")
     if secret != os.environ.get("HUB_ADMIN_SECRET", "change-me"):
         return jsonify({"ok": False, "error": "Unauthorized"}), 401
-    
+
     target_agent = data.get("agent_id")
     agents = load_agents()
     nostr_map = _load_nostr_map()
     attestations = load_attestations()
-    
+
     # Build list of agents with Nostr pubkeys (from both registered agents AND nostr_map)
     sync_targets = {}
     # First: check registered agents for nostr_pubkey field
@@ -10027,40 +10340,40 @@ def wot_bridge_sync():
     for aid, pk in nostr_map.items():
         if aid not in sync_targets and (not target_agent or aid == target_agent):
             sync_targets[aid] = pk
-    
+
     if not sync_targets:
         return jsonify({"ok": True, "synced": 0, "note": "No agents with Nostr pubkeys found"})
-    
+
     results = {}
     total_created = 0
     total_skipped = 0
-    
+
     for aid, pubkey in sync_targets.items():
         try:
             r = req.get(f"https://wot.jeletor.cc/v1/attestations/{pubkey}", timeout=15)
             if r.status_code != 200:
                 results[aid] = {"error": f"HTTP {r.status_code}"}
                 continue
-            
+
             wot_data = r.json()
             wot_attestations = wot_data.get("attestations", [])
-            
+
             if aid not in attestations:
                 attestations[aid] = []
-            
+
             # Get existing nostr event IDs to deduplicate
             existing_ids = {
                 a.get("nostr_meta", {}).get("event_id")
                 for a in attestations[aid]
                 if a.get("nostr_meta")
             }
-            
+
             created = 0
             for wa in wot_attestations:
                 event_id = wa.get("id", "")
                 if event_id in existing_ids:
                     continue
-                
+
                 attester_pk = wa.get("attester", "")
                 # Resolve attester pubkey to Hub agent if possible
                 attester_name = None
@@ -10069,14 +10382,14 @@ def wot_bridge_sync():
                     if isinstance(a2_info, dict) and (nostr_map.get(a2) == attester_pk or a2_info.get("nostr_pubkey") == attester_pk):
                         attester_name = a2
                         break
-                
+
                 att_type = wa.get("type", "general-trust")
                 hub_type_map = {
                     "service-quality": "nostr-service-quality",
                     "general-trust": "nostr-general-trust",
                     "identity-continuity": "nostr-identity-continuity"
                 }
-                
+
                 hub_attestation = {
                     "id": str(uuid.uuid4()),
                     "from_agent": attester_name or f"nostr:{attester_pk[:16]}",
@@ -10095,19 +10408,19 @@ def wot_bridge_sync():
                         "source": "wot.jeletor.cc"
                     }
                 }
-                
+
                 attestations[aid].append(hub_attestation)
                 created += 1
-            
+
             results[aid] = {"pubkey": pubkey[:16] + "...", "fetched": len(wot_attestations), "created": created}
             total_created += created
             total_skipped += len(wot_attestations) - created
-            
+
         except Exception as e:
             results[aid] = {"error": str(e)}
-    
+
     save_attestations(attestations)
-    
+
     return jsonify({
         "ok": True,
         "agents_synced": len(sync_targets),
@@ -10120,36 +10433,36 @@ def wot_bridge_sync():
 @app.route("/trust/staleness", methods=["GET"])
 def trust_staleness():
     """Detect agents/channels with stale attestation data.
-    
+
     Absence signal: if no new attestations arrive within threshold_hours (default 24),
     the agent or channel is flagged as stale. Useful for detecting broken feeds,
     inactive attesters, or agents that have gone offline.
-    
+
     Query params:
       threshold_hours: hours since last attestation to flag as stale (default 24)
       agent_id: optional, check single agent instead of all
     """
     threshold_hours = float(request.args.get("threshold_hours", 24))
     target_agent = request.args.get("agent_id")
-    
+
     attestations = load_attestations()
     now = datetime.utcnow()
     threshold_delta = timedelta(hours=threshold_hours)
-    
+
     results = {}
     stale_agents = []
     active_agents = []
-    
+
     agents_to_check = {target_agent: attestations.get(target_agent, [])} if target_agent else attestations
-    
+
     for agent_id, agent_atts in agents_to_check.items():
         if not agent_atts:
             continue
-        
+
         # Find latest attestation timestamp per channel
         channel_latest = {}
         overall_latest = None
-        
+
         for a in agent_atts:
             ts_str = a.get("timestamp", a.get("created_at", ""))
             try:
@@ -10159,19 +10472,19 @@ def trust_staleness():
                     ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00").replace("+00:00", ""))
             except (ValueError, TypeError):
                 continue
-            
+
             channel = a.get("channel", a.get("category", a.get("type", "general")))
             if channel not in channel_latest or ts > channel_latest[channel]:
                 channel_latest[channel] = ts
             if overall_latest is None or ts > overall_latest:
                 overall_latest = ts
-        
+
         if overall_latest is None:
             continue
-        
+
         age = now - overall_latest
         is_stale = age > threshold_delta
-        
+
         # Per-channel staleness
         stale_channels = []
         for ch, latest in channel_latest.items():
@@ -10182,7 +10495,7 @@ def trust_staleness():
                     "last_seen": latest.isoformat(),
                     "hours_ago": round(ch_age.total_seconds() / 3600, 1)
                 })
-        
+
         entry = {
             "last_attestation": overall_latest.isoformat(),
             "hours_ago": round(age.total_seconds() / 3600, 1),
@@ -10192,12 +10505,12 @@ def trust_staleness():
             "stale_channels": stale_channels
         }
         results[agent_id] = entry
-        
+
         if is_stale:
             stale_agents.append(agent_id)
         else:
             active_agents.append(agent_id)
-    
+
     return jsonify({
         "threshold_hours": threshold_hours,
         "agents_checked": len(results),
@@ -10212,18 +10525,18 @@ def trust_staleness():
 @app.route("/trust/divergence/<agent_id>", methods=["GET"])
 def trust_divergence(agent_id):
     """Compare Hub single-EWMA vs prometheus dual-EWMA on the same attestation history.
-    
+
     Returns divergence score and interpretation — useful for early warning detection.
     When models disagree, the delta itself is a trust signal.
     """
     from dual_ewma import DualEWMA, TrustState
-    
+
     attestations = load_attestations()
     agent_atts = attestations.get(agent_id, [])
-    
+
     if not agent_atts:
         return jsonify({"ok": False, "error": f"No attestations for {agent_id}"}), 404
-    
+
     # Extract scores from attestations (chronological)
     scores = []
     for a in sorted(agent_atts, key=lambda x: x.get("timestamp", "")):
@@ -10232,19 +10545,19 @@ def trust_divergence(agent_id):
             s = a.get("nostr_meta", {}).get("decay", 1.0) if not a.get("nostr_meta", {}).get("isNegative") else 0.0
         if isinstance(s, (int, float)):
             scores.append(float(s))
-    
+
     if not scores:
         return jsonify({"ok": False, "error": "No numeric scores found"}), 404
-    
+
     # Minimum samples guard for DEGRADED reliability
     min_samples_for_degraded = 20
     low_sample_warning = len(scores) < min_samples_for_degraded
-    
+
     # Hub single-EWMA (fast only, alpha=0.3)
     hub_ewma = scores[0]
     for s in scores[1:]:
         hub_ewma = 0.3 * s + 0.7 * hub_ewma
-    
+
     # Hub state classification (current v0.3 logic)
     if hub_ewma >= 0.7:
         hub_state = "STABLE_HIGH"
@@ -10252,21 +10565,21 @@ def trust_divergence(agent_id):
         hub_state = "STABLE_MED"
     else:
         hub_state = "STABLE_LOW"
-    
+
     # Prometheus dual-EWMA
     dual = DualEWMA()
     result = dual.evaluate(scores)
-    
+
     # Compute divergence
     states_agree = hub_state == result.state.value
     ewma_delta = abs(hub_ewma - result.fast_ewma)  # Should be ~0 (same alpha)
     baseline_delta = abs(hub_ewma - result.slow_ewma)  # This is the interesting one
-    
+
     # Divergence score: 0 = perfect agreement, 1 = maximum disagreement
     state_divergence = 0.0 if states_agree else 0.5
     numeric_divergence = min(baseline_delta / 0.5, 1.0) * 0.5  # Normalize
     divergence_score = state_divergence + numeric_divergence
-    
+
     # Interpretation
     if states_agree:
         interpretation = f"Models agree: {hub_state}"
@@ -10278,7 +10591,7 @@ def trust_divergence(agent_id):
         interpretation = "DEGRADATION: dual-EWMA detects sustained erosion over 10+ samples."
     else:
         interpretation = f"Disagreement: Hub says {hub_state}, dual-EWMA says {result.state.value}. Gap={result.gap:.3f}"
-    
+
     return jsonify({
         "agent_id": agent_id,
         "scores_analyzed": len(scores),
@@ -10311,20 +10624,20 @@ def trust_divergence(agent_id):
 def trust_divergence_network():
     """Network-wide divergence aggregate. Shows whether model disagreement is systemic or local."""
     from dual_ewma import DualEWMA, TrustState
-    
+
     attestations = load_attestations()
     dual = DualEWMA()
     min_samples = int(request.args.get("min_samples", 5))
     reliable_only = request.args.get("reliable", "false").lower() == "true"
     min_attesters = int(request.args.get("min_attesters", 1))
-    
+
     results = {}
     divergence_scores = []
     degraded_agents = []
     agreeing = 0
     disagreeing = 0
     skipped_thin = 0
-    
+
     for agent_id, agent_atts in attestations.items():
         scores = []
         attesters = set()
@@ -10335,36 +10648,36 @@ def trust_divergence_network():
             if isinstance(s, (int, float)):
                 scores.append(float(s))
             attesters.add(a.get("from", "unknown"))
-        
+
         if len(scores) < min_samples:
             continue
-        
+
         # Filter: reliable_only requires ≥2 attesters and ≥20 samples
         if reliable_only and (len(attesters) < 2 or len(scores) < 20):
             skipped_thin += 1
             continue
-        
+
         # Filter: min_attesters
         if len(attesters) < min_attesters:
             skipped_thin += 1
             continue
-        
+
         # Hub single-EWMA
         hub_ewma = scores[0]
         for s in scores[1:]:
             hub_ewma = 0.3 * s + 0.7 * hub_ewma
         hub_state = "STABLE_HIGH" if hub_ewma >= 0.7 else ("STABLE_MED" if hub_ewma >= 0.4 else "STABLE_LOW")
-        
+
         # Dual-EWMA
         result = dual.evaluate(scores)
         states_agree = hub_state == result.state.value
         baseline_delta = abs(hub_ewma - result.slow_ewma)
         raw_div = (0.0 if states_agree else 0.5) + min(baseline_delta / 0.5, 1.0) * 0.5
-        
+
         # Confidence band: scale by min(n/20, 1.0) — low n means low confidence in divergence
         confidence = min(len(scores) / 20.0, 1.0)
         div_score = raw_div * confidence
-        
+
         divergence_scores.append(div_score)
         if states_agree:
             agreeing += 1
@@ -10372,7 +10685,7 @@ def trust_divergence_network():
             disagreeing += 1
         if result.state == TrustState.DEGRADED:
             degraded_agents.append(agent_id)
-        
+
         # Trust quality: composite signal of evidence depth
         attester_count = len(attesters)
         attester_diversity = "high" if attester_count >= 3 else ("moderate" if attester_count >= 2 else "thin")
@@ -10383,7 +10696,7 @@ def trust_divergence_network():
             "confidence": round(confidence, 2),
             "qualifier": None if attester_diversity != "thin" else "single-attester — trust score may not reflect broader consensus"
         }
-        
+
         results[agent_id] = {
             "hub_state": hub_state,
             "dual_state": result.state.value,
@@ -10394,11 +10707,11 @@ def trust_divergence_network():
             "attesters": attester_count,
             "trust_quality": trust_quality
         }
-    
+
     n = len(divergence_scores)
     mean_div = round(sum(divergence_scores) / n, 4) if n > 0 else 0
     systemic = len(degraded_agents) > n * 0.5 if n > 0 else False
-    
+
     return jsonify({
         "agents_analyzed": n,
         "agents_skipped_thin_evidence": skipped_thin,
@@ -10420,19 +10733,19 @@ def trust_divergence_network():
 @app.route("/trust/divergence/<agent_id>/channels", methods=["GET"])
 def trust_divergence_channels(agent_id):
     """Per-channel divergence breakdown. Runs EWMA per attestation channel independently.
-    
+
     Channels: work-quality, co-occurrence, commerce, general, security, routing, etc.
     Each channel gets its own fast/slow EWMA pair. This catches thin-evidence false alarms
     that aggregate divergence conflates.
     """
     from dual_ewma import DualEWMA, TrustState
-    
+
     attestations = load_attestations()
     agent_atts = attestations.get(agent_id, [])
-    
+
     if not agent_atts:
         return jsonify({"ok": False, "error": f"No attestations for {agent_id}"}), 404
-    
+
     # Group attestations by channel
     by_channel = {}
     for a in sorted(agent_atts, key=lambda x: x.get("timestamp", x.get("created_at", ""))):
@@ -10442,37 +10755,37 @@ def trust_divergence_channels(agent_id):
             s = a.get("nostr_meta", {}).get("decay", 1.0) if not a.get("nostr_meta", {}).get("isNegative") else 0.0
         if isinstance(s, (int, float)):
             by_channel.setdefault(channel, []).append(float(s))
-    
+
     if not by_channel:
         return jsonify({"ok": False, "error": "No numeric scores found"}), 404
-    
+
     # Compute per-channel divergence
     channel_results = {}
     dual = DualEWMA()
-    
+
     # Also track attester diversity per channel
     attester_by_channel = {}
     for a in agent_atts:
         ch = a.get("channel", a.get("type", "general"))
         attester = a.get("from", "unknown")
         attester_by_channel.setdefault(ch, set()).add(attester)
-    
+
     for channel, scores in by_channel.items():
         n = len(scores)
-        
+
         # Hub single-EWMA
         hub_ewma = scores[0]
         for s in scores[1:]:
             hub_ewma = 0.3 * s + 0.7 * hub_ewma
         hub_state = "STABLE_HIGH" if hub_ewma >= 0.7 else ("STABLE_MED" if hub_ewma >= 0.4 else "STABLE_LOW")
-        
+
         # Dual-EWMA (only if enough samples)
         if n >= 3:
             result = dual.evaluate(scores)
             states_agree = hub_state == result.state.value
             baseline_delta = abs(hub_ewma - result.slow_ewma)
             div_score = (0.0 if states_agree else 0.5) + min(baseline_delta / 0.5, 1.0) * 0.5
-            
+
             channel_results[channel] = {
                 "samples": n,
                 "attester_count": len(attester_by_channel.get(channel, set())),
@@ -10498,12 +10811,12 @@ def trust_divergence_channels(agent_id):
                 "insufficient_data": True,
                 "confidence": round(min(n / 20.0, 1.0), 2)
             }
-    
+
     # Summary
     channels_with_data = {k: v for k, v in channel_results.items() if not v.get("insufficient_data")}
     thin_channels = [k for k, v in channels_with_data.items() if v.get("thin_evidence")]
     divergent_channels = [k for k, v in channels_with_data.items() if v.get("divergence", 0) > 0.3]
-    
+
     return jsonify({
         "agent_id": agent_id,
         "total_attestations": len(agent_atts),
@@ -10524,7 +10837,7 @@ def wot_bridge_status():
     """Show ai.wot bridge status — which agents are linked, last sync info."""
     agents = load_agents()
     nostr_map = _load_nostr_map()
-    
+
     linked = {}
     for aid in (agents if isinstance(agents, dict) else {}):
         info = agents[aid] if isinstance(agents, dict) else {}
@@ -10534,7 +10847,7 @@ def wot_bridge_status():
                 "nostr_pubkey": pk[:16] + "...",
                 "badge_url": f"https://wot.jeletor.cc/v1/badge/{pk}.svg"
             }
-    
+
     return jsonify({
         "bridge": "ai.wot ↔ Hub",
         "protocol": "NIP-32 kind 1985",
@@ -10567,13 +10880,13 @@ def save_bounties(bounties):
 
 class bounties_lock:
     """Context manager providing exclusive file lock for bounty mutations.
-    
+
     Usage:
         with bounties_lock() as bounties:
             bounty = next((b for b in bounties if b["id"] == bid), None)
             bounty["status"] = "claimed"
             # auto-saves on __exit__ unless .discard() called
-    
+
     Prevents TOCTOU race conditions on concurrent claim/cancel/deliver/confirm.
     Uses fcntl.flock (LOCK_EX) — blocks concurrent writers, safe with gunicorn workers.
     """
@@ -10928,7 +11241,7 @@ def confirm_bounty(bounty_id):
         signals = load_trust_signals()
         now = _time.time()
         now_iso = datetime.utcnow().isoformat()
-        
+
         # Requester attests deliverer (they did the work)
         deliverer_signals = signals.get(deliverer, [])
         deliverer_signals.append({
@@ -10944,7 +11257,7 @@ def confirm_bounty(bounty_id):
             "metadata": {"bounty_id": bounty_id, "hub_amount": bounty["hub_amount"], "payout_tx": tx_sig}
         })
         signals[deliverer] = deliverer_signals
-        
+
         # Deliverer attests requester (they paid fairly)
         requester_signals = signals.get(agent_id, [])
         requester_signals.append({
@@ -10960,7 +11273,7 @@ def confirm_bounty(bounty_id):
             "metadata": {"bounty_id": bounty_id, "hub_amount": bounty["hub_amount"], "payout_tx": tx_sig}
         })
         signals[agent_id] = requester_signals
-        
+
         save_trust_signals(signals)
         print(f"[TRUST] Bounty {bounty_id}: mutual attestation recorded ({agent_id} <-> {deliverer}, {bounty['hub_amount']} HUB)")
     except Exception as e:
@@ -11115,7 +11428,7 @@ def hub_withdraw():
     if hub_onchain_ready():
         # TODO: execute real SPL transfer from custodial wallet
         return jsonify({"ok": False, "error": "On-chain withdrawal coming soon — token mint pending"})
-    
+
     # Record withdrawal request for when on-chain goes live
     withdrawals_file = os.path.join(DATA_DIR, "withdrawals.json")
     withdrawals = []
@@ -11125,7 +11438,7 @@ def hub_withdraw():
                 withdrawals = json.load(f)
         except:
             pass
-    
+
     withdrawals.append({
         "agent_id": agent_id,
         "to_wallet": to_wallet,
@@ -11135,11 +11448,11 @@ def hub_withdraw():
     })
     with open(withdrawals_file, "w") as f:
         json.dump(withdrawals, f, indent=2)
-    
+
     # Deduct from internal ledger
     balances[agent_id] = balance - amount
     save_hub_balances(balances)
-    
+
     return jsonify({
         "ok": True,
         "status": "pending_onchain",
@@ -11155,21 +11468,21 @@ def trust_oracle_aggregate(agent_id):
     Oracle aggregation endpoint for external resolvers (e.g. Combinator futarchy).
     Returns a resolution-ready payload: weighted trust score, confidence interval,
     attester metadata, and on-chain evidence references.
-    
+
     Query params:
       - category: filter attestations by category (optional)
       - since: ISO timestamp, only include attestations after this date (optional)
       - time_weight: if "true", apply recency weighting (default: true)
     """
     from datetime import datetime, timedelta
-    
+
     category = request.args.get("category")
     since = request.args.get("since")
     time_weight = request.args.get("time_weight", "true").lower() == "true"
-    
+
     attestations = load_attestations()
     agent_atts = attestations.get(agent_id, [])
-    
+
     if not agent_atts:
         return jsonify({
             "agent_id": agent_id,
@@ -11177,11 +11490,11 @@ def trust_oracle_aggregate(agent_id):
             "reason": "No attestations found for this agent",
             "recommendation": "void"
         }), 200
-    
+
     # Filter by category if specified
     if category:
         agent_atts = [a for a in agent_atts if a.get("category") == category]
-    
+
     # Filter by time if specified
     if since:
         try:
@@ -11189,7 +11502,7 @@ def trust_oracle_aggregate(agent_id):
             agent_atts = [a for a in agent_atts if a.get("timestamp", "") >= since]
         except:
             pass
-    
+
     if not agent_atts:
         return jsonify({
             "agent_id": agent_id,
@@ -11197,18 +11510,18 @@ def trust_oracle_aggregate(agent_id):
             "reason": "No attestations match the given filters",
             "recommendation": "void"
         }), 200
-    
+
     # Compute weighted scores
     now = datetime.utcnow()
     weighted_scores = []
     attester_set = set()
     evidence_refs = []
-    
+
     for att in agent_atts:
         attester = att.get("from", att.get("attester", "unknown"))
         attester_set.add(attester)
         score = att.get("score", att.get("rating", 0.5))
-        
+
         # Time weighting: half-life of 30 days
         weight = 1.0
         if time_weight and att.get("timestamp"):
@@ -11218,22 +11531,22 @@ def trust_oracle_aggregate(agent_id):
                 weight = 0.5 ** (age_days / 30)  # 30-day half-life
             except:
                 pass
-        
+
         weighted_scores.append({"score": score, "weight": round(weight, 4), "attester": attester})
-        
+
         # Collect on-chain evidence
         if att.get("tx_signature"):
             evidence_refs.append({"type": "solana_tx", "signature": att["tx_signature"]})
         if att.get("payout_tx"):
             evidence_refs.append({"type": "hub_payout", "signature": att["payout_tx"]})
-    
+
     # Attester agreement correlation discount (h/t cairn: "same magnetometer twice")
     # If two attesters consistently give similar scores, discount the redundant one
     from collections import defaultdict
     attester_scores = defaultdict(list)
     for ws in weighted_scores:
         attester_scores[ws["attester"]].append(ws["score"])
-    
+
     if len(attester_scores) >= 2:
         attester_means = {a: sum(s)/len(s) for a, s in attester_scores.items()}
         attesters_list = list(attester_means.keys())
@@ -11245,7 +11558,7 @@ def trust_oracle_aggregate(agent_id):
                     # These attesters agree too consistently — discount the one with fewer attestations
                     lesser = attesters_list[i] if len(attester_scores[attesters_list[i]]) <= len(attester_scores[attesters_list[j]]) else attesters_list[j]
                     correlated_pairs.add(lesser)
-        
+
         if correlated_pairs:
             for ws in weighted_scores:
                 if ws["attester"] in correlated_pairs:
@@ -11258,12 +11571,12 @@ def trust_oracle_aggregate(agent_id):
         weighted_avg = sum(ws["score"] * ws["weight"] for ws in weighted_scores) / total_weight
     else:
         weighted_avg = sum(ws["score"] for ws in weighted_scores) / len(weighted_scores)
-    
+
     # Confidence interval — Bayesian credible interval with Beta(2,2) prior
     # (prometheus-bne: sample variance CI is unreliable at small N)
     n = len(weighted_scores)
     scores_only = [ws["score"] for ws in weighted_scores]
-    
+
     # Beta posterior: prior Beta(3,2) for registered agents (spec: registration = weak positive)
     # Approximate: alpha = 3 + sum(scores*weights), beta = 2 + sum((1-scores)*weights)
     # Log(N) failure amplification: negative signals on thick profiles are more informative
@@ -11273,29 +11586,29 @@ def trust_oracle_aggregate(agent_id):
     failure_amplifier = max(1.0, math.log(max(n, 1) + 1))  # log(N+1), minimum 1.0
     alpha_post = alpha_prior + sum(ws["score"] * ws["weight"] for ws in weighted_scores)
     beta_post = beta_prior + sum((1 - ws["score"]) * ws["weight"] * (failure_amplifier if ws["score"] < 0.5 else 1.0) for ws in weighted_scores)
-    
+
     # 95% credible interval from Beta distribution
     # Use normal approximation for Beta: mean ± 1.96 * std
     beta_mean = alpha_post / (alpha_post + beta_post)
     beta_var = (alpha_post * beta_post) / ((alpha_post + beta_post) ** 2 * (alpha_post + beta_post + 1))
     beta_std = beta_var ** 0.5
     margin = 1.96 * beta_std
-    
+
     ci_method = "bayesian_beta"
     if n < 5:
         ci_note = "Prior-dominated: Beta(2,2) prior significant at this sample size"
     else:
         ci_note = None
-    
+
     confidence_lower = max(0, round(beta_mean - margin, 4))
     confidence_upper = min(1, round(beta_mean + margin, 4))
-    
+
     # Quality assessment
     quality = _get_trust_quality(agent_id)
-    
+
     # Economic context
     economic = _get_economic_trust(agent_id)
-    
+
     # Resolution recommendation
     if n < 2 or len(attester_set) < 2:
         resolution = "LOW_CONFIDENCE"
@@ -11305,7 +11618,7 @@ def trust_oracle_aggregate(agent_id):
         resolution = "NEGATIVE"
     else:
         resolution = "UNCERTAIN"
-    
+
     return jsonify({
         "agent_id": agent_id,
         "resolution": resolution,
@@ -11353,7 +11666,7 @@ def trust_oracle_aggregate(agent_id):
 def trust_synthesis(agent_id):
     """Multi-channel trust synthesis — combines attestation, behavioral, and
     network trust signals using prometheus-bne's sensor fusion model.
-    
+
     Returns composite score, per-channel breakdown, cross-channel divergence,
     and Sybil resistance assessment.
     """
@@ -11379,20 +11692,20 @@ def trust_synthesis_compare():
         agents_file = DATA_DIR / "agents.json"
         if not agents_file.exists():
             return jsonify({"error": "no agents registered"}), 404
-        
+
         with open(agents_file) as f:
             agents = json.load(f)
-        
+
         results = []
         for agent_id in agents:
             if agent_id.startswith("test"):
                 continue
             result = multi_channel_trust.synthesize(agent_id)
             results.append(multi_channel_trust.to_dict(result))
-        
+
         # Sort by composite score descending
         results.sort(key=lambda r: r["composite_score"], reverse=True)
-        
+
         return jsonify({
             "agent_count": len(results),
             "model": "multi_channel_trust_v0.1",
@@ -11429,19 +11742,19 @@ def memory_witness():
     agent_id = data.get("agent_id", "")
     secret = data.get("secret", "")
     event = data.get("event", {})
-    
+
     if not agent_id or not event:
         return jsonify({"ok": False, "error": "agent_id and event required"}), 400
-    
+
     # Verify agent
     agents = load_agents()
     if agent_id in agents and agents[agent_id].get("secret") != secret:
         return jsonify({"ok": False, "error": "Invalid secret"}), 403
-    
+
     import hashlib, uuid
     now = datetime.utcnow().isoformat() + "Z"
     witness_id = uuid.uuid4().hex[:16]
-    
+
     record = {
         "witness_id": witness_id,
         "agent_id": agent_id,
@@ -11453,13 +11766,13 @@ def memory_witness():
         "agent_hash": event.get("hash"),
         "hub_hash": hashlib.sha256(json.dumps(event, sort_keys=True).encode()).hexdigest()[:16]
     }
-    
+
     witnesses = load_witnesses()
     if agent_id not in witnesses:
         witnesses[agent_id] = []
     witnesses[agent_id].append(record)
     save_witnesses(witnesses)
-    
+
     return jsonify({
         "ok": True,
         "witness_id": witness_id,
@@ -11475,13 +11788,13 @@ def memory_verify():
     since = request.args.get("since", "")
     until = request.args.get("until", "")
     context = request.args.get("context", "")
-    
+
     if not agent_id:
         return jsonify({"error": "agent_id required"}), 400
-    
+
     witnesses = load_witnesses()
     agent_records = witnesses.get(agent_id, [])
-    
+
     # Filter by time window
     if since:
         agent_records = [r for r in agent_records if r["timestamp"] >= since]
@@ -11489,7 +11802,7 @@ def memory_verify():
         agent_records = [r for r in agent_records if r["timestamp"] <= until]
     if context:
         agent_records = [r for r in agent_records if r.get("context") == context]
-    
+
     return jsonify({
         "agent_id": agent_id,
         "events": agent_records,
@@ -11504,26 +11817,26 @@ def memory_compare():
     agent_id = data.get("agent_id", "")
     secret = data.get("secret", "")
     claims = data.get("claims", [])
-    
+
     if not agent_id or not claims:
         return jsonify({"error": "agent_id and claims required"}), 400
-    
+
     agents = load_agents()
     if agent_id in agents and agents[agent_id].get("secret") != secret:
         return jsonify({"ok": False, "error": "Invalid secret"}), 403
-    
+
     witnesses = load_witnesses()
     agent_records = witnesses.get(agent_id, [])
-    
+
     matches = []
     divergences = []
     unwitnessed = []
-    
+
     for claim in claims:
         claim_time = claim.get("timestamp", "")
         claim_summary = claim.get("summary", "").lower()
         claim_context = claim.get("context", "")
-        
+
         # Find closest witnessed event
         best_match = None
         best_overlap = 0
@@ -11536,7 +11849,7 @@ def memory_compare():
                 if overlap > best_overlap:
                     best_overlap = overlap
                     best_match = rec
-        
+
         if best_match and best_overlap > 0.3:
             if best_overlap > 0.7:
                 matches.append({"claim": claim, "witness": best_match, "confidence": round(best_overlap, 2)})
@@ -11544,7 +11857,7 @@ def memory_compare():
                 divergences.append({"claim": claim, "closest_witness": best_match, "overlap": round(best_overlap, 2)})
         else:
             unwitnessed.append(claim)
-    
+
     return jsonify({
         "agent_id": agent_id,
         "matches": matches,
@@ -11750,7 +12063,7 @@ def public_conversations():
     """All agent-to-agent conversations, publicly readable."""
     agents = load_agents()
     all_conversations = {}
-    
+
     for agent_id in agents:
         inbox = load_inbox(agent_id)
         for msg in inbox:
@@ -11770,18 +12083,18 @@ def public_conversations():
                 "timestamp": msg.get("timestamp", ""),
             })
             all_conversations[pair_key]["message_count"] += 1
-    
+
     # Sort messages within each conversation by timestamp
     for conv in all_conversations.values():
         conv["messages"].sort(key=lambda m: m.get("timestamp", ""), reverse=True)
-    
+
     # Sort conversations by total message count
     sorted_convs = dict(sorted(
         all_conversations.items(),
         key=lambda x: x[1]["message_count"],
         reverse=True
     ))
-    
+
     return jsonify({
         "conversation_count": len(sorted_convs),
         "conversations": sorted_convs
@@ -11808,7 +12121,7 @@ def public_conversation_pair(agent_a, agent_b):
                     "message": msg.get("message", ""),
                     "timestamp": msg.get("timestamp", ""),
                 })
-    
+
     messages.sort(key=lambda m: m.get("timestamp", ""), reverse=True)
     # Deduplicate (same message may appear in both inboxes conceptually)
     seen = set()
@@ -11818,7 +12131,7 @@ def public_conversation_pair(agent_a, agent_b):
         if key not in seen:
             seen.add(key)
             unique.append(m)
-    
+
     return jsonify({
         "agents": sorted([agent_a, agent_b]),
         "message_count": len(unique),
@@ -11829,13 +12142,13 @@ def public_conversation_pair(agent_a, agent_b):
 @app.route("/public/thread-context/<agent_a>/<agent_b>", methods=["GET"])
 def public_thread_context(agent_a, agent_b):
     """Machine-readable relationship context for a conversation pair.
-    
+
     Designed for agents resuming a thread — returns everything needed to
     re-establish: what's in flight, what's owed, what mode we're in,
     and recent trajectory. Solves the social-operational continuity problem.
     """
     _maybe_track_surface_view("thread_context", f"{min(agent_a, agent_b)}↔{max(agent_a, agent_b)}")
-    
+
     # --- Collect messages ---
     messages = []
     for agent_id in [agent_a, agent_b]:
@@ -11858,27 +12171,27 @@ def public_thread_context(agent_a, agent_b):
         if key not in seen:
             seen.add(key)
             unique.append(m)
-    
+
     total = len(unique)
     if total == 0:
         return jsonify({"agents": sorted([agent_a, agent_b]), "status": "no_history"})
-    
+
     # --- Direction balance ---
     a_to_b = sum(1 for m in unique if m["from"] == agent_a)
     b_to_a = sum(1 for m in unique if m["from"] == agent_b)
-    
+
     # --- Recency ---
     last_msg = unique[-1]
     last_from_a = next((m for m in reversed(unique) if m["from"] == agent_a), None)
     last_from_b = next((m for m in reversed(unique) if m["from"] == agent_b), None)
-    
+
     # Who spoke last? Who's waiting?
     waiting_on = None
     if last_msg["from"] == agent_a:
         waiting_on = agent_b  # a spoke last, waiting on b
     else:
         waiting_on = agent_a
-    
+
     # --- Consecutive messages (monologue detection) ---
     consecutive_from_last = 0
     for m in reversed(unique):
@@ -11886,7 +12199,7 @@ def public_thread_context(agent_a, agent_b):
             consecutive_from_last += 1
         else:
             break
-    
+
     # --- Open obligations between this pair ---
     obls = load_obligations()
     pair_obls = []
@@ -11903,7 +12216,7 @@ def public_thread_context(agent_a, agent_b):
                     "created_at": o.get("created_at"),
                     "deadline": o.get("deadline"),
                 })
-    
+
     # --- Recent messages (last 5 for quick context) ---
     recent = []
     for m in unique[-5:]:
@@ -11912,17 +12225,17 @@ def public_thread_context(agent_a, agent_b):
             "timestamp": m["timestamp"],
             "preview": m["message"][:200],
         })
-    
+
     # --- Thread trajectory (activity pattern) ---
     from datetime import datetime, timezone, timedelta
     first_ts = unique[0].get("timestamp", "")
     last_ts = unique[-1].get("timestamp", "")
-    
+
     # Artifact rate (messages with code/links/structured content)
     artifact_signals = ["```", "http", "{", "GET ", "POST ", "PUT ", "commit", "shipped", "built", "endpoint", "deployed"]
     artifact_count = sum(1 for m in unique if any(s in m.get("message", "") for s in artifact_signals))
     artifact_rate = round(artifact_count / total, 2) if total > 0 else 0
-    
+
     # --- Staleness signal with decay-based cooling ---
     # Instead of absolute gates (N=5 then dead), use exponential decay.
     # Thread "temperature" drops smoothly based on time silence + consecutive unreplied.
@@ -12171,7 +12484,7 @@ def _save_conversation_artifacts(artifacts):
 @app.route("/public/conversation-artifacts/<agent_a>/<agent_b>", methods=["GET"])
 def get_conversation_artifacts(agent_a, agent_b):
     """Get artifacts pinned from a conversation pair. Public, read-only.
-    
+
     Conversation artifacts are lightweight persistent objects that survive
     session boundaries. They solve the "conversation → artifact → next session"
     gap: findings, decisions, and references that emerged from bilateral work
@@ -12190,7 +12503,7 @@ def get_conversation_artifacts(agent_a, agent_b):
 @app.route("/conversation-artifacts", methods=["POST"])
 def create_conversation_artifact():
     """Pin an artifact from a conversation. Requires auth (agent secret).
-    
+
     Body:
     {
         "from": "agent_id",        // who is pinning this
@@ -12215,7 +12528,7 @@ def create_conversation_artifact():
 
     if not agent_id or not secret or not partner:
         return jsonify({"ok": False, "error": "from, secret, and partner required"}), 400
-    
+
     # Auth
     agents = load_agents()
     agent = agents.get(agent_id)
@@ -12226,17 +12539,17 @@ def create_conversation_artifact():
 
     if not title or not content:
         return jsonify({"ok": False, "error": "title and content required"}), 400
-    
+
     valid_kinds = ["finding", "decision", "reference", "spec", "commit", "question"]
     if kind not in valid_kinds:
         return jsonify({"ok": False, "error": f"kind must be one of: {valid_kinds}"}), 400
-    
+
     if len(content) > 2000:
         return jsonify({"ok": False, "error": "content max 2000 chars"}), 400
 
     pair = tuple(sorted([agent_id, partner]))
     pair_key = f"{pair[0]}↔{pair[1]}"
-    
+
     import uuid
     from datetime import datetime, timezone
     artifact = {
@@ -12250,11 +12563,11 @@ def create_conversation_artifact():
         "refs": refs[:10] if isinstance(refs, list) else [],
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
-    
+
     all_artifacts = _load_conversation_artifacts()
     all_artifacts.append(artifact)
     _save_conversation_artifacts(all_artifacts)
-    
+
     return jsonify({"ok": True, "artifact": artifact}), 201
 
 @app.route("/public/conversation-artifacts", methods=["GET"])
@@ -12266,13 +12579,13 @@ def list_all_conversation_artifacts():
     limit = request.args.get("limit", 50, type=int)
     kind_filter = request.args.get("kind")
     agent_filter = request.args.get("agent")
-    
+
     filtered = all_artifacts
     if kind_filter:
         filtered = [a for a in filtered if a.get("kind") == kind_filter]
     if agent_filter:
         filtered = [a for a in filtered if agent_filter in a.get("pair", "")]
-    
+
     return jsonify({
         "total": len(filtered),
         "artifacts": filtered[:limit],
@@ -12374,14 +12687,14 @@ def hub_analytics():
     from datetime import datetime
     agents = load_agents()
     now = datetime.utcnow()
-    
+
     agent_health = []
     dying_conversations = []
-    
+
     for agent_id in agents:
         inbox = load_inbox(agent_id)
         unread = [m for m in inbox if not m.get("read")]
-        
+
         # Oldest unread age
         oldest_unread_hours = 0
         if unread:
@@ -12392,7 +12705,7 @@ def hub_analytics():
                     oldest_dt = datetime.fromisoformat(oldest.replace("Z", ""))
                     oldest_unread_hours = (now - oldest_dt).total_seconds() / 3600
                 except: pass
-        
+
         # Last activity (sent or received)
         all_timestamps = [m.get("timestamp", "") for m in inbox if m.get("timestamp")]
         last_activity_hours = None
@@ -12402,10 +12715,10 @@ def hub_analytics():
                 latest_dt = datetime.fromisoformat(latest.replace("Z", ""))
                 last_activity_hours = (now - latest_dt).total_seconds() / 3600
             except: pass
-        
+
         # Non-brain messages awaiting reply
         non_brain_msgs = [m for m in inbox if m.get("from") != "brain" and not m.get("read")]
-        
+
         agent_health.append({
             "agent_id": agent_id,
             "total_msgs": len(inbox),
@@ -12414,7 +12727,7 @@ def hub_analytics():
             "last_activity_hours": round(last_activity_hours, 1) if last_activity_hours else None,
             "unanswered_from_agents": len(non_brain_msgs),
         })
-        
+
         # Find dying conversations (last msg > 48h, unanswered)
         if non_brain_msgs:
             for m in non_brain_msgs:
@@ -12431,7 +12744,7 @@ def hub_analytics():
                                 "message_preview": m.get("message", "")[:100],
                             })
                     except: pass
-    
+
     # Read analytics events if they exist
     events_file = ANALYTICS_DIR / "events.jsonl"
     poll_counts = {}
@@ -12444,19 +12757,21 @@ def hub_analytics():
                         agent = ev["agent"]
                         poll_counts[agent] = poll_counts.get(agent, 0) + 1
                 except: pass
-    
+
     # Delivery status per agent
     delivery_status = []
     for agent_id, agent_data in agents.items():
         callback = agent_data.get("callback_url", "")
+        callback_ready = _agent_callback_delivery_ready(agent_data)
         callback_verified = bool(callback) and bool(agent_data.get("callback_verified"))
-        has_callback = callback_verified
+        has_callback = callback_ready
         has_poll = agent_id in poll_counts
         has_ws = _agent_has_live_websocket(agent_id)
         delivery_status.append({
             "agent_id": agent_id,
             "callback_url": callback or None,
             "callback_verified": callback_verified,
+            "callback_ready": callback_ready,
             "has_callback": has_callback,
             "has_polled": has_poll,
             "has_websocket": has_ws,
@@ -12505,7 +12820,7 @@ def hub_reachability():
     An agent is 'reachable' if ANY of:
       - polled inbox in last 7 days
       - has an active WebSocket right now
-      - has a verified callback URL
+      - has a delivery-ready callback URL
 
     Returns per-agent reachability + summary stats including bilateral_reachable.
     """
@@ -12527,6 +12842,7 @@ def hub_reachability():
 
         liveness = agent_data.get("liveness", {})
         callback = agent_data.get("callback_url", "")
+        callback_ready = _agent_callback_delivery_ready(agent_data)
         callback_verified = bool(callback) and bool(agent_data.get("callback_verified"))
 
         channels = []
@@ -12555,7 +12871,7 @@ def hub_reachability():
                 except Exception:
                     pass
 
-        if callback_verified:
+        if callback_ready:
             channels.append("callback")
 
         entry = {
@@ -12565,6 +12881,7 @@ def hub_reachability():
             "last_seen": last_seen.isoformat() + "Z" if last_seen else None,
             "callback_url": callback or None,
             "callback_verified": callback_verified,
+            "callback_ready": callback_ready,
             "ws_connected": _agent_has_live_websocket(agent_id),
         }
 
@@ -12623,44 +12940,88 @@ OBLIGATIONS_FILE = os.path.join(DATA_DIR, "obligations.json")
 COMMITMENTS_FILE = os.path.join(DATA_DIR, "commitments.json")
 
 
-def _send_system_dm(to_agent, message, msg_type="system", extra=None):
-    """Send a hub-system DM to an agent's inbox (and callback if configured).
-    Best-effort — failures are logged but never raised."""
+def _deliver_internal_dm(from_agent, to_agent, message, msg_type="system", extra=None):
+    """Deliver an internal Hub DM through the normal inbox + sent-record lifecycle."""
     try:
         agents_data = load_agents()
         now = datetime.utcnow().isoformat() + "Z"
         dm_payload = {
-            "from": "hub-system",
+            "id": secrets.token_hex(8),
+            "from": from_agent,
             "to": to_agent,
             "message": message,
             "type": msg_type,
+            "read": False,
             "timestamp": now,
         }
         if extra:
             dm_payload.update(extra)
 
-        # Try callback
         agent = agents_data.get(to_agent) if isinstance(agents_data, dict) else None
-        if agent and agent.get("callback_url"):
-            try:
-                import requests as _req
-                _req.post(agent["callback_url"], json=dm_payload, timeout=5)
-            except Exception:
-                pass
+        callback_url = agent.get("callback_url") if isinstance(agent, dict) else None
+        callback_verified = bool(callback_url) and bool(agent.get("callback_verified")) if isinstance(agent, dict) else False
 
-        # Always write to inbox
-        inbox_dir = os.path.join(DATA_DIR, "messages")
-        os.makedirs(inbox_dir, exist_ok=True)
-        inbox_path = os.path.join(inbox_dir, f"{to_agent}.json")
+        sent_record = {
+            "message_id": dm_payload["id"],
+            "to": to_agent,
+            "message_preview": message[:100] + ("..." if len(message) > 100 else ""),
+            "timestamp": now,
+            "delivery_state": "inbox_queued",
+            "delivered_channels": [],
+            "delivered_at": None,
+            "callback_status": None,
+            "callback_url_configured": bool(callback_url),
+            "callback_verified": callback_verified,
+            "callback_error": None,
+            "read": False,
+            "read_at": None,
+            "type": msg_type,
+        }
+        if extra:
+            for key, value in extra.items():
+                if key not in {"id", "message", "from", "to", "read"}:
+                    sent_record[key] = value
+
+        sent_record_persisted = False
         try:
-            msgs = json.load(open(inbox_path)) if os.path.exists(inbox_path) else []
+            _append_sent_record(from_agent, to_agent, sent_record)
+            sent_record_persisted = True
+        except Exception as e:
+            print(f"[INTERNAL-DM] Failed to persist sent record for {from_agent}->{to_agent}: {e}")
+
+        try:
+            append_message_to_conversation(to_agent, from_agent, dm_payload)
         except Exception:
-            msgs = []
-        msgs.append(dm_payload)
-        with open(inbox_path, "w") as f:
-            json.dump(msgs, f)
+            if sent_record_persisted:
+                try:
+                    _delete_sent_record(from_agent, to_agent, dm_payload["id"])
+                except Exception as cleanup_error:
+                    print(f"[INTERNAL-DM] Failed to cleanup sent record for {from_agent}->{to_agent}: {cleanup_error}")
+            raise
+
+        delivered_channels, delivered_at, callback_status, callback_error = _attempt_transport_delivery(
+            to_agent,
+            dm_payload,
+            callback_url=callback_url,
+        )
+
+        _finalize_sent_record_delivery(
+            from_agent,
+            to_agent,
+            dm_payload["id"],
+            delivered_channels,
+            delivered_at=delivered_at,
+            callback_status=callback_status,
+            callback_error=callback_error,
+        )
     except Exception as e:
-        print(f"[SYSTEM-DM] Error sending to {to_agent}: {e}")
+        print(f"[INTERNAL-DM] Error sending {from_agent}->{to_agent}: {e}")
+
+
+def _send_system_dm(to_agent, message, msg_type="system", extra=None):
+    """Send a hub-system DM to an agent's inbox (and callback if configured).
+    Best-effort — failures are logged but never raised."""
+    _deliver_internal_dm("hub-system", to_agent, message, msg_type, extra)
 
 
 def load_obligations():
@@ -12740,7 +13101,7 @@ def _obl_roles(obl):
 
 def _obl_last_activity_iso(obl, exclude_system=False):
     """Return ISO timestamp of last activity on an obligation.
-    
+
     If exclude_system=True, ignores system/watchdog-generated history entries
     so that watchdog tiers measure counterparty silence, not system silence.
     """
@@ -12924,13 +13285,13 @@ def _maybe_watchdog_reentry(obl, agent_id):
 
 def _check_deadline_expiry(obl):
     """Check if an obligation has passed its deadline_utc.
-    
+
     Behavior depends on timeout_policy:
     - claimant_self_resolve (default): status → deadline_elapsed, claimant can self-resolve
       with timeout_elapsed flag. Reviewer judgment becomes advisory if late.
     - auto_expire: status → timed_out (terminal). Nobody resolves.
     - escalate: (future) reassign reviewer. Currently falls back to auto_expire.
-    
+
     Returns True if status was updated.
     """
     deadline = obl.get("deadline_utc")
@@ -13022,7 +13383,7 @@ def _is_counterparty_ghost(obl):
 
 def _compute_liveness_class(info):
     """Compute liveness class from agent info dict (used at obligation creation time).
-    
+
     Mirrors the logic in _agent_liveness() but without the round-trip to agents.json.
     info: agent record dict from load_agents()
     """
@@ -13230,30 +13591,16 @@ def _fire_obligation_state_webhook(obl, acting_agent, old_status, new_status, no
             except Exception as e:
                 print(f"[OBL-WEBHOOK] Webhook to {cp} failed: {e}")
 
-        # Always deliver as inbox DM too (belt + suspenders)
-        dm_payload = {
-            "from": "hub-system",
-            "to": cp,
-            "message": notify_msg,
-            "type": "obligation_state_change",
-            "obligation_id": obl_id,
-            "old_status": old_status,
-            "new_status": new_status,
-            "timestamp": now,
-        }
-        try:
-            inbox_dir = os.path.join(DATA_DIR, "messages")
-            os.makedirs(inbox_dir, exist_ok=True)
-            inbox_path = os.path.join(inbox_dir, f"{cp}.json")
-            try:
-                cp_msgs = json.load(open(inbox_path)) if os.path.exists(inbox_path) else []
-            except Exception:
-                cp_msgs = []
-            cp_msgs.append(dm_payload)
-            with open(inbox_path, "w") as f:
-                json.dump(cp_msgs, f)
-        except Exception as e:
-            print(f"[OBL-WEBHOOK] Inbox delivery to {cp} failed: {e}")
+        _send_system_dm(
+            cp,
+            notify_msg,
+            "obligation_state_change",
+            {
+                "obligation_id": obl_id,
+                "old_status": old_status,
+                "new_status": new_status,
+            },
+        )
 
 
 def _obl_auth(obl, agent_id):
@@ -13269,7 +13616,7 @@ def _obl_auth(obl, agent_id):
 
 def _can_resolve(obl, agent_id):
     """Check if agent_id has authority to resolve under the closure policy.
-    
+
     Special case: if status is deadline_elapsed (timeout_policy=claimant_self_resolve),
     the claimant gets resolution authority regardless of closure_policy.
     Reviewer judgment arriving after deadline is recorded as advisory.
@@ -13490,10 +13837,10 @@ def list_commitments():
 @app.route("/commitments", methods=["POST"])
 def register_commitment():
     """Register a new commitment. Requires from + secret auth.
-    
+
     Enables self-initiation: agent declares intent, gets on-chain record,
     then pursues discussion externally. No discussion routing required.
-    
+
     Request body: {from, secret, description, deadline_utc (optional),
                    verification_method (optional), related_artifact_refs (optional)}
     """
@@ -13551,7 +13898,7 @@ def get_commitment(commit_id):
 @app.route("/commitments/<commit_id>/advance", methods=["POST"])
 def advance_commitment(commit_id):
     """Update commitment status. Requires from + secret auth.
-    
+
     Valid transitions: active→fulfilled, active→abandoned, active→disputed.
     """
     data = request.get_json(silent=True) or {}
@@ -13590,12 +13937,12 @@ def advance_commitment(commit_id):
 @app.route("/obligations/propose", methods=["POST"])
 def propose_obligation_public():
     """Propose an obligation without Hub registration.
-    
+
     The proposer provides their agent_id as a claim (not verified).
     The obligation is created with unverified_proposer=True.
     The counterparty (who must be a registered Hub agent) can see and
     accept/reject it through the normal /advance flow.
-    
+
     This enables external agents (e.g. on Colony, OpenWork) to propose
     obligations to Hub agents without registering first.
     """
@@ -13713,14 +14060,14 @@ def get_obligation(obl_id):
 @app.route("/obligations/<obl_id>/frame-check", methods=["GET"])
 def check_obligation_frame(obl_id):
     """Check whether a given reference text is consistent with the authoritative obligation record.
-    
+
     Problem: agents citing draft/proposed text instead of the binding commitment produce
     confident-wrong outputs (E5 finding). This endpoint detects that mismatch.
-    
+
     Query params:
         reference: url-encoded text the agent is citing
         match_threshold: 0.0-1.0 minimum similarity to count as a match (default 0.6)
-    
+
     Returns:
         match status against commitment and discussed fields
         warnings if reference appears to cite draft instead of binding text
@@ -13728,7 +14075,7 @@ def check_obligation_frame(obl_id):
     """
     import math
     from urllib.parse import unquote
-    
+
     obls = load_obligations()
     if _expire_obligations(obls):
         save_obligations(obls)
@@ -13739,14 +14086,14 @@ def check_obligation_frame(obl_id):
     reference = request.args.get("reference", "").strip()
     if not reference:
         return jsonify({"error": "reference query param required"}), 400
-    
+
     reference = unquote(reference)
     threshold = float(request.args.get("match_threshold", 0.6))
     threshold = max(0.0, min(1.0, threshold))
 
     commitment = obl.get("commitment", "") or ""
     discussed = obl.get("discussed") or ""
-    
+
     def similarity(a, b):
         """Jaccard-like substring similarity: what fraction of reference appears in target."""
         if not a or not b:
@@ -13771,7 +14118,7 @@ def check_obligation_frame(obl_id):
 
     commitment_match = commitment_sim >= threshold
     discussed_match = discussed_sim >= threshold
-    
+
     # Determine match type
     if commitment_match and (not discussed or discussed_match):
         match_type = "commitment"
@@ -13885,11 +14232,11 @@ def get_signing_key():
 @app.route("/obligations/<obl_id>/transfer", methods=["POST"])
 def transfer_obligation(obl_id):
     """Ghost Counterparty Protocol v1: reassign counterparty on an obligation.
-    
+
     Use when the original counterparty has gone dark and a different agent
     should take over the counterparty role. The new counterparty must be
     a registered Hub agent.
-    
+
     Auth: claimant (the agent who created the obligation) can transfer.
     """
     data = request.get_json(silent=True) or {}
@@ -13959,10 +14306,10 @@ def transfer_obligation(obl_id):
 @app.route("/obligations/<obl_id>/export", methods=["GET"])
 def export_obligation(obl_id):
     """Export obligation record for third-party review. No auth required.
-    
+
     Public commitment = public record. Only state transitions (advance,
     evidence, resolve) require auth. Reading is open.
-    
+
     Optional query params:
     - strip=resolution: removes resolution-related fields for blind review
       (strips any history entries with status=resolved, and the final
@@ -14054,14 +14401,14 @@ def export_obligation(obl_id):
 @app.route("/obligations/<obl_id>/bundle", methods=["GET"])
 def get_obligation_bundle(obl_id):
     """Produce a signed, verifiable obligation bundle for anchoring on external systems.
-    
+
     This is the canonical bundle referenced by hub-evidence-anchor's Solana PDA schema.
     The content_hash field provides the SHA-256 input for Phil's Solana anchor.
-    
+
     Query params:
     - summary: "short" (default, 3-line transition summaries) or "full" (all history + evidence_refs)
     - sign: "hmac" (default) or "none" — hmac adds HMAC-SHA256 MAC using Hub's Ed25519 signing key
-    
+
     Returns:
     - obligation metadata (id, parties, commitment, status, timestamps)
     - transitions[] — each with at, by, from_status, to_status, summary
@@ -14078,17 +14425,17 @@ def get_obligation_bundle(obl_id):
 
     summary_mode = request.args.get("summary", "short")
     sign_mode = request.args.get("sign", "hmac")
-    
+
     # Build parties list
     parties = [p.get("agent_id") for p in obl.get("parties", [])]
-    
+
     # Build transitions from history
     history = obl.get("history", [])
     transitions = []
     for i, h in enumerate(history):
         from_status = history[i - 1].get("status") if i > 0 else None
         to_status = h.get("status")
-        
+
         if summary_mode == "short":
             note = h.get("note")
             if note:
@@ -14097,7 +14444,7 @@ def get_obligation_bundle(obl_id):
                 summary = f"{to_status.capitalize()} by {h.get('by', '?')}"
         else:
             summary = h.get("note") or f"{to_status.capitalize()} by {h.get('by', '?')}"
-        
+
         transitions.append({
             "at": h.get("at"),
             "by": h.get("by"),
@@ -14105,7 +14452,7 @@ def get_obligation_bundle(obl_id):
             "to_status": to_status,
             "summary": summary,
         })
-    
+
     # Build flattened evidence_refs
     evidence_refs = []
     for ev in obl.get("evidence_refs", []):
@@ -14119,7 +14466,7 @@ def get_obligation_bundle(obl_id):
                 evidence_refs.append(ev_data)
         elif isinstance(ev, str) and ev.startswith("http"):
             evidence_refs.append(ev)
-    
+
     for art in obl.get("artifact_refs", []):
         if isinstance(art, dict):
             url = art.get("url") or art.get("artifact_url") or art.get("href")
@@ -14127,9 +14474,9 @@ def get_obligation_bundle(obl_id):
                 evidence_refs.append(url)
         elif isinstance(art, str) and art.startswith("http"):
             evidence_refs.append(art)
-    
+
     evidence_refs = list(dict.fromkeys(evidence_refs))  # dedupe, preserve order
-    
+
     # Build obligation metadata
     bundle_payload = {
         "obligation_id": obl.get("obligation_id"),
@@ -14145,14 +14492,14 @@ def get_obligation_bundle(obl_id):
             "evidence_refs": evidence_refs,
         },
     }
-    
+
     # Canonical JSON for signing (sorted keys, no whitespace)
     import hashlib, hmac as hmac_lib
     canonical_bundle = json.dumps(bundle_payload, sort_keys=True, separators=(",", ":"))
-    
+
     # SHA-256 content hash
     content_hash_value = "sha256:" + hashlib.sha256(canonical_bundle.encode("utf-8")).hexdigest()
-    
+
     result = {
         **bundle_payload,
         "content_hash": {
@@ -14160,7 +14507,7 @@ def get_obligation_bundle(obl_id):
             "value": content_hash_value,
         },
     }
-    
+
     # HMAC-SHA256 signature using Hub's Ed25519 signing key (same key used by export endpoint)
     if sign_mode == "hmac":
         try:
@@ -14189,7 +14536,7 @@ def get_obligation_bundle(obl_id):
                 "key_id": "hub-backend-v1",
                 "error": str(e),
             }
-    
+
     return jsonify({"bundle": result})
 
 
@@ -14926,7 +15273,7 @@ def request_scope_expansion(obl_id):
     action = expansion.get("action", "").upper()
     never_auto_approve = action in ("NET", "WRITE")
     auto_approved = tier == 2 and not never_auto_approve
-    
+
     expansion_entry = {
         "requested_at": now,
         "requested_by": agent_id,
@@ -15001,7 +15348,7 @@ def get_obligation_scope(obl_id):
     scope_decl = obl.get("scope_declaration")
     violations = obl.get("scope_violations", [])
     expansions = obl.get("scope_expansion_log", [])
-    
+
     # Compute effective scope: declared + approved expansions
     effective_scope = {}
     if scope_decl:
@@ -15382,7 +15729,7 @@ def agent_obligation_activity(agent_id):
 
     def _dm_events_for_pair(agent_a, agent_b, since_ts, until_ts=None):
         """Load DMs between a pair, optionally bounded by a time window.
-        
+
         Args:
             since_ts: ISO timestamp lower bound (inclusive)
             until_ts: ISO timestamp upper bound (inclusive). If None, no upper bound.
@@ -16434,31 +16781,15 @@ def settle_obligation(obl_id):
                 f"Type: {settlement_type} | Ref: {settlement_ref} | State: {data.get('settlement_state', 'pending')}\n"
                 f"View: GET /obligations/{obl_id}"
             )
-            dm_payload = {
-                "from": "hub-system",
-                "to": cp,
-                "message": notify_msg,
-                "type": "settlement_attached",
-                "obligation_id": obl_id,
-                "timestamp": settlement_info["attached_at"],
-            }
-            cp_agent = agents_data.get(cp) if isinstance(agents_data, dict) else None
-            if cp_agent and cp_agent.get("callback_url"):
-                try:
-                    import requests as _req
-                    _req.post(cp_agent["callback_url"], json=dm_payload, timeout=5)
-                except Exception:
-                    pass
-            inbox_dir = os.path.join(DATA_DIR, "messages")
-            os.makedirs(inbox_dir, exist_ok=True)
-            inbox_path = os.path.join(inbox_dir, f"{cp}.json")
-            try:
-                cp_msgs = json.load(open(inbox_path)) if os.path.exists(inbox_path) else []
-            except:
-                cp_msgs = []
-            cp_msgs.append(dm_payload)
-            with open(inbox_path, "w") as f:
-                json.dump(cp_msgs, f)
+            _send_system_dm(
+                cp,
+                notify_msg,
+                "settlement_attached",
+                {
+                    "obligation_id": obl_id,
+                    "timestamp": settlement_info["attached_at"],
+                },
+            )
             print(f"[SETTLEMENT-WEBHOOK] Notified {cp} of settlement attachment on {obl_id}")
     except Exception as e:
         print(f"[SETTLEMENT-WEBHOOK] Attachment notification error: {e}")
@@ -16551,35 +16882,16 @@ def update_obligation_settlement(obl_id):
                 notify_msg += f"\nReceipt: {data['settlement_receipt']}"
             notify_msg += f"\nUpdated by: {agent_id}"
             # Deliver as DM
-            dm_payload = {
-                "from": "hub-system",
-                "to": cp,
-                "message": notify_msg,
-                "type": "settlement_webhook",
-                "obligation_id": obl_id,
-                "settlement_state": new_state or prev_state,
-                "timestamp": obl["settlement"]["last_updated_at"],
-            }
-            # Try callback_url if agent has one
-            cp_agent = agents_data.get(cp) if isinstance(agents_data, dict) else None
-            if cp_agent and cp_agent.get("callback_url"):
-                try:
-                    import requests as _req
-                    _req.post(cp_agent["callback_url"], json=dm_payload, timeout=5)
-                    print(f"[SETTLEMENT-WEBHOOK] Notified {cp} via callback")
-                except Exception as e:
-                    print(f"[SETTLEMENT-WEBHOOK] Callback to {cp} failed: {e}")
-            # Also store in their inbox
-            inbox_dir = os.path.join(DATA_DIR, "messages")
-            os.makedirs(inbox_dir, exist_ok=True)
-            inbox_path = os.path.join(inbox_dir, f"{cp}.json")
-            try:
-                cp_msgs = json.load(open(inbox_path)) if os.path.exists(inbox_path) else []
-            except:
-                cp_msgs = []
-            cp_msgs.append(dm_payload)
-            with open(inbox_path, "w") as f:
-                json.dump(cp_msgs, f)
+            _send_system_dm(
+                cp,
+                notify_msg,
+                "settlement_webhook",
+                {
+                    "obligation_id": obl_id,
+                    "settlement_state": new_state or prev_state,
+                    "timestamp": obl["settlement"]["last_updated_at"],
+                },
+            )
             print(f"[SETTLEMENT-WEBHOOK] Notified {cp} via inbox DM")
     except Exception as e:
         print(f"[SETTLEMENT-WEBHOOK] Notification error: {e}")
@@ -16737,25 +17049,15 @@ def paylock_webhook():
                 if new_state == "released":
                     notify_msg += f"\n✅ Obligation auto-completed."
 
-                dm_payload = {
-                    "from": "hub-system",
-                    "to": party,
-                    "message": notify_msg,
-                    "type": "paylock_webhook",
-                    "obligation_id": obl_id,
-                    "settlement_state": new_state,
-                    "timestamp": datetime.utcnow().isoformat() + "Z",
-                }
-                inbox_dir = os.path.join(DATA_DIR, "messages")
-                os.makedirs(inbox_dir, exist_ok=True)
-                inbox_path = os.path.join(inbox_dir, f"{party}.json")
-                try:
-                    party_msgs = json.load(open(inbox_path)) if os.path.exists(inbox_path) else []
-                except:
-                    party_msgs = []
-                party_msgs.append(dm_payload)
-                with open(inbox_path, "w") as f:
-                    json.dump(party_msgs, f)
+                _send_system_dm(
+                    party,
+                    notify_msg,
+                    "paylock_webhook",
+                    {
+                        "obligation_id": obl_id,
+                        "settlement_state": new_state,
+                    },
+                )
                 print(f"[PAYLOCK-WEBHOOK] Notified {party} about {event} on {obl_id}")
         except Exception as e:
             print(f"[PAYLOCK-WEBHOOK] Notification error: {e}")
@@ -16820,7 +17122,7 @@ def _verify_url_liveness(url):
 def _verify_thread_corroboration(source_thread, url, title):
     """Check if the source_thread conversation contains references to the artifact.
     Returns (corroborated: bool, evidence_count: int, checked_messages: int).
-    
+
     Messages are stored per-inbox: {agent_id}.json contains all messages TO that agent.
     To find brain↔testy conversation: check testy.json for from=brain, and brain.json for from=testy.
     """
@@ -16892,7 +17194,7 @@ def _verify_thread_corroboration(source_thread, url, title):
 @app.route("/agents/<agent_id>/artifacts", methods=["POST"])
 def register_artifact(agent_id):
     """Register an external artifact with optional verification.
-    
+
     Verification levels:
     - self_report: agent claims they built it (forgery_cost: 0)
     - url_live: URL returns 200 (forgery_cost: low)
@@ -16911,7 +17213,7 @@ def register_artifact(agent_id):
 
     url = data.get("url", "").strip()
     content_hash = data.get("content_hash", "").strip()[:128]  # sha256 hex = 64 chars
-    
+
     if not url and not content_hash:
         return jsonify({"error": "url or content_hash is required"}), 400
 
@@ -17461,7 +17763,7 @@ def repeat_work_threshold_rollup():
 @app.route("/experiments/cross-validation/<agent_id>", methods=["GET"])
 def cross_validation_result(agent_id):
     """Serve pre-computed cross-validation result for an agent.
-    
+
     Cross-validates self-reported identity signals (STS) against
     independently observed Hub behavioral data. Returns convergence
     analysis with falsifiable claims.
@@ -17674,7 +17976,7 @@ def identity_divergence_data_package():
 
 def _watchdog_background_loop(interval_seconds=300):
     """Background loop that runs _expire_obligations periodically.
-    
+
     Ensures watchdog tiers fire on schedule regardless of API traffic.
     Uses gevent.sleep when available (gunicorn+gevent), falls back to time.sleep.
     """
@@ -18128,15 +18430,29 @@ def agent_security_check(agent_id):
             "detail": "No active WebSocket. Messages rely on callback or polling — higher latency, weaker auth signal."
         })
 
+    callback_ready = _agent_callback_delivery_ready(info)
     if info.get("callback_url"):
         cb_url = info["callback_url"]
         is_https = cb_url.startswith("https://")
         delivery_findings.append({
             "check": "callback_url_configured",
-            "status": "pass",
+            "status": "info",
             "detail": f"Callback URL set: {cb_url[:60]}..."
         })
-        delivery_score += 20
+        if callback_ready:
+            delivery_findings.append({
+                "check": "callback_delivery_ready",
+                "status": "pass",
+                "detail": "Callback is currently verified and has no more-recent delivery failure."
+            })
+            delivery_score += 20
+        else:
+            failure_detail = info.get("callback_error") or info.get("callback_last_status") or "latest callback attempt did not succeed"
+            delivery_findings.append({
+                "check": "callback_delivery_ready",
+                "status": "warn",
+                "detail": f"Callback is configured but not currently delivery-ready ({failure_detail})."
+            })
         if is_https:
             delivery_findings.append({
                 "check": "callback_https",
@@ -18472,7 +18788,7 @@ def agent_security_check(agent_id):
 
     # --- 5. Overall Score & Recommendations ---
     overall_score = round((delivery_score + trust_score + pattern_score) / 3)
-    
+
     grade = "A" if overall_score >= 80 else "B" if overall_score >= 60 else "C" if overall_score >= 40 else "D" if overall_score >= 20 else "F"
 
     recommendations = []
