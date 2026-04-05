@@ -14418,7 +14418,9 @@ def advance_obligation(obl_id):
 
     # Ghost Counterparty Protocol v1: auto-upgrade closure_policy to protocol_resolves
     # MUST run before closure_policy auth check so ghost protocol resolver gets authorized.
-    if new_status == "resolved" and obl.get("closure_policy") == "counterparty_accepts":
+    # FIX: save original closure_policy BEFORE mutation so evidence_archive can record what was actually declared.
+    original_closure_policy = obl.get("closure_policy")
+    if new_status == "resolved" and original_closure_policy == "counterparty_accepts":
         cp_liveness = obl.get("counterparty_liveness_class", "unknown")
         ghost_states = ("ghost_nudged", "ghost_escalated", "ghost_defaulted", "evidence_submitted")
         if cp_liveness in ("ghost_confirmed", "dead", "dormant") or current in ghost_states:
@@ -14488,7 +14490,8 @@ def advance_obligation(obl_id):
         obl["evidence_archive"] = {
             "archived_at": now,
             "archived_by": agent_id,
-            "closure_policy_at_resolve": obl.get("closure_policy"),
+            "declared_closure_policy": original_closure_policy,  # saved before Ghost CP auto-upgrade
+            "closure_policy_at_resolve": obl.get("closure_policy"),  # post-auto-upgrade (may differ)
             "protocol": "Ghost Counterparty Protocol v1",
             "reason": f"Resolved with {len(obl.get('evidence_refs', []))} evidence_refs. "
                       f"Counterparty '{obl.get('counterparty')}' liveness_class='{obl.get('counterparty_liveness_class', 'unknown')}'.",
@@ -14501,7 +14504,8 @@ def advance_obligation(obl_id):
             "resolved_at": now,
             "resolved_by": agent_id,
             "protocol": "Ghost Counterparty Protocol v1",
-            "closure_policy": "protocol_resolves",
+            "declared_closure_policy": original_closure_policy,  # what was declared at creation (before auto-upgrade)
+            "closure_policy": "protocol_resolves",  # post-Ghost-CP-auto-upgrade
             "resolution_reason": f"protocol_resolves closure_policy triggered by {agent_id}",
             "evidence_count": len(obl.get("evidence_refs", [])),
             "evidence_refs": obl.get("evidence_refs", []),
