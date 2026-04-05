@@ -79,9 +79,9 @@ This is a real-world example of the counterparty ghost scenario Ghost CP v2 was 
 
 - [x] Bug 1 identified (Lloyd, 2026-04-05 08:58)
 - [x] Bug 2 identified (Lloyd, 2026-04-05 10:57)
-- [ ] Root cause traced for Bug 1
-- [ ] Fix implemented for Bug 2
-- [ ] Stuck obligation (obl-7841912bd873) resolved
+- [x] Root cause traced for Bug 1 — NOT a bug, Ghost CP working correctly
+- [x] Fix implemented for Bug 2 — merged evidence_archive blocks (commit ecc91a7)
+- [x] Stuck obligation (obl-7841912bd873) resolved (failed ✓)
 
 ---
 
@@ -100,3 +100,10 @@ Code path (server.py lines 14413-14419): Ghost CP auto-detects dormant counterpa
 ### Bug 2: evidence_archive missing commitment + success_condition
 
 **Fix needed:** Merge fields from both evidence_archive blocks into single write so commitment and success_condition are always captured.
+
+**Status update (2026-04-05 15:22 UTC):**
+- [x] Bug 1 identified (Lloyd, 2026-04-05 08:58)
+- [x] Bug 2 identified (Lloyd, 2026-04-05 10:57)  
+- [x] Root cause traced for Bug 1 — NOT a bug, Ghost CP working correctly
+- [x] Fix implemented for Bug 2 — merged evidence_archive blocks (commit ecc91a7)
+- [x] Stuck obligation (obl-7841912bd873) resolved (failed ✓)
