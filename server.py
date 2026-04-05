@@ -14482,38 +14482,33 @@ def advance_obligation(obl_id):
         history_entry["resolution_type"] = "post_deadline_claimant"
     obl["history"].append(history_entry)
 
-    # Ghost Counterparty Protocol v1: write evidence_archive on all resolutions with evidence_refs
-    # Captures evidence snapshot at resolution time regardless of closure_policy.
-    # The protocol_resolves block above handles the auto-resolved TTL case.
-    # This block handles explicit resolutions (human or agent-initiated).
-    if new_status == "resolved" and obl.get("evidence_refs") and not obl.get("evidence_archive"):
+    # Ghost Counterparty Protocol v1: write evidence_archive on all resolutions.
+    # Single block captures all relevant fields regardless of which resolution path was taken.
+    # Fixes bug: both evidence_archive blocks previously overwrote each other, losing commitment/success_condition.
+    if new_status == "resolved" and not obl.get("evidence_archive"):
+        is_protocol_resolves = obl.get("closure_policy") == "protocol_resolves"
         obl["evidence_archive"] = {
             "archived_at": now,
             "archived_by": agent_id,
-            "declared_closure_policy": original_closure_policy,  # saved before Ghost CP auto-upgrade
-            "closure_policy_at_resolve": obl.get("closure_policy"),  # post-auto-upgrade (may differ)
             "protocol": "Ghost Counterparty Protocol v1",
-            "reason": f"Resolved with {len(obl.get('evidence_refs', []))} evidence_refs. "
-                      f"Counterparty '{obl.get('counterparty')}' liveness_class='{obl.get('counterparty_liveness_class', 'unknown')}'.",
-            "evidence_refs_snapshot": list(obl.get("evidence_refs", [])),
-        }
-
-    # Ghost Counterparty Protocol v1: write evidence_archive on protocol_resolves closure
-    if new_status == "resolved" and obl.get("closure_policy") == "protocol_resolves":
-        obl["evidence_archive"] = {
-            "resolved_at": now,
-            "resolved_by": agent_id,
-            "protocol": "Ghost Counterparty Protocol v1",
-            "declared_closure_policy": original_closure_policy,  # what was declared at creation (before auto-upgrade)
-            "closure_policy": "protocol_resolves",  # post-Ghost-CP-auto-upgrade
-            "resolution_reason": f"protocol_resolves closure_policy triggered by {agent_id}",
+            "declared_closure_policy": original_closure_policy,  # pre-mutation (what was originally declared)
+            "closure_policy_at_resolve": obl.get("closure_policy"),  # post-mutation (what was in effect)
+            "resolution_type": "protocol_resolves" if is_protocol_resolves else "explicit_resolution",
+            "resolution_reason": (
+                f"protocol_resolves closure_policy triggered by {agent_id}"
+                if is_protocol_resolves
+                else f"Resolved with {len(obl.get('evidence_refs', []))} evidence_refs. "
+                     f"Counterparty '{obl.get('counterparty')}' liveness_class='{obl.get('counterparty_liveness_class', 'unknown')}'."
+            ),
             "evidence_count": len(obl.get("evidence_refs", [])),
-            "evidence_refs": obl.get("evidence_refs", []),
+            "evidence_refs": list(obl.get("evidence_refs", [])),
             "commitment": obl.get("commitment", ""),
             "success_condition": obl.get("success_condition"),
+            "binding_scope_text": obl.get("binding_scope_text"),
         }
         history_entry["resolution_type"] = "protocol_resolves"
         history_entry["protocol"] = "Ghost Counterparty Protocol v1"
+
 
     # Attach evidence if provided
     if data.get("evidence"):

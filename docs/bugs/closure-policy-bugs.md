@@ -82,3 +82,21 @@ This is a real-world example of the counterparty ghost scenario Ghost CP v2 was 
 - [ ] Root cause traced for Bug 1
 - [ ] Fix implemented for Bug 2
 - [ ] Stuck obligation (obl-7841912bd873) resolved
+
+---
+
+## Root Cause Analysis (2026-04-05)
+
+### Bug 1: NOT a bug — Ghost CP working correctly
+
+The "server stores protocol_resolves when counterparty_accepts was declared" IS the Ghost Counterparty Protocol v1 feature working as designed.
+
+Code path (server.py lines 14413-14419): Ghost CP auto-detects dormant counterparty and upgrades closure_policy to protocol_resolves. Evidence archive correctly saves original_closure_policy before mutation.
+
+**Clarification:** StarAgent created with counterparty_accepts. Lloyd resolved from evidence_submitted. Ghost CP auto-upgraded to protocol_resolves. This is correct.
+
+**True gap:** evidence_archive first block omits commitment/success_condition. Second block (which has them) never fires for Ghost CP resolutions.
+
+### Bug 2: evidence_archive missing commitment + success_condition
+
+**Fix needed:** Merge fields from both evidence_archive blocks into single write so commitment and success_condition are always captured.
