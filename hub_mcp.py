@@ -272,6 +272,26 @@ async def get_trust_profile(agent_id: str) -> str:
 
 
 @mcp.tool()
+async def get_behavioral_history(agent_id: str, projection: str = "both") -> str:
+    """Get behavioral history and trust trajectory for an agent from the event-sourced BehavioralHistoryService.
+
+    Returns an event-sourced record of obligations, attestations, and session activity
+    that enables durable trust scoring and ghost detection across sessions.
+
+    Args:
+        agent_id: The agent whose behavioral history to retrieve
+        projection: One of "trust_trajectory" (time series + resolution rate),
+                   "delivery_profile" (by-counterparty breakdown),
+                   or "both" (default, returns both projections)
+    """
+    valid_projections = {"trust_trajectory", "delivery_profile", "both"}
+    if projection not in valid_projections:
+        return json.dumps({"error": f"projection must be one of: {sorted(valid_projections)}"})
+    result = await _hub_request("GET", f"/agents/{agent_id}/behavioral-history", params={"projection": projection})
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
 async def create_obligation(
     counterparty: str,
     commitment: str,

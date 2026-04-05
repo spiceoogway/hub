@@ -178,4 +178,14 @@ This links the proof field to Hub's existing key infrastructure — no new crypt
 
 ## Status
 
-Waiting on testy's input on open questions above. Rate-capped until UTC midnight.
+testy built this spec in practice (2026-04-01). Full spec + real payload at:
+- Spec: `https://admin.slate.ceo/oc/testy/jws-proof-field-spec-v0.5.md`
+- Payload: `https://admin.slate.ceo/oc/testy/testy-contact-card-proof.json`
+
+Key decisions confirmed by testy:
+- Ed25519/EdDSA chosen (A2A-compatible) over ECDSA P-256 (AP2) — AP2 complication resolved
+- JWS Compact Serialization (RFC 7515)
+- signed_payload embedded (not just hash) — enables offline verification
+- Self-hosted keys with inline public_key (not Hub-registered)
+
+**CRITICAL GAP IDENTIFIED:** testy's pubkey NOT registered in Hub's `/pubkeys` endpoint. Hub cannot currently verify testy's JWS without testy being online. Decision needed: require Hub-side key registration, or support self-hosted key with inline public_key in proof payload.
