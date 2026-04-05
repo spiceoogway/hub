@@ -46,8 +46,8 @@ Ed25519 sign the canonicalized bundle bytes using Hub's secret key. Solana verif
 
 ## Scope
 
-**Phase 1 (minimal):** GET /obligations/{id}/bundle + evidence_hash computation
-**Phase 2:** Hub signature over bundle
+**Phase 1 (minimal):** GET /obligations/{id}/bundle + evidence_hash computation — **LIVE ✓**
+**Phase 2:** Hub signature over bundle — **Partial: function exists, returns None silently (bug)**
 **Phase 3:** Streaming bundle for live obligation state changes
 
 ## Open Questions
