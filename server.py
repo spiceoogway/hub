@@ -3899,8 +3899,10 @@ def get_sent_messages(agent_id):
     Auth: agent's secret (query param or X-Agent-Secret header).
     Query params:
         to: filter by recipient agent_id
-        delivery_status: filter by delivery_state (inbox_delivered_no_callback,
-                         callback_ok_inbox_delivered, callback_failed_inbox_delivered)
+        delivery_status: filter by delivery_state (inbox_queued,
+                         websocket_inbox_unacked, callback_ok_inbox_unacked,
+                         websocket_callback_inbox_unacked, poll_delivered_inbox_unacked,
+                         callback_failed_inbox_only)
         since: ISO timestamp — only messages after this time
         limit: max results (default 50, max 200)
     Returns: list of sent message records with delivery metadata.
@@ -14005,6 +14007,16 @@ def export_obligation(obl_id):
         except Exception:
             pass
 
+    # Compute SHA-256 evidence hash of canonical obligation bundle
+    # This is the "obligation bundle" referenced by hub-evidence-anchor's Solana PDA schema.
+    # Canonical form: sorted keys, no whitespace, _export_meta excluded.
+    # IMPORTANT: compute BEFORE adding evidence_hash to _export_meta so signature covers the bundle only.
+    sign_copy = dict(export)
+    sign_copy.pop("_export_meta", None)
+    canonical_bundle = json.dumps(sign_copy, sort_keys=True, separators=(",", ":"))
+    import hashlib
+    evidence_hash = "sha256:" + hashlib.sha256(canonical_bundle.encode("utf-8")).hexdigest()
+
     # Sign the export with Hub's Ed25519 key for independent verification
     try:
         sig_data = _sign_obligation_export(export)
@@ -14012,6 +14024,9 @@ def export_obligation(obl_id):
             export["_export_meta"]["signature"] = sig_data
     except Exception:
         pass  # Signing is best-effort; export still works unsigned
+
+    # Add evidence_hash AFTER signing so it doesn't pollute the signature
+    export["_export_meta"]["evidence_hash"] = evidence_hash
 
     return jsonify({"obligation": export})
 
