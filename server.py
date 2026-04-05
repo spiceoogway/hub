@@ -14051,6 +14051,148 @@ def export_obligation(obl_id):
     return jsonify({"obligation": export})
 
 
+@app.route("/obligations/<obl_id>/bundle", methods=["GET"])
+def get_obligation_bundle(obl_id):
+    """Produce a signed, verifiable obligation bundle for anchoring on external systems.
+    
+    This is the canonical bundle referenced by hub-evidence-anchor's Solana PDA schema.
+    The content_hash field provides the SHA-256 input for Phil's Solana anchor.
+    
+    Query params:
+    - summary: "short" (default, 3-line transition summaries) or "full" (all history + evidence_refs)
+    - sign: "hmac" (default) or "none" — hmac adds HMAC-SHA256 MAC using Hub's Ed25519 signing key
+    
+    Returns:
+    - obligation metadata (id, parties, commitment, status, timestamps)
+    - transitions[] — each with at, by, from_status, to_status, summary
+    - evidence_refs[] — flattened evidence and artifact URLs
+    - signature{ algorithm, key_id, mac } — HMAC-SHA256 of canonical bundle JSON
+    - content_hash{ algorithm, value } — SHA-256 of canonical bundle JSON
+    """
+    obls = load_obligations()
+    if _expire_obligations(obls):
+        save_obligations(obls)
+    obl = next((o for o in obls if o["obligation_id"] == obl_id), None)
+    if not obl:
+        return jsonify({"error": "not found"}), 404
+
+    summary_mode = request.args.get("summary", "short")
+    sign_mode = request.args.get("sign", "hmac")
+    
+    # Build parties list
+    parties = [p.get("agent_id") for p in obl.get("parties", [])]
+    
+    # Build transitions from history
+    history = obl.get("history", [])
+    transitions = []
+    for i, h in enumerate(history):
+        from_status = history[i - 1].get("status") if i > 0 else None
+        to_status = h.get("status")
+        
+        if summary_mode == "short":
+            note = h.get("note")
+            if note:
+                summary = note[:200]
+            else:
+                summary = f"{to_status.capitalize()} by {h.get('by', '?')}"
+        else:
+            summary = h.get("note") or f"{to_status.capitalize()} by {h.get('by', '?')}"
+        
+        transitions.append({
+            "at": h.get("at"),
+            "by": h.get("by"),
+            "from_status": from_status,
+            "to_status": to_status,
+            "summary": summary,
+        })
+    
+    # Build flattened evidence_refs
+    evidence_refs = []
+    for ev in obl.get("evidence_refs", []):
+        if isinstance(ev, dict) and ev.get("evidence"):
+            ev_data = ev["evidence"]
+            if isinstance(ev_data, dict):
+                for art in ev_data.get("artifacts", []):
+                    if art and isinstance(art, str) and art.startswith("http"):
+                        evidence_refs.append(art)
+            elif isinstance(ev_data, str) and ev_data.startswith("http"):
+                evidence_refs.append(ev_data)
+        elif isinstance(ev, str) and ev.startswith("http"):
+            evidence_refs.append(ev)
+    
+    for art in obl.get("artifact_refs", []):
+        if isinstance(art, dict):
+            url = art.get("url") or art.get("artifact_url") or art.get("href")
+            if url and isinstance(url, str) and url.startswith("http"):
+                evidence_refs.append(url)
+        elif isinstance(art, str) and art.startswith("http"):
+            evidence_refs.append(art)
+    
+    evidence_refs = list(dict.fromkeys(evidence_refs))  # dedupe, preserve order
+    
+    # Build obligation metadata
+    bundle_payload = {
+        "obligation_id": obl.get("obligation_id"),
+        "agent_id": obl.get("created_by"),
+        "counterparty": obl.get("counterparty"),
+        "commitment": obl.get("commitment"),
+        "status": obl.get("status"),
+        "created_at": obl.get("created_at"),
+        "completed_at": obl.get("completed_at"),
+        "parties": parties,
+        "bundle": {
+            "transitions": transitions,
+            "evidence_refs": evidence_refs,
+        },
+    }
+    
+    # Canonical JSON for signing (sorted keys, no whitespace)
+    import hashlib, hmac as hmac_lib
+    canonical_bundle = json.dumps(bundle_payload, sort_keys=True, separators=(",", ":"))
+    
+    # SHA-256 content hash
+    content_hash_value = "sha256:" + hashlib.sha256(canonical_bundle.encode("utf-8")).hexdigest()
+    
+    result = {
+        **bundle_payload,
+        "content_hash": {
+            "algorithm": "SHA-256",
+            "value": content_hash_value,
+        },
+    }
+    
+    # HMAC-SHA256 signature using Hub's Ed25519 signing key (same key used by export endpoint)
+    if sign_mode == "hmac":
+        try:
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+            from cryptography.hazmat.primitives import serialization
+            key_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "credentials", "hub_signing_key.pem")
+            if os.path.exists(key_path):
+                with open(key_path, "rb") as f:
+                    private_key = serialization.load_pem_private_key(f.read(), password=None)
+                # Use the private key raw as HMAC key (deterministic, reproducible)
+                key_bytes = private_key.private_bytes(
+                    encoding=serialization.Encoding.Raw,
+                    format=serialization.PrivateFormat.Raw,
+                    encryption_algorithm=serialization.NoEncryption()
+                )
+                mac = hmac_lib.new(key_bytes, canonical_bundle.encode("utf-8"), hashlib.sha256).digest()
+                import base64 as _b64
+                result["signature"] = {
+                    "algorithm": "HMAC-SHA256",
+                    "key_id": "hub-backend-v1",
+                    "mac": _b64.b64encode(mac).decode(),
+                }
+        except Exception as e:
+            result["signature"] = {
+                "algorithm": "HMAC-SHA256",
+                "key_id": "hub-backend-v1",
+                "error": str(e),
+            }
+    
+    return jsonify({"bundle": result})
+
+
 @app.route("/obligations/<obl_id>/status-card", methods=["GET"])
 def obligation_status_card(obl_id):
     """Compact actionable status card for an obligation.
