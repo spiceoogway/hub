@@ -23,6 +23,7 @@ _ensure_deps()
 
 from flask import Flask, request, jsonify, redirect
 from flask_sock import Sock
+from contextlib import contextmanager
 import fcntl
 import json
 import os
@@ -160,6 +161,38 @@ MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
 EMAIL_DIR.mkdir(parents=True, exist_ok=True)
 ANALYTICS_DIR.mkdir(parents=True, exist_ok=True)
 SENT_DIR.mkdir(parents=True, exist_ok=True)
+AGENTS_LOCK_FILE = DATA_DIR / "agents.json.lock"
+
+
+def _atomic_json_dump(path, data):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        with open(tmp_path, "w") as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+@contextmanager
+def _exclusive_file_lock(lock_path):
+    lock_path = Path(lock_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_fd = open(lock_path, "w")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        lock_fd.close()
 
 def _log_agent_event(agent_id, event_type, metadata=None):
     """Append timestamped event to analytics log."""
@@ -170,21 +203,75 @@ def _log_agent_event(agent_id, event_type, metadata=None):
     log_file = ANALYTICS_DIR / "events.jsonl"
     with open(log_file, "a") as f:
         f.write(json.dumps(event) + "\n")
-    # Update liveness timestamps on agent record
-    _LIVENESS_EVENTS = {"inbox_poll": "last_inbox_check", "ws_connect": "last_ws_connect"}
-    if event_type in _LIVENESS_EVENTS:
-        _update_agent_liveness(agent_id, _LIVENESS_EVENTS[event_type])
+    if event_type == "inbox_poll":
+        _set_agent_liveness_fields(agent_id, {"last_inbox_check": datetime.utcnow().isoformat() + "Z"})
+    elif event_type == "ws_connect":
+        now = datetime.utcnow().isoformat() + "Z"
+        _set_agent_liveness_fields(agent_id, {"last_ws_connect": now, "ws_connected": True})
+    elif event_type == "ws_disconnect":
+        now = datetime.utcnow().isoformat() + "Z"
+        _set_agent_liveness_fields(agent_id, {"last_ws_disconnect": now, "ws_connected": False})
 
 
 def _update_agent_liveness(agent_id, field):
     """Update a liveness timestamp field on the agent record."""
+    _set_agent_liveness_fields(agent_id, {field: datetime.utcnow().isoformat() + "Z"})
+
+
+def _set_agent_liveness_fields(agent_id, fields):
+    """Atomically merge liveness fields into an agent record."""
     try:
-        agents = load_agents()
-        if agent_id in agents:
-            agents[agent_id].setdefault("liveness", {})[field] = datetime.utcnow().isoformat() + "Z"
-            save_agents(agents)
+        with agents_lock() as agents:
+            if agent_id in agents:
+                agents[agent_id].setdefault("liveness", {}).update(fields)
     except Exception:
         pass  # Non-critical — don't break the request on liveness tracking failure
+
+
+def _agent_has_live_websocket(agent_id):
+    with _ws_lock:
+        return bool(_ws_connections.get(agent_id))
+
+
+def _parse_iso_utc(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).rstrip("Z"))
+    except Exception:
+        return None
+
+
+def _agent_callback_delivery_ready(agent_info):
+    callback_url = agent_info.get("callback_url")
+    if not callback_url or not agent_info.get("callback_verified"):
+        return False
+    last_ok = _parse_iso_utc(agent_info.get("callback_last_ok_at"))
+    last_error = _parse_iso_utc(agent_info.get("callback_last_error_at"))
+    if last_error and (not last_ok or last_error >= last_ok):
+        return False
+    return True
+
+
+def _record_callback_attempt(agent_id, callback_url, callback_status, callback_error=None):
+    now = datetime.utcnow().isoformat() + "Z"
+    try:
+        with agents_lock() as agents:
+            info = agents.get(agent_id)
+            if not info:
+                return
+            if callback_url is not None:
+                info["callback_url"] = callback_url
+            info["callback_last_status"] = callback_status
+            if isinstance(callback_status, int) and callback_status < 400:
+                info["callback_last_ok_at"] = now
+                info["callback_last_error_at"] = None
+                info["callback_error"] = None
+            else:
+                info["callback_last_error_at"] = now
+                info["callback_error"] = callback_error
+    except Exception:
+        pass
 
 
 def _log_frame_check(obl_id, match_type, commitment_similarity, discussed_similarity, has_warning):
@@ -211,24 +298,16 @@ def _log_frame_check(obl_id, match_type, commitment_similarity, discussed_simila
         pass  # Non-critical — don't break the request on frame-check
 
 
-def _agent_delivery_capability(agent_info):
+def _agent_delivery_capability(agent_info, agent_id=None):
     """Compute delivery capability from agent config and liveness data.
     
     Returns: "callback" | "websocket" | "poll_active" | "poll_stale" | "none"
     """
-    # Has callback URL configured?
-    if agent_info.get("callback_url"):
+    if _agent_callback_delivery_ready(agent_info):
         return "callback"
-    # Active WebSocket?
+    if agent_id and _agent_has_live_websocket(agent_id):
+        return "websocket"
     liveness = agent_info.get("liveness", {})
-    ws_ts = liveness.get("last_ws_connect")
-    if ws_ts:
-        try:
-            ws_dt = datetime.fromisoformat(ws_ts.replace("Z", ""))
-            if (datetime.utcnow() - ws_dt).total_seconds() < 3600:  # connected within 1h
-                return "websocket"
-        except (ValueError, TypeError):
-            pass
     # Polls inbox?
     poll_ts = liveness.get("last_inbox_check")
     if poll_ts:
@@ -530,8 +609,30 @@ def load_agents():
     return {}
 
 def save_agents(agents):
-    with open(AGENTS_FILE, "w") as f:
-        json.dump(agents, f, indent=2)
+    with _exclusive_file_lock(AGENTS_LOCK_FILE):
+        _atomic_json_dump(AGENTS_FILE, agents)
+
+
+class agents_lock:
+    """Exclusive lock for load-modify-save agent mutations across workers."""
+
+    def __init__(self):
+        self._ctx = None
+        self._agents = None
+
+    def __enter__(self):
+        self._ctx = _exclusive_file_lock(AGENTS_LOCK_FILE)
+        self._ctx.__enter__()
+        self._agents = load_agents()
+        return self._agents
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            if exc_type is None:
+                _atomic_json_dump(AGENTS_FILE, self._agents)
+        finally:
+            self._ctx.__exit__(exc_type, exc_val, exc_tb)
+        return False
 
 
 def _trust_multiplier_from_decay(score):
@@ -873,6 +974,10 @@ def get_conversation_dir(agent_id):
 def get_conversation_path(agent_id, peer_id):
     return get_conversation_dir(agent_id) / f"{peer_id}.json"
 
+
+def _inbox_lock_path(agent_id):
+    return get_conversation_dir(agent_id) / ".inbox.lock"
+
 def _safe_load_json_list(path):
     if path.exists() and path.is_file():
         with open(path) as f:
@@ -918,7 +1023,8 @@ def load_inbox(agent_id):
     path = get_inbox_path(agent_id)
     return _safe_load_json_list(path)
 
-def save_inbox(agent_id, messages):
+
+def _save_inbox_unlocked(agent_id, messages):
     conv_dir = get_conversation_dir(agent_id)
     conv_dir.mkdir(parents=True, exist_ok=True)
 
@@ -927,23 +1033,28 @@ def save_inbox(agent_id, messages):
         peer_id = _infer_peer_for_inbox_message(agent_id, message)
         grouped[peer_id].append(message)
 
-    # Remove stale conversation files first so save_inbox remains authoritative.
-    for path in conv_dir.glob("*.json"):
-        if path.is_file():
-            path.unlink()
-
+    desired_paths = set()
     for peer_id, peer_messages in grouped.items():
         peer_messages.sort(key=_message_sort_key)
-        with open(get_conversation_path(agent_id, peer_id), "w") as f:
-            json.dump(peer_messages, f, indent=2)
+        conv_path = get_conversation_path(agent_id, peer_id)
+        desired_paths.add(conv_path.name)
+        _atomic_json_dump(conv_path, peer_messages)
+
+    for path in conv_dir.glob("*.json"):
+        if path.is_file() and path.name not in desired_paths:
+            path.unlink()
 
     # Preserve legacy flat file for non-migrated callers only if conversation dir doesn't exist.
     legacy_path = get_inbox_path(agent_id)
     if legacy_path.exists() and legacy_path.is_file() and not get_conversation_dir(agent_id).samefile(conv_dir):
-        with open(legacy_path, "w") as f:
-            json.dump(sorted(messages, key=_message_sort_key), f, indent=2)
+        _atomic_json_dump(legacy_path, sorted(messages, key=_message_sort_key))
 
     return messages
+
+
+def save_inbox(agent_id, messages):
+    with _exclusive_file_lock(_inbox_lock_path(agent_id)):
+        return _save_inbox_unlocked(agent_id, messages)
 
 
 def iter_message_records(messages_dir):
@@ -979,11 +1090,11 @@ def append_message_to_conversation(agent_id, peer_id, message):
     conv_dir = get_conversation_dir(agent_id)
     conv_dir.mkdir(parents=True, exist_ok=True)
     path = get_conversation_path(agent_id, peer_id)
-    msgs = _safe_load_json_list(path)
-    msgs.append(message)
-    msgs.sort(key=_message_sort_key)
-    with open(path, "w") as f:
-        json.dump(msgs, f, indent=2)
+    with _exclusive_file_lock(_inbox_lock_path(agent_id)):
+        msgs = _safe_load_json_list(path)
+        msgs.append(message)
+        msgs.sort(key=_message_sort_key)
+        _atomic_json_dump(path, msgs)
     return message
 
 
@@ -999,13 +1110,200 @@ def _get_sent_path(sender_id, recipient_id):
     return _get_sent_dir(sender_id) / f"{recipient_id}.json"
 
 
+def _sent_lock_path(sender_id, recipient_id):
+    path = _get_sent_path(sender_id, recipient_id)
+    return path.with_name(path.name + ".lock")
+
+
+def _write_sent_records_unlocked(sender_id, recipient_id, records):
+    _atomic_json_dump(_get_sent_path(sender_id, recipient_id), records)
+
+
+def _derive_delivery_state(delivered_channels, callback_status=None):
+    channels = list(dict.fromkeys(delivered_channels or []))
+    if "websocket" in channels and "callback" in channels:
+        return "websocket_callback_inbox_unacked"
+    if "websocket" in channels:
+        return "websocket_inbox_unacked"
+    if "callback" in channels:
+        return "callback_ok_inbox_unacked"
+    if "poll" in channels:
+        return "poll_delivered_inbox_unacked"
+    if callback_status is not None:
+        if callback_status == "failed" or (isinstance(callback_status, int) and callback_status >= 400):
+            return "callback_failed_inbox_only"
+    return "inbox_queued"
+
+
+def _derive_acknowledged_delivery_state(delivered_channels, callback_status=None):
+    channels = list(dict.fromkeys(delivered_channels or []))
+    if "websocket" in channels and "callback" in channels:
+        return "websocket_callback_read"
+    if "websocket" in channels:
+        return "websocket_read"
+    if "callback" in channels:
+        return "callback_read"
+    if "poll" in channels:
+        return "poll_read"
+    if callback_status is not None:
+        if callback_status == "failed" or (isinstance(callback_status, int) and callback_status >= 400):
+            return "callback_failed_inbox_read"
+    return "inbox_read"
+
+
+def _mutate_sent_records(sender_id, recipient_id, mutator):
+    path = _get_sent_path(sender_id, recipient_id)
+    with _exclusive_file_lock(_sent_lock_path(sender_id, recipient_id)):
+        records = _safe_load_json_list(path)
+        changed = bool(mutator(records))
+        if changed:
+            _write_sent_records_unlocked(sender_id, recipient_id, records)
+        return changed
+
+
+def _mark_sent_records_delivered(sender_id, recipient_id, message_ids, channel, delivered_at=None):
+    message_id_set = {m for m in message_ids if m}
+    if not message_id_set:
+        return False
+    delivered_at = delivered_at or (datetime.utcnow().isoformat() + "Z")
+
+    def _mutate(records):
+        changed = False
+        for record in records:
+            if record.get("message_id") not in message_id_set:
+                continue
+            channels = list(dict.fromkeys(record.get("delivered_channels") or []))
+            if channel not in channels:
+                channels.append(channel)
+            record["delivered_channels"] = channels
+            record["delivered_at"] = record.get("delivered_at") or delivered_at
+            if record.get("read"):
+                record["delivery_state"] = _derive_acknowledged_delivery_state(channels, record.get("callback_status"))
+            else:
+                record["delivery_state"] = _derive_delivery_state(channels, record.get("callback_status"))
+            changed = True
+        return changed
+
+    return _mutate_sent_records(sender_id, recipient_id, _mutate)
+
+
+def _mark_sent_records_read(sender_id, recipient_id, message_ids, read_at=None):
+    message_id_set = {m for m in message_ids if m}
+    if not message_id_set:
+        return False
+    read_at = read_at or (datetime.utcnow().isoformat() + "Z")
+
+    def _mutate(records):
+        changed = False
+        for record in records:
+            if record.get("message_id") not in message_id_set:
+                continue
+            if not record.get("read") or not record.get("read_at"):
+                record["read"] = True
+                record["read_at"] = read_at
+                changed = True
+            next_state = _derive_acknowledged_delivery_state(
+                record.get("delivered_channels"),
+                record.get("callback_status"),
+            )
+            if record.get("delivery_state") != next_state:
+                record["delivery_state"] = next_state
+                changed = True
+        return changed
+
+    return _mutate_sent_records(sender_id, recipient_id, _mutate)
+
+
+def _merge_delivery_channels(existing_channels, new_channels):
+    merged = []
+    for channel in list(existing_channels or []) + list(new_channels or []):
+        if channel and channel not in merged:
+            merged.append(channel)
+    return merged
+
+
+def _earliest_timestamp(*values):
+    candidates = [v for v in values if v]
+    if not candidates:
+        return None
+    parsed = []
+    for value in candidates:
+        dt = _parse_iso_utc(value)
+        if dt is None:
+            return candidates[0]
+        parsed.append((dt, value))
+    return min(parsed, key=lambda item: item[0])[1]
+
+
+def _update_sent_record(sender_id, recipient_id, message_id, **updates):
+    if not message_id:
+        return False
+
+    def _mutate(records):
+        changed = False
+        for record in records:
+            if record.get("message_id") != message_id:
+                continue
+            record.update(updates)
+            changed = True
+            break
+        return changed
+
+    return _mutate_sent_records(sender_id, recipient_id, _mutate)
+
+
+def _finalize_sent_record_delivery(
+    sender_id,
+    recipient_id,
+    message_id,
+    delivered_channels,
+    delivered_at=None,
+    callback_status=None,
+    callback_error=None,
+):
+    if not message_id:
+        return False
+
+    def _mutate(records):
+        changed = False
+        for record in records:
+            if record.get("message_id") != message_id:
+                continue
+            merged_channels = _merge_delivery_channels(record.get("delivered_channels"), delivered_channels)
+            record["delivered_channels"] = merged_channels
+            record["delivered_at"] = _earliest_timestamp(record.get("delivered_at"), delivered_at)
+            record["callback_status"] = callback_status
+            record["callback_error"] = callback_error
+            if record.get("read"):
+                record["delivery_state"] = _derive_acknowledged_delivery_state(merged_channels, callback_status)
+            else:
+                record["delivery_state"] = _derive_delivery_state(merged_channels, callback_status)
+            changed = True
+            break
+        return changed
+
+    return _mutate_sent_records(sender_id, recipient_id, _mutate)
+
+
+def _delete_sent_record(sender_id, recipient_id, message_id):
+    if not message_id:
+        return False
+
+    def _mutate(records):
+        before = len(records)
+        records[:] = [r for r in records if r.get("message_id") != message_id]
+        return len(records) != before
+
+    return _mutate_sent_records(sender_id, recipient_id, _mutate)
+
+
 def _append_sent_record(sender_id, recipient_id, record):
     """Append a delivery record to the sender's sent log for a recipient."""
-    path = _get_sent_path(sender_id, recipient_id)
-    records = _safe_load_json_list(path)
-    records.append(record)
-    with open(path, "w") as f:
-        json.dump(records, f, indent=2)
+    with _exclusive_file_lock(_sent_lock_path(sender_id, recipient_id)):
+        path = _get_sent_path(sender_id, recipient_id)
+        records = _safe_load_json_list(path)
+        records.append(record)
+        _write_sent_records_unlocked(sender_id, recipient_id, records)
 
 
 def _load_sent_records(sender_id, recipient_id=None):
@@ -1068,7 +1366,7 @@ def _compute_agent_liveness(agent_id, agents=None):
             liveness_class = "dormant"
     
     # Delivery capability (how messages can reach this agent)
-    delivery_cap = _agent_delivery_capability(info)
+    delivery_cap = _agent_delivery_capability(info, agent_id)
     
     # Inbox poll tracking
     liveness_data = info.get("liveness", {})
@@ -1406,7 +1704,7 @@ def index():
         "endpoints": {
             "registration": "POST /agents/register",
             "agents": "GET /agents | GET /agents/match?need=<query> (capability matching)",
-            "messaging": "POST /agents/<id>/message | GET /agents/<id>/messages?secret=&unread=true",
+            "messaging": "POST /agents/<id>/message | GET /agents/<id>/messages?secret=&unread=true&mark_read=false | GET /agents/<id>/messages/poll?secret= | POST /agents/<id>/messages/<message_id>/read",
             "trust": "GET /trust/<id> | POST /trust/attest | GET /trust/consistency/<id>",
             "bounties": "GET /bounties | POST /bounties | POST /bounties/<id>/claim",
             "assets": "GET /assets | POST /assets/register",
@@ -2504,6 +2802,7 @@ def update_agent(agent_id):
         return jsonify({"ok": False, "error": "Invalid secret"}), 403
     
     updated = []
+    callback_update = None
     if "callback_url" in data:
         new_callback = data["callback_url"]
         # Test the callback URL before saving
@@ -2518,101 +2817,107 @@ def update_agent(agent_id):
                 callback_ok = resp.status < 400
             except Exception as e:
                 callback_error = f"{type(e).__name__}: {str(e)[:100]}"
-        agents[agent_id]["callback_url"] = new_callback
-        agents[agent_id]["callback_verified"] = callback_ok
-        agents[agent_id]["callback_error"] = callback_error
+        callback_update = {
+            "callback_url": new_callback,
+            "callback_verified": callback_ok,
+            "callback_error": callback_error,
+            "callback_last_status": 200 if callback_ok else "verification_failed",
+            "callback_last_ok_at": datetime.utcnow().isoformat() + "Z" if callback_ok else None,
+            "callback_last_error_at": None if callback_ok else (datetime.utcnow().isoformat() + "Z" if new_callback else None),
+        }
         updated.append("callback_url")
         if not callback_ok and new_callback:
             updated.append(f"WARNING: callback test failed ({callback_error}). Messages may not be delivered.")
-    if "description" in data:
-        agents[agent_id]["description"] = data["description"]
-        updated.append("description")
-    if "capabilities" in data:
-        agents[agent_id]["capabilities"] = data["capabilities"]
-        updated.append("capabilities")
-    if "allowed_actions" in data:
-        if not isinstance(data["allowed_actions"], list) or not all(isinstance(x, str) for x in data["allowed_actions"]):
-            return jsonify({"ok": False, "error": "allowed_actions must be a list of strings"}), 400
-        agents[agent_id].setdefault("permissions", {}).setdefault("operator_constraints", {})["allowed_actions"] = data["allowed_actions"]
-        updated.append("allowed_actions")
-    if "permissions" in data:
-        perms = data["permissions"]
-        if not isinstance(perms, dict):
-            return jsonify({"ok": False, "error": "permissions must be an object"}), 400
-        existing = agents[agent_id].get("permissions") or {}
-        operator_constraints = perms.get("operator_constraints")
-        peer_grants = perms.get("peer_grants")
-        if operator_constraints is not None:
-            if not isinstance(operator_constraints, dict):
-                return jsonify({"ok": False, "error": "permissions.operator_constraints must be an object"}), 400
-            existing["operator_constraints"] = operator_constraints
-        if peer_grants is not None:
-            if not isinstance(peer_grants, list):
-                return jsonify({"ok": False, "error": "permissions.peer_grants must be a list"}), 400
-            existing["peer_grants"] = peer_grants
-        agents[agent_id]["permissions"] = existing
-        updated.append("permissions")
-    if "intent" in data:
-        intent = data["intent"]
-        if isinstance(intent, dict):
-            # Validate intent shape: {seeking, deadline, budget, match_criteria} — all optional strings
-            allowed_keys = {"seeking", "deadline", "budget", "match_criteria"}
-            intent = {k: str(v)[:500] for k, v in intent.items() if k in allowed_keys}
-            if intent:
-                intent["updated_at"] = datetime.utcnow().isoformat()
-                agents[agent_id]["intent"] = intent
-                updated.append("intent")
+    with agents_lock() as agents:
+        if agent_id not in agents:
+            return jsonify({"ok": False, "error": "Agent not found"}), 404
+        if agents[agent_id].get("secret") != secret:
+            return jsonify({"ok": False, "error": "Invalid secret"}), 403
+        if callback_update is not None:
+            agents[agent_id].update(callback_update)
+        if "description" in data:
+            agents[agent_id]["description"] = data["description"]
+            updated.append("description")
+        if "capabilities" in data:
+            agents[agent_id]["capabilities"] = data["capabilities"]
+            updated.append("capabilities")
+        if "allowed_actions" in data:
+            if not isinstance(data["allowed_actions"], list) or not all(isinstance(x, str) for x in data["allowed_actions"]):
+                return jsonify({"ok": False, "error": "allowed_actions must be a list of strings"}), 400
+            agents[agent_id].setdefault("permissions", {}).setdefault("operator_constraints", {})["allowed_actions"] = data["allowed_actions"]
+            updated.append("allowed_actions")
+        if "permissions" in data:
+            perms = data["permissions"]
+            if not isinstance(perms, dict):
+                return jsonify({"ok": False, "error": "permissions must be an object"}), 400
+            existing = agents[agent_id].get("permissions") or {}
+            operator_constraints = perms.get("operator_constraints")
+            peer_grants = perms.get("peer_grants")
+            if operator_constraints is not None:
+                if not isinstance(operator_constraints, dict):
+                    return jsonify({"ok": False, "error": "permissions.operator_constraints must be an object"}), 400
+                existing["operator_constraints"] = operator_constraints
+            if peer_grants is not None:
+                if not isinstance(peer_grants, list):
+                    return jsonify({"ok": False, "error": "permissions.peer_grants must be a list"}), 400
+                existing["peer_grants"] = peer_grants
+            agents[agent_id]["permissions"] = existing
+            updated.append("permissions")
+        if "intent" in data:
+            intent = data["intent"]
+            if isinstance(intent, dict):
+                allowed_keys = {"seeking", "deadline", "budget", "match_criteria"}
+                intent = {k: str(v)[:500] for k, v in intent.items() if k in allowed_keys}
+                if intent:
+                    intent["updated_at"] = datetime.utcnow().isoformat()
+                    agents[agent_id]["intent"] = intent
+                    updated.append("intent")
+                else:
+                    return jsonify({"ok": False, "error": "intent must contain at least one of: seeking, deadline, budget, match_criteria"}), 400
+            elif intent is None or intent == "":
+                agents[agent_id].pop("intent", None)
+                updated.append("intent (cleared)")
             else:
-                return jsonify({"ok": False, "error": "intent must contain at least one of: seeking, deadline, budget, match_criteria"}), 400
-        elif intent is None or intent == "":
-            # Clear intent
-            agents[agent_id].pop("intent", None)
-            updated.append("intent (cleared)")
-        else:
-            return jsonify({"ok": False, "error": "intent must be an object with {seeking, deadline, budget, match_criteria}"}), 400
-    if "heartbeat_interval" in data:
-        hb_interval = data["heartbeat_interval"]
-        if isinstance(hb_interval, dict):
-            # Shape: {seconds: int, description: str, last_active_utc: str}
-            allowed_hb_keys = {"seconds", "description", "last_active_utc"}
-            hb_interval = {k: v for k, v in hb_interval.items() if k in allowed_hb_keys}
-            if "seconds" in hb_interval:
-                try:
-                    hb_interval["seconds"] = int(hb_interval["seconds"])
-                except (ValueError, TypeError):
-                    return jsonify({"ok": False, "error": "heartbeat_interval.seconds must be an integer"}), 400
-            hb_interval["updated_at"] = datetime.utcnow().isoformat()
-            agents[agent_id]["heartbeat_interval"] = hb_interval
-            updated.append("heartbeat_interval")
-        elif hb_interval is None or hb_interval == "":
-            agents[agent_id].pop("heartbeat_interval", None)
-            updated.append("heartbeat_interval (cleared)")
-        elif isinstance(hb_interval, (int, float)):
-            agents[agent_id]["heartbeat_interval"] = {
-                "seconds": int(hb_interval),
-                "updated_at": datetime.utcnow().isoformat()
-            }
-            updated.append("heartbeat_interval")
-        else:
-            return jsonify({"ok": False, "error": "heartbeat_interval must be an object {seconds, description, last_active_utc} or an integer (seconds)"}), 400
-    if "obligation_webhook_url" in data:
-        owu = data["obligation_webhook_url"]
-        if owu and not isinstance(owu, str):
-            return jsonify({"ok": False, "error": "obligation_webhook_url must be a URL string or empty"}), 400
-        agents[agent_id]["obligation_webhook_url"] = owu or ""
-        updated.append("obligation_webhook_url")
-    if "solana_wallet" in data:
-        new_wallet = data["solana_wallet"]
-        agents[agent_id]["solana_wallet"] = new_wallet
-        agents[agent_id]["custodial"] = False  # BYOW overrides custodial
-        # Add to wallets list (both custodial + BYOW count for attestations)
-        wallets_list = agents[agent_id].get("wallets", [])
-        if new_wallet not in wallets_list:
-            wallets_list.append(new_wallet)
-        agents[agent_id]["wallets"] = wallets_list
-        updated.append("solana_wallet")
-    
-    save_agents(agents)
+                return jsonify({"ok": False, "error": "intent must be an object with {seeking, deadline, budget, match_criteria}"}), 400
+        if "heartbeat_interval" in data:
+            hb_interval = data["heartbeat_interval"]
+            if isinstance(hb_interval, dict):
+                allowed_hb_keys = {"seconds", "description", "last_active_utc"}
+                hb_interval = {k: v for k, v in hb_interval.items() if k in allowed_hb_keys}
+                if "seconds" in hb_interval:
+                    try:
+                        hb_interval["seconds"] = int(hb_interval["seconds"])
+                    except (ValueError, TypeError):
+                        return jsonify({"ok": False, "error": "heartbeat_interval.seconds must be an integer"}), 400
+                hb_interval["updated_at"] = datetime.utcnow().isoformat()
+                agents[agent_id]["heartbeat_interval"] = hb_interval
+                updated.append("heartbeat_interval")
+            elif hb_interval is None or hb_interval == "":
+                agents[agent_id].pop("heartbeat_interval", None)
+                updated.append("heartbeat_interval (cleared)")
+            elif isinstance(hb_interval, (int, float)):
+                agents[agent_id]["heartbeat_interval"] = {
+                    "seconds": int(hb_interval),
+                    "updated_at": datetime.utcnow().isoformat()
+                }
+                updated.append("heartbeat_interval")
+            else:
+                return jsonify({"ok": False, "error": "heartbeat_interval must be an object {seconds, description, last_active_utc} or an integer (seconds)"}), 400
+        if "obligation_webhook_url" in data:
+            owu = data["obligation_webhook_url"]
+            if owu and not isinstance(owu, str):
+                return jsonify({"ok": False, "error": "obligation_webhook_url must be a URL string or empty"}), 400
+            agents[agent_id]["obligation_webhook_url"] = owu or ""
+            updated.append("obligation_webhook_url")
+        if "solana_wallet" in data:
+            new_wallet = data["solana_wallet"]
+            agents[agent_id]["solana_wallet"] = new_wallet
+            agents[agent_id]["custodial"] = False
+            wallets_list = agents[agent_id].get("wallets", [])
+            if new_wallet not in wallets_list:
+                wallets_list.append(new_wallet)
+            agents[agent_id]["wallets"] = wallets_list
+            updated.append("solana_wallet")
     return jsonify({"ok": True, "updated": updated, "note": "callback_url = push delivery. solana_wallet = receive HUB tokens directly."})
 
 # ============ PUBKEY REGISTRY ============
@@ -3050,19 +3355,56 @@ def send_message(agent_id):
         msg["topic"] = topic[:100]  # cap at 100 chars
     if reply_to:
         msg["reply_to"] = reply_to
-    append_message_to_conversation(agent_id, from_agent, msg)
-    
-    # Update stats
-    agents[agent_id]["messages_received"] = agents[agent_id].get("messages_received", 0) + 1
-    agents[agent_id]["last_message_received_at"] = datetime.utcnow().isoformat()
-    if from_agent in agents:
-        agents[from_agent]["last_message_sent_at"] = datetime.utcnow().isoformat()
-    save_agents(agents)
+    with agents_lock() as mutable_agents:
+        callback_url = mutable_agents[agent_id].get("callback_url")
+        callback_verified = bool(callback_url) and bool(mutable_agents[agent_id].get("callback_verified"))
+
+    sent_record = {
+        "message_id": msg["id"],
+        "to": agent_id,
+        "message_preview": message[:100] + ("..." if len(message) > 100 else ""),
+        "timestamp": msg["timestamp"],
+        "delivery_state": "inbox_queued",
+        "delivered_channels": [],
+        "delivered_at": None,
+        "callback_status": None,
+        "callback_url_configured": bool(callback_url),
+        "callback_verified": callback_verified,
+        "callback_error": None,
+        "read": False,
+        "read_at": None,
+    }
+    if topic:
+        sent_record["topic"] = msg["topic"]
+    if reply_to:
+        sent_record["reply_to"] = reply_to
+    try:
+        _append_sent_record(from_agent, agent_id, sent_record)
+    except Exception as e:
+        print(f"[SENT] Failed to persist sent record for {from_agent}->{agent_id}: {e}")
+        return jsonify({"ok": False, "error": "Failed to persist sender delivery record"}), 500
+
+    try:
+        append_message_to_conversation(agent_id, from_agent, msg)
+    except Exception:
+        try:
+            _delete_sent_record(from_agent, agent_id, msg["id"])
+        except Exception as cleanup_error:
+            print(f"[SENT] Failed to cleanup precreated sent record for {from_agent}->{agent_id}: {cleanup_error}")
+        raise
+
+    with agents_lock() as mutable_agents:
+        mutable_agents[agent_id]["messages_received"] = mutable_agents[agent_id].get("messages_received", 0) + 1
+        mutable_agents[agent_id]["last_message_received_at"] = datetime.utcnow().isoformat()
+        if from_agent in mutable_agents:
+            mutable_agents[from_agent]["last_message_sent_at"] = datetime.utcnow().isoformat()
     
     print(f"[MSG] {from_agent} -> {agent_id}: {message[:50]}...")
     
     # WebSocket push (real-time delivery to connected clients)
-    _ws_push_message(agent_id, msg)
+    ws_delivered = _ws_push_message(agent_id, msg)
+    delivered_channels = ["websocket"] if ws_delivered else []
+    delivered_at = datetime.utcnow().isoformat() + "Z" if ws_delivered else None
     
     # Telegram push notification
     notify = _load_notify_settings()
@@ -3098,7 +3440,6 @@ def send_message(agent_id):
                 print(f"[NOTIFY] Webhook failed: {e}")
     
     # Optional: try callback if configured
-    callback_url = agents[agent_id].get("callback_url")
     callback_status = None
     callback_error = None
     if callback_url:
@@ -3108,56 +3449,29 @@ def send_message(agent_id):
             callback_status = r.status_code
             if r.status_code >= 400:
                 _log_agent_event(agent_id, "callback_failed", {"url": callback_url, "status": r.status_code, "from": from_agent})
+            else:
+                if "callback" not in delivered_channels:
+                    delivered_channels.append("callback")
+                delivered_at = delivered_at or (datetime.utcnow().isoformat() + "Z")
         except Exception as e:
             callback_status = "failed"
             callback_error = str(e)[:200]
             _log_agent_event(agent_id, "callback_failed", {"url": callback_url, "error": str(e)[:100], "from": from_agent})
+        _record_callback_attempt(agent_id, callback_url, callback_status, callback_error)
 
-    # Explicit delivery contract fields
-    if not callback_url:
-        delivery_state = "inbox_delivered_no_callback"
-    elif isinstance(callback_status, int) and callback_status < 400:
-        delivery_state = "callback_ok_inbox_delivered"
-    else:
-        delivery_state = "callback_failed_inbox_delivered"
-
-    # Mark message as read on successful callback delivery
-    # (same semantics as WebSocket delivery at lines 2284-2302)
-    callback_read = isinstance(callback_status, int) and callback_status < 400
-    read_at_cb = None
-    if callback_read:
-        read_at_cb = datetime.utcnow().isoformat() + "Z"
-        try:
-            cb_inbox = load_inbox(agent_id)
-            for m in cb_inbox:
-                if m.get("id") == msg["id"]:
-                    m["read"] = True
-                    m["read_at"] = read_at_cb
-                    break
-            save_inbox(agent_id, cb_inbox)
-        except Exception as e:
-            print(f"[CALLBACK] Failed to mark message as read for {agent_id}: {e}")
-
-    # Persist sender-side delivery record
-    sent_record = {
-        "message_id": msg["id"],
-        "to": agent_id,
-        "message_preview": message[:100] + ("..." if len(message) > 100 else ""),
-        "timestamp": msg["timestamp"],
-        "delivery_state": delivery_state,
-        "callback_status": callback_status,
-        "callback_url_configured": bool(callback_url),
-        "read": callback_read,
-        "read_at": read_at_cb if callback_read else None,
-    }
-    if topic:
-        sent_record["topic"] = msg["topic"]
-    if reply_to:
-        sent_record["reply_to"] = reply_to
+    delivery_state = _derive_delivery_state(delivered_channels, callback_status)
     try:
-        _append_sent_record(from_agent, agent_id, sent_record)
+        _finalize_sent_record_delivery(
+            from_agent,
+            agent_id,
+            msg["id"],
+            delivered_channels,
+            delivered_at=delivered_at,
+            callback_status=callback_status,
+            callback_error=callback_error,
+        )
     except Exception as e:
-        print(f"[SENT] Failed to persist sent record for {from_agent}->{agent_id}: {e}")
+        print(f"[SENT] Failed to update sent record for {from_agent}->{agent_id}: {e}")
 
     return jsonify({
         "ok": True,
@@ -3186,6 +3500,7 @@ def poll_messages(agent_id):
         return jsonify({"ok": False, "error": "Not found"}), 404
     if agents[agent_id].get("secret") != secret:
         return jsonify({"ok": False, "error": "Invalid secret"}), 403
+    _log_agent_event(agent_id, "inbox_poll")
     
     # Reject excess concurrent polls for this agent
     current = _active_poll_count.get(agent_id, 0)
@@ -3220,32 +3535,17 @@ def poll_messages(agent_id):
                 unread = [m for m in unread if inbox.index(m) > last_offset]
             
             if unread:
-                # Mark delivered messages as read + propagate read receipts
-                unread_ids = {m.get("id") for m in unread}
-                read_at = datetime.utcnow().isoformat() + "Z"
-                read_receipts = {}  # sender_id -> [message_id, ...]
-                for m in inbox:
-                    if m.get("id") in unread_ids and not m.get("read"):
-                        m["read"] = True
-                        m["read_at"] = read_at
-                        sender = m.get("from")
-                        if sender:
-                            read_receipts.setdefault(sender, []).append(m["id"])
-                save_inbox(agent_id, inbox)
-                # Propagate read receipts to senders' sent logs
-                for sender_id, msg_ids in read_receipts.items():
+                delivered_at = datetime.utcnow().isoformat() + "Z"
+                delivered_by_sender = {}
+                for m in unread:
+                    sender = m.get("from")
+                    if sender:
+                        delivered_by_sender.setdefault(sender, []).append(m.get("id"))
+                for sender_id, msg_ids in delivered_by_sender.items():
                     try:
-                        sent_path = _get_sent_path(sender_id, agent_id)
-                        sent_records = _safe_load_json_list(sent_path)
-                        msg_id_set = set(msg_ids)
-                        for sr in sent_records:
-                            if sr.get("message_id") in msg_id_set:
-                                sr["read"] = True
-                                sr["read_at"] = read_at
-                        with open(sent_path, "w") as f:
-                            json.dump(sent_records, f, indent=2)
+                        _mark_sent_records_delivered(sender_id, agent_id, msg_ids, "poll", delivered_at)
                     except Exception as e:
-                        print(f"[SENT] Failed to propagate poll read receipts to {sender_id}: {e}")
+                        print(f"[SENT] Failed to record poll delivery for {sender_id}: {e}")
                 
                 # Map fields for channel adapter compatibility
                 adapted = []
@@ -3289,12 +3589,15 @@ def ws_messages(ws, agent_id):
         return
 
     secret = auth.get("secret", "")
+    probe = bool(auth.get("probe"))
     agents = load_agents()
     if agent_id not in agents or agents[agent_id].get("secret") != secret:
         ws.send(json.dumps({"ok": False, "error": "Invalid agent_id or secret"}))
         return
 
-    ws.send(json.dumps({"ok": True, "type": "auth", "agent_id": agent_id}))
+    ws.send(json.dumps({"ok": True, "type": "auth", "agent_id": agent_id, "probe": probe}))
+    if probe:
+        return
 
     # Register this connection
     with _ws_lock:
@@ -3308,7 +3611,8 @@ def ws_messages(ws, agent_id):
             if not unread:
                 return
 
-            unread_ids = {m.get("id") for m in unread}
+            delivered_at = datetime.utcnow().isoformat() + "Z"
+            delivered_by_sender = {}
             for m in unread:
                 ws.send(json.dumps({
                     "type": "message",
@@ -3319,30 +3623,14 @@ def ws_messages(ws, agent_id):
                         "timestamp": m.get("timestamp", ""),
                     }
                 }))
-
-            read_at_ws = datetime.utcnow().isoformat() + "Z"
-            ws_read_receipts = {}
-            for m in inbox:
-                if m.get("id") in unread_ids and not m.get("read"):
-                    m["read"] = True
-                    m["read_at"] = read_at_ws
-                    sender = m.get("from")
-                    if sender:
-                        ws_read_receipts.setdefault(sender, []).append(m["id"])
-            save_inbox(agent_id, inbox)
-            for sender_id, msg_ids in ws_read_receipts.items():
+                sender = m.get("from")
+                if sender:
+                    delivered_by_sender.setdefault(sender, []).append(m.get("id"))
+            for sender_id, msg_ids in delivered_by_sender.items():
                 try:
-                    sent_path = _get_sent_path(sender_id, agent_id)
-                    sent_records = _safe_load_json_list(sent_path)
-                    msg_id_set = set(msg_ids)
-                    for sr in sent_records:
-                        if sr.get("message_id") in msg_id_set:
-                            sr["read"] = True
-                            sr["read_at"] = read_at_ws
-                    with open(sent_path, "w") as f:
-                        json.dump(sent_records, f, indent=2)
+                    _mark_sent_records_delivered(sender_id, agent_id, msg_ids, "websocket", delivered_at)
                 except Exception as e:
-                    print(f"[SENT] Failed to propagate WS read receipts to {sender_id}: {e}")
+                    print(f"[SENT] Failed to record WS delivery for {sender_id}: {e}")
 
         _deliver_unread_once()
 
@@ -3386,16 +3674,19 @@ def _ws_push_message(agent_id: str, message: dict):
         }
     }
     payload = json.dumps(adapted)
+    delivered = False
     with _ws_lock:
         conns = _ws_connections.get(agent_id, [])
         dead = []
         for ws_conn in conns:
             try:
                 ws_conn.send(payload)
+                delivered = True
             except Exception:
                 dead.append(ws_conn)
         for d in dead:
             conns.remove(d)
+    return delivered
 
 
 @app.route("/agents/<agent_id>/messages", methods=["GET"])
@@ -3437,56 +3728,46 @@ def get_messages(agent_id):
     # Mark as read behavior:
     # - explicit mark_read=true -> mark returned messages as read
     # - explicit mark_read=false -> never mark
-    # - default for unread=true -> mark returned messages as read (consume semantics)
+    # - default -> do not mark; explicit read acknowledgements should flow through
+    #   POST /agents/<id>/messages/<message_id>/read or mark_read=true.
     mr = request.args.get("mark_read", "").lower()
     if mr in ("true", "1", "yes"):
         should_mark_read = True
     elif mr in ("false", "0", "no"):
         should_mark_read = False
     else:
-        should_mark_read = unread_only
+        should_mark_read = False
 
     if should_mark_read and messages:
         message_ids = {m.get("id") for m in messages}
         read_at = datetime.utcnow().isoformat() + "Z"
         changed = False
-        # Collect sender->message_ids for read receipt propagation
-        # Also backfill read_at for messages marked read without read_at
-        # (e.g. by WS adapter consuming messages)
-        read_receipts = {}  # sender_id -> [message_id, ...]
-        for m in full_inbox:
-            if m.get("id") in message_ids:
-                needs_propagation = False
-                if not m.get("read"):
-                    m["read"] = True
-                    m["read_at"] = read_at
-                    needs_propagation = True
-                    changed = True
-                elif not m.get("read_at"):
-                    # Backfill read_at for messages marked read without timestamp
-                    m["read_at"] = read_at
-                    needs_propagation = True
-                    changed = True
-                if needs_propagation:
-                    sender = m.get("from")
-                    if sender:
-                        read_receipts.setdefault(sender, []).append(m["id"])
-        if changed:
-            save_inbox(agent_id, full_inbox)
-            # Propagate read receipts to senders' sent logs
-            for sender_id, msg_ids in read_receipts.items():
-                try:
-                    sent_path = _get_sent_path(sender_id, agent_id)
-                    sent_records = _safe_load_json_list(sent_path)
-                    msg_id_set = set(msg_ids)
-                    for sr in sent_records:
-                        if sr.get("message_id") in msg_id_set:
-                            sr["read"] = True
-                            sr["read_at"] = read_at
-                    with open(sent_path, "w") as f:
-                        json.dump(sent_records, f, indent=2)
-                except Exception as e:
-                    print(f"[SENT] Failed to propagate bulk read receipts to {sender_id}: {e}")
+        read_receipts = {}
+        with _exclusive_file_lock(_inbox_lock_path(agent_id)):
+            full_inbox = load_inbox(agent_id)
+            for m in full_inbox:
+                if m.get("id") in message_ids:
+                    needs_propagation = False
+                    if not m.get("read"):
+                        m["read"] = True
+                        m["read_at"] = read_at
+                        needs_propagation = True
+                        changed = True
+                    elif not m.get("read_at"):
+                        m["read_at"] = read_at
+                        needs_propagation = True
+                        changed = True
+                    if needs_propagation:
+                        sender = m.get("from")
+                        if sender:
+                            read_receipts.setdefault(sender, []).append(m["id"])
+            if changed:
+                _save_inbox_unlocked(agent_id, full_inbox)
+        for sender_id, msg_ids in read_receipts.items():
+            try:
+                _mark_sent_records_read(sender_id, agent_id, msg_ids, read_at)
+            except Exception as e:
+                print(f"[SENT] Failed to propagate bulk read receipts to {sender_id}: {e}")
 
         # Reflect read status in response payload as well
         for m in messages:
@@ -3511,33 +3792,27 @@ def mark_message_read(agent_id, message_id):
     if agents[agent_id].get("secret") != secret:
         return jsonify({"ok": False, "error": "Invalid secret"}), 403
 
-    inbox = load_inbox(agent_id)
+    read_at = datetime.utcnow().isoformat() + "Z"
     found = False
     sender_id = None
-    for m in inbox:
-        if m.get("id") == message_id:
-            m["read"] = True
-            m["read_at"] = datetime.utcnow().isoformat() + "Z"
-            sender_id = m.get("from")
-            found = True
-            break
+    with _exclusive_file_lock(_inbox_lock_path(agent_id)):
+        inbox = load_inbox(agent_id)
+        for m in inbox:
+            if m.get("id") == message_id:
+                m["read"] = True
+                m["read_at"] = read_at
+                sender_id = m.get("from")
+                found = True
+                break
+        if found:
+            _save_inbox_unlocked(agent_id, inbox)
     if not found:
         return jsonify({"ok": False, "error": "Message not found"}), 404
-
-    save_inbox(agent_id, inbox)
 
     # Propagate read receipt to sender's sent log
     if sender_id:
         try:
-            sent_path = _get_sent_path(sender_id, agent_id)
-            sent_records = _safe_load_json_list(sent_path)
-            for sr in sent_records:
-                if sr.get("message_id") == message_id:
-                    sr["read"] = True
-                    sr["read_at"] = datetime.utcnow().isoformat() + "Z"
-                    break
-            with open(sent_path, "w") as f:
-                json.dump(sent_records, f, indent=2)
+            _mark_sent_records_read(sender_id, agent_id, [message_id], read_at)
         except Exception as e:
             print(f"[SENT] Failed to propagate read receipt for {message_id}: {e}")
 
@@ -3562,30 +3837,28 @@ def delete_inbox_message(agent_id, message_id):
     if agents[agent_id].get("secret") != secret:
         return jsonify({"ok": False, "error": "Invalid secret"}), 403
 
-    # Remove from per-conversation files
-    conv_dir = get_conversation_dir(agent_id)
     found = False
-    if conv_dir.exists():
-        for conv_file in conv_dir.glob("*.json"):
-            msgs = _safe_load_json_list(conv_file)
+    with _exclusive_file_lock(_inbox_lock_path(agent_id)):
+        conv_dir = get_conversation_dir(agent_id)
+        if conv_dir.exists():
+            for conv_file in conv_dir.glob("*.json"):
+                msgs = _safe_load_json_list(conv_file)
+                before = len(msgs)
+                msgs = [m for m in msgs if m.get("id") != message_id]
+                if len(msgs) < before:
+                    found = True
+                    _atomic_json_dump(conv_file, msgs)
+                    break
+
+        # Also remove from flat inbox if it exists (legacy)
+        flat_path = MESSAGES_DIR / f"{agent_id}.json"
+        if flat_path.exists():
+            msgs = _safe_load_json_list(flat_path)
             before = len(msgs)
             msgs = [m for m in msgs if m.get("id") != message_id]
             if len(msgs) < before:
                 found = True
-                with open(conv_file, "w") as f:
-                    json.dump(msgs, f, indent=2)
-                break
-
-    # Also remove from flat inbox if it exists (legacy)
-    flat_path = MESSAGES_DIR / f"{agent_id}.json"
-    if flat_path.exists():
-        msgs = _safe_load_json_list(flat_path)
-        before = len(msgs)
-        msgs = [m for m in msgs if m.get("id") != message_id]
-        if len(msgs) < before:
-            found = True
-            with open(flat_path, "w") as f:
-                json.dump(msgs, f, indent=2)
+                _atomic_json_dump(flat_path, msgs)
 
     if not found:
         return jsonify({"ok": False, "error": "Message not found"}), 404
@@ -3614,14 +3887,14 @@ def delete_sent_message(agent_id, message_id):
     found = False
     if sent_dir.exists():
         for sent_file in sent_dir.glob("*.json"):
-            records = _safe_load_json_list(sent_file)
-            before = len(records)
-            records = [r for r in records if r.get("message_id") != message_id]
-            if len(records) < before:
-                found = True
-                with open(sent_file, "w") as f:
-                    json.dump(records, f, indent=2)
-                break
+            with _exclusive_file_lock(_sent_lock_path(agent_id, sent_file.stem)):
+                records = _safe_load_json_list(sent_file)
+                before = len(records)
+                records = [r for r in records if r.get("message_id") != message_id]
+                if len(records) < before:
+                    found = True
+                    _write_sent_records_unlocked(agent_id, sent_file.stem, records)
+                    break
 
     if not found:
         return jsonify({"ok": False, "error": "Sent record not found"}), 404
@@ -3659,20 +3932,21 @@ def bulk_delete_sent(agent_id):
     for sent_file in files:
         if not sent_file.exists():
             continue
-        records = _safe_load_json_list(sent_file)
-        before_len = len(records)
+        recipient_id = sent_file.stem
+        with _exclusive_file_lock(_sent_lock_path(agent_id, recipient_id)):
+            records = _safe_load_json_list(sent_file)
+            before_len = len(records)
 
-        if message_ids:
-            id_set = set(message_ids)
-            records = [r for r in records if r.get("message_id") not in id_set]
-        elif before_filter:
-            records = [r for r in records if r.get("timestamp", "") >= before_filter]
-        else:
-            continue
+            if message_ids:
+                id_set = set(message_ids)
+                records = [r for r in records if r.get("message_id") not in id_set]
+            elif before_filter:
+                records = [r for r in records if r.get("timestamp", "") >= before_filter]
+            else:
+                continue
 
-        deleted_count += before_len - len(records)
-        with open(sent_file, "w") as f:
-            json.dump(records, f, indent=2)
+            deleted_count += before_len - len(records)
+            _write_sent_records_unlocked(agent_id, recipient_id, records)
 
     return jsonify({"ok": True, "deleted_count": deleted_count})
 
@@ -3683,8 +3957,10 @@ def get_sent_messages(agent_id):
     Auth: agent's secret (query param or X-Agent-Secret header).
     Query params:
         to: filter by recipient agent_id
-        delivery_status: filter by delivery_state (inbox_delivered_no_callback,
-                         callback_ok_inbox_delivered, callback_failed_inbox_delivered)
+        delivery_status: filter by delivery_state (inbox_queued,
+                         websocket_inbox_unacked, callback_ok_inbox_unacked,
+                         websocket_callback_inbox_unacked, poll_delivered_inbox_unacked,
+                         callback_failed_inbox_only)
         since: ISO timestamp — only messages after this time
         limit: max results (default 50, max 200)
     Returns: list of sent message records with delivery metadata.
@@ -3722,7 +3998,7 @@ def get_sent_messages(agent_id):
         if to_agent in agents:
             liveness = _compute_agent_liveness(to_agent, agents)
             r["recipient_liveness"] = liveness.get("liveness_class", "unknown")
-            r["recipient_delivery_capability"] = _agent_delivery_capability(agents[to_agent])
+            r["recipient_delivery_capability"] = _agent_delivery_capability(agents[to_agent], to_agent)
 
     return jsonify({
         "ok": True,
@@ -3783,11 +4059,11 @@ def broadcast():
     
     # Deliver to all agents except sender
     delivered = []
-    for agent_id in agents:
+    delivered_stats = []
+    for agent_id in list(agents.keys()):
         if agent_id == from_agent:
             continue
         
-        inbox = load_inbox(agent_id)
         msg = {
             "id": secrets.token_hex(8),
             "from": from_agent,
@@ -3796,17 +4072,46 @@ def broadcast():
             "read": False,
             "is_broadcast": True
         }
-        inbox.append(msg)
-        save_inbox(agent_id, inbox)
+        sent_record = {
+            "message_id": msg["id"],
+            "to": agent_id,
+            "message_preview": msg["message"][:100] + ("..." if len(msg["message"]) > 100 else ""),
+            "timestamp": msg["timestamp"],
+            "delivery_state": "inbox_queued",
+            "delivered_channels": [],
+            "delivered_at": None,
+            "callback_status": None,
+            "callback_url_configured": bool(agents.get(agent_id, {}).get("callback_url")),
+            "callback_verified": bool(agents.get(agent_id, {}).get("callback_verified")),
+            "callback_error": None,
+            "read": False,
+            "read_at": None,
+            "is_broadcast": True,
+            "broadcast_type": msg_type,
+        }
+        try:
+            _append_sent_record(from_agent, agent_id, sent_record)
+        except Exception as e:
+            print(f"[BROADCAST] Failed to persist sent record for {from_agent}->{agent_id}: {e}")
+            continue
+        try:
+            append_message_to_conversation(agent_id, from_agent, msg)
+        except Exception:
+            try:
+                _delete_sent_record(from_agent, agent_id, msg["id"])
+            except Exception as cleanup_error:
+                print(f"[BROADCAST] Failed to cleanup sent record for {from_agent}->{agent_id}: {cleanup_error}")
+            continue
         delivered.append(agent_id)
-        
-        # Update stats
-        agents[agent_id]["messages_received"] = agents[agent_id].get("messages_received", 0) + 1
-        agents[agent_id]["last_message_received_at"] = datetime.utcnow().isoformat()
-    
-    if from_agent in agents:
-        agents[from_agent]["last_message_sent_at"] = datetime.utcnow().isoformat()
-    save_agents(agents)
+        delivered_stats.append(agent_id)
+
+    with agents_lock() as mutable_agents:
+        for delivered_agent_id in delivered_stats:
+            if delivered_agent_id in mutable_agents:
+                mutable_agents[delivered_agent_id]["messages_received"] = mutable_agents[delivered_agent_id].get("messages_received", 0) + 1
+                mutable_agents[delivered_agent_id]["last_message_received_at"] = datetime.utcnow().isoformat()
+        if from_agent in mutable_agents:
+            mutable_agents[from_agent]["last_message_sent_at"] = datetime.utcnow().isoformat()
     
     print(f"[BROADCAST] {from_agent} -> {len(delivered)} agents: {msg_type}")
     
@@ -3872,11 +4177,11 @@ def announce():
     
     # Deliver to all agents except sender
     delivered = []
-    for agent_id in agents:
+    delivered_stats = []
+    for agent_id in list(agents.keys()):
         if agent_id == from_agent:
             continue
         
-        inbox = load_inbox(agent_id)
         msg = {
             "id": secrets.token_hex(8),
             "from": from_agent,
@@ -3885,17 +4190,46 @@ def announce():
             "read": False,
             "is_announcement": True
         }
-        inbox.append(msg)
-        save_inbox(agent_id, inbox)
+        sent_record = {
+            "message_id": msg["id"],
+            "to": agent_id,
+            "message_preview": msg["message"][:100] + ("..." if len(msg["message"]) > 100 else ""),
+            "timestamp": msg["timestamp"],
+            "delivery_state": "inbox_queued",
+            "delivered_channels": [],
+            "delivered_at": None,
+            "callback_status": None,
+            "callback_url_configured": bool(agents.get(agent_id, {}).get("callback_url")),
+            "callback_verified": bool(agents.get(agent_id, {}).get("callback_verified")),
+            "callback_error": None,
+            "read": False,
+            "read_at": None,
+            "is_announcement": True,
+            "announcement_endpoint": endpoint,
+        }
+        try:
+            _append_sent_record(from_agent, agent_id, sent_record)
+        except Exception as e:
+            print(f"[ANNOUNCE] Failed to persist sent record for {from_agent}->{agent_id}: {e}")
+            continue
+        try:
+            append_message_to_conversation(agent_id, from_agent, msg)
+        except Exception:
+            try:
+                _delete_sent_record(from_agent, agent_id, msg["id"])
+            except Exception as cleanup_error:
+                print(f"[ANNOUNCE] Failed to cleanup sent record for {from_agent}->{agent_id}: {cleanup_error}")
+            continue
         delivered.append(agent_id)
-        
-        # Update stats
-        agents[agent_id]["messages_received"] = agents[agent_id].get("messages_received", 0) + 1
-        agents[agent_id]["last_message_received_at"] = datetime.utcnow().isoformat()
-    
-    if from_agent in agents:
-        agents[from_agent]["last_message_sent_at"] = datetime.utcnow().isoformat()
-    save_agents(agents)
+        delivered_stats.append(agent_id)
+
+    with agents_lock() as mutable_agents:
+        for delivered_agent_id in delivered_stats:
+            if delivered_agent_id in mutable_agents:
+                mutable_agents[delivered_agent_id]["messages_received"] = mutable_agents[delivered_agent_id].get("messages_received", 0) + 1
+                mutable_agents[delivered_agent_id]["last_message_received_at"] = datetime.utcnow().isoformat()
+        if from_agent in mutable_agents:
+            mutable_agents[from_agent]["last_message_sent_at"] = datetime.utcnow().isoformat()
     
     print(f"[ANNOUNCE] {from_agent} -> {endpoint} (delivered to {len(delivered)} agents)")
     
@@ -7308,16 +7642,16 @@ def file_dispute():
     
     # Notify the accused
     try:
-        inbox = load_inbox(against)
-        inbox.append({
-            "id": secrets.token_hex(8),
-            "from": "system",
-            "message": f"⚠️ Dispute filed against you by {from_agent}. Category: {category}. Dispute ID: {dispute_id}. You have 48h to submit counter-evidence via POST /trust/dispute/{dispute_id}/respond",
-            "timestamp": datetime.utcnow().isoformat(),
-            "read": False,
-            "priority": "high"
-        })
-        save_inbox(against, inbox)
+        _deliver_internal_dm(
+            "system",
+            against,
+            f"⚠️ Dispute filed against you by {from_agent}. Category: {category}. Dispute ID: {dispute_id}. You have 48h to submit counter-evidence via POST /trust/dispute/{dispute_id}/respond",
+            "dispute_filed",
+            {
+                "dispute_id": dispute_id,
+                "priority": "high",
+            },
+        )
     except:
         pass
     
@@ -9746,21 +10080,22 @@ def post_demand():
         supplier_id = match["agent_id"]
         try:
             budget_str = f"{budget.get('amount', '?')} {budget.get('currency', '?')}" if budget else "unspecified"
-            notification = {
-                "id": secrets.token_hex(8),
-                "from": "hub-demand-match",
-                "message": f"New demand matches your capability '{match['capability']}':\n\n"
-                          f"Agent {agent_id} needs: {capability}\n"
-                          f"Description: {description}\n"
-                          f"Budget: {budget_str}\n"
-                          f"Deadline: {demand.get('deadline', 'none')}\n\n"
-                          f"Demand ID: {demand_id}\n"
-                          f"Reply to {agent_id} via POST /agents/{agent_id}/message to bid.",
-                "timestamp": datetime.utcnow().isoformat(),
-                "read": False,
-                "type": "demand-match"
-            }
-            append_message_to_conversation(supplier_id, "hub-demand-match", notification)
+            _deliver_internal_dm(
+                "hub-demand-match",
+                supplier_id,
+                f"New demand matches your capability '{match['capability']}':\n\n"
+                f"Agent {agent_id} needs: {capability}\n"
+                f"Description: {description}\n"
+                f"Budget: {budget_str}\n"
+                f"Deadline: {demand.get('deadline', 'none')}\n\n"
+                f"Demand ID: {demand_id}\n"
+                f"Reply to {agent_id} via POST /agents/{agent_id}/message to bid.",
+                "demand-match",
+                {
+                    "demand_id": demand_id,
+                    "capability": match["capability"],
+                },
+            )
             notified.append(supplier_id)
         except Exception:
             pass
@@ -12231,15 +12566,20 @@ def hub_analytics():
     delivery_status = []
     for agent_id, agent_data in agents.items():
         callback = agent_data.get("callback_url", "")
-        has_callback = bool(callback)
+        callback_ready = _agent_callback_delivery_ready(agent_data)
+        has_callback = callback_ready
         has_poll = agent_id in poll_counts
+        has_ws = _agent_has_live_websocket(agent_id)
         delivery_status.append({
             "agent_id": agent_id,
             "callback_url": callback or None,
+            "callback_verified": bool(callback) and bool(agent_data.get("callback_verified")),
+            "callback_ready": callback_ready,
             "has_callback": has_callback,
             "has_polled": has_poll,
+            "has_websocket": has_ws,
             "poll_count": poll_counts.get(agent_id, 0),
-            "delivery": "callback" if has_callback else ("poll" if has_poll else "NONE"),
+            "delivery": "websocket" if has_ws else ("callback" if has_callback else ("poll" if has_poll else "NONE")),
         })
 
     # Error summary
@@ -12282,8 +12622,8 @@ def hub_reachability():
 
     An agent is 'reachable' if ANY of:
       - polled inbox in last 7 days
-      - connected via WebSocket in last 7 days
-      - has a callback URL registered
+      - has an active WebSocket right now
+      - has a verified callback URL
 
     Returns per-agent reachability + summary stats including bilateral_reachable.
     """
@@ -12305,11 +12645,12 @@ def hub_reachability():
 
         liveness = agent_data.get("liveness", {})
         callback = agent_data.get("callback_url", "")
+        callback_ready = _agent_callback_delivery_ready(agent_data)
 
         channels = []
         last_seen = None
 
-        for field, label in [("last_inbox_check", "poll"), ("last_ws_connect", "ws")]:
+        for field, label in [("last_inbox_check", "poll")]:
             ts_str = liveness.get(field)
             if ts_str:
                 try:
@@ -12321,7 +12662,18 @@ def hub_reachability():
                 except Exception:
                     pass
 
-        if callback:
+        if _agent_has_live_websocket(agent_id):
+            channels.append("ws")
+            ws_seen = liveness.get("last_ws_connect")
+            if ws_seen:
+                try:
+                    ws_dt = datetime.fromisoformat(ws_seen.rstrip("Z"))
+                    if last_seen is None or ws_dt > last_seen:
+                        last_seen = ws_dt
+                except Exception:
+                    pass
+
+        if callback_ready:
             channels.append("callback")
 
         entry = {
@@ -12330,6 +12682,9 @@ def hub_reachability():
             "channels": channels,
             "last_seen": last_seen.isoformat() + "Z" if last_seen else None,
             "callback_url": callback or None,
+            "callback_verified": bool(callback) and bool(agent_data.get("callback_verified")),
+            "callback_ready": callback_ready,
+            "ws_connected": _agent_has_live_websocket(agent_id),
         }
 
         if channels:
@@ -12387,44 +12742,93 @@ OBLIGATIONS_FILE = os.path.join(DATA_DIR, "obligations.json")
 COMMITMENTS_FILE = os.path.join(DATA_DIR, "commitments.json")
 
 
-def _send_system_dm(to_agent, message, msg_type="system", extra=None):
-    """Send a hub-system DM to an agent's inbox (and callback if configured).
-    Best-effort — failures are logged but never raised."""
+def _deliver_internal_dm(from_agent, to_agent, message, msg_type="system", extra=None):
+    """Deliver an internal Hub DM through the normal inbox + sent-record lifecycle."""
     try:
         agents_data = load_agents()
         now = datetime.utcnow().isoformat() + "Z"
         dm_payload = {
-            "from": "hub-system",
+            "id": secrets.token_hex(8),
+            "from": from_agent,
             "to": to_agent,
             "message": message,
             "type": msg_type,
+            "read": False,
             "timestamp": now,
         }
         if extra:
             dm_payload.update(extra)
 
-        # Try callback
         agent = agents_data.get(to_agent) if isinstance(agents_data, dict) else None
-        if agent and agent.get("callback_url"):
+        callback_url = agent.get("callback_url") if isinstance(agent, dict) else None
+        callback_verified = bool(callback_url) and bool(agent.get("callback_verified")) if isinstance(agent, dict) else False
+
+        sent_record = {
+            "message_id": dm_payload["id"],
+            "to": to_agent,
+            "message_preview": message[:100] + ("..." if len(message) > 100 else ""),
+            "timestamp": now,
+            "delivery_state": "inbox_queued",
+            "delivered_channels": [],
+            "delivered_at": None,
+            "callback_status": None,
+            "callback_url_configured": bool(callback_url),
+            "callback_verified": callback_verified,
+            "callback_error": None,
+            "read": False,
+            "read_at": None,
+            "type": msg_type,
+        }
+        if extra:
+            for key, value in extra.items():
+                if key not in {"id", "message", "from", "to", "read"}:
+                    sent_record[key] = value
+
+        try:
+            _append_sent_record(from_agent, to_agent, sent_record)
+        except Exception as e:
+            print(f"[INTERNAL-DM] Failed to persist sent record for {from_agent}->{to_agent}: {e}")
+
+        append_message_to_conversation(to_agent, from_agent, dm_payload)
+
+        delivered_channels = []
+        ws_delivered = _ws_push_message(to_agent, dm_payload)
+        if ws_delivered:
+            delivered_channels.append("websocket")
+        delivered_at = now if ws_delivered else None
+
+        callback_status = None
+        callback_error = None
+        if callback_url:
             try:
                 import requests as _req
-                _req.post(agent["callback_url"], json=dm_payload, timeout=5)
-            except Exception:
-                pass
+                resp = _req.post(callback_url, json=dm_payload, timeout=5)
+                callback_status = resp.status_code
+                if resp.status_code < 400:
+                    delivered_channels = _merge_delivery_channels(delivered_channels, ["callback"])
+                    delivered_at = delivered_at or (datetime.utcnow().isoformat() + "Z")
+            except Exception as e:
+                callback_status = "failed"
+                callback_error = str(e)[:200]
+            _record_callback_attempt(to_agent, callback_url, callback_status, callback_error)
 
-        # Always write to inbox
-        inbox_dir = os.path.join(DATA_DIR, "messages")
-        os.makedirs(inbox_dir, exist_ok=True)
-        inbox_path = os.path.join(inbox_dir, f"{to_agent}.json")
-        try:
-            msgs = json.load(open(inbox_path)) if os.path.exists(inbox_path) else []
-        except Exception:
-            msgs = []
-        msgs.append(dm_payload)
-        with open(inbox_path, "w") as f:
-            json.dump(msgs, f)
+        _finalize_sent_record_delivery(
+            from_agent,
+            to_agent,
+            dm_payload["id"],
+            delivered_channels,
+            delivered_at=delivered_at,
+            callback_status=callback_status,
+            callback_error=callback_error,
+        )
     except Exception as e:
-        print(f"[SYSTEM-DM] Error sending to {to_agent}: {e}")
+        print(f"[INTERNAL-DM] Error sending {from_agent}->{to_agent}: {e}")
+
+
+def _send_system_dm(to_agent, message, msg_type="system", extra=None):
+    """Send a hub-system DM to an agent's inbox (and callback if configured).
+    Best-effort — failures are logged but never raised."""
+    _deliver_internal_dm("hub-system", to_agent, message, msg_type, extra)
 
 
 def load_obligations():
@@ -12994,30 +13398,16 @@ def _fire_obligation_state_webhook(obl, acting_agent, old_status, new_status, no
             except Exception as e:
                 print(f"[OBL-WEBHOOK] Webhook to {cp} failed: {e}")
 
-        # Always deliver as inbox DM too (belt + suspenders)
-        dm_payload = {
-            "from": "hub-system",
-            "to": cp,
-            "message": notify_msg,
-            "type": "obligation_state_change",
-            "obligation_id": obl_id,
-            "old_status": old_status,
-            "new_status": new_status,
-            "timestamp": now,
-        }
-        try:
-            inbox_dir = os.path.join(DATA_DIR, "messages")
-            os.makedirs(inbox_dir, exist_ok=True)
-            inbox_path = os.path.join(inbox_dir, f"{cp}.json")
-            try:
-                cp_msgs = json.load(open(inbox_path)) if os.path.exists(inbox_path) else []
-            except Exception:
-                cp_msgs = []
-            cp_msgs.append(dm_payload)
-            with open(inbox_path, "w") as f:
-                json.dump(cp_msgs, f)
-        except Exception as e:
-            print(f"[OBL-WEBHOOK] Inbox delivery to {cp} failed: {e}")
+        _send_system_dm(
+            cp,
+            notify_msg,
+            "obligation_state_change",
+            {
+                "obligation_id": obl_id,
+                "old_status": old_status,
+                "new_status": new_status,
+            },
+        )
 
 
 def _obl_auth(obl, agent_id):
@@ -16022,31 +16412,15 @@ def settle_obligation(obl_id):
                 f"Type: {settlement_type} | Ref: {settlement_ref} | State: {data.get('settlement_state', 'pending')}\n"
                 f"View: GET /obligations/{obl_id}"
             )
-            dm_payload = {
-                "from": "hub-system",
-                "to": cp,
-                "message": notify_msg,
-                "type": "settlement_attached",
-                "obligation_id": obl_id,
-                "timestamp": settlement_info["attached_at"],
-            }
-            cp_agent = agents_data.get(cp) if isinstance(agents_data, dict) else None
-            if cp_agent and cp_agent.get("callback_url"):
-                try:
-                    import requests as _req
-                    _req.post(cp_agent["callback_url"], json=dm_payload, timeout=5)
-                except Exception:
-                    pass
-            inbox_dir = os.path.join(DATA_DIR, "messages")
-            os.makedirs(inbox_dir, exist_ok=True)
-            inbox_path = os.path.join(inbox_dir, f"{cp}.json")
-            try:
-                cp_msgs = json.load(open(inbox_path)) if os.path.exists(inbox_path) else []
-            except:
-                cp_msgs = []
-            cp_msgs.append(dm_payload)
-            with open(inbox_path, "w") as f:
-                json.dump(cp_msgs, f)
+            _send_system_dm(
+                cp,
+                notify_msg,
+                "settlement_attached",
+                {
+                    "obligation_id": obl_id,
+                    "timestamp": settlement_info["attached_at"],
+                },
+            )
             print(f"[SETTLEMENT-WEBHOOK] Notified {cp} of settlement attachment on {obl_id}")
     except Exception as e:
         print(f"[SETTLEMENT-WEBHOOK] Attachment notification error: {e}")
@@ -16139,35 +16513,16 @@ def update_obligation_settlement(obl_id):
                 notify_msg += f"\nReceipt: {data['settlement_receipt']}"
             notify_msg += f"\nUpdated by: {agent_id}"
             # Deliver as DM
-            dm_payload = {
-                "from": "hub-system",
-                "to": cp,
-                "message": notify_msg,
-                "type": "settlement_webhook",
-                "obligation_id": obl_id,
-                "settlement_state": new_state or prev_state,
-                "timestamp": obl["settlement"]["last_updated_at"],
-            }
-            # Try callback_url if agent has one
-            cp_agent = agents_data.get(cp) if isinstance(agents_data, dict) else None
-            if cp_agent and cp_agent.get("callback_url"):
-                try:
-                    import requests as _req
-                    _req.post(cp_agent["callback_url"], json=dm_payload, timeout=5)
-                    print(f"[SETTLEMENT-WEBHOOK] Notified {cp} via callback")
-                except Exception as e:
-                    print(f"[SETTLEMENT-WEBHOOK] Callback to {cp} failed: {e}")
-            # Also store in their inbox
-            inbox_dir = os.path.join(DATA_DIR, "messages")
-            os.makedirs(inbox_dir, exist_ok=True)
-            inbox_path = os.path.join(inbox_dir, f"{cp}.json")
-            try:
-                cp_msgs = json.load(open(inbox_path)) if os.path.exists(inbox_path) else []
-            except:
-                cp_msgs = []
-            cp_msgs.append(dm_payload)
-            with open(inbox_path, "w") as f:
-                json.dump(cp_msgs, f)
+            _send_system_dm(
+                cp,
+                notify_msg,
+                "settlement_webhook",
+                {
+                    "obligation_id": obl_id,
+                    "settlement_state": new_state or prev_state,
+                    "timestamp": obl["settlement"]["last_updated_at"],
+                },
+            )
             print(f"[SETTLEMENT-WEBHOOK] Notified {cp} via inbox DM")
     except Exception as e:
         print(f"[SETTLEMENT-WEBHOOK] Notification error: {e}")
@@ -16325,25 +16680,15 @@ def paylock_webhook():
                 if new_state == "released":
                     notify_msg += f"\n✅ Obligation auto-completed."
 
-                dm_payload = {
-                    "from": "hub-system",
-                    "to": party,
-                    "message": notify_msg,
-                    "type": "paylock_webhook",
-                    "obligation_id": obl_id,
-                    "settlement_state": new_state,
-                    "timestamp": datetime.utcnow().isoformat() + "Z",
-                }
-                inbox_dir = os.path.join(DATA_DIR, "messages")
-                os.makedirs(inbox_dir, exist_ok=True)
-                inbox_path = os.path.join(inbox_dir, f"{party}.json")
-                try:
-                    party_msgs = json.load(open(inbox_path)) if os.path.exists(inbox_path) else []
-                except:
-                    party_msgs = []
-                party_msgs.append(dm_payload)
-                with open(inbox_path, "w") as f:
-                    json.dump(party_msgs, f)
+                _send_system_dm(
+                    party,
+                    notify_msg,
+                    "paylock_webhook",
+                    {
+                        "obligation_id": obl_id,
+                        "settlement_state": new_state,
+                    },
+                )
                 print(f"[PAYLOCK-WEBHOOK] Notified {party} about {event} on {obl_id}")
         except Exception as e:
             print(f"[PAYLOCK-WEBHOOK] Notification error: {e}")
@@ -17671,7 +18016,7 @@ def agent_security_check(agent_id):
 
     info = agents[agent_id]
     liveness = _compute_agent_liveness(agent_id, agents)
-    delivery = _agent_delivery_capability(info)
+    delivery = _agent_delivery_capability(info, agent_id)
 
     # --- 1. Delivery Channel Security ---
     delivery_findings = []
@@ -17691,15 +18036,29 @@ def agent_security_check(agent_id):
             "detail": "No active WebSocket. Messages rely on callback or polling — higher latency, weaker auth signal."
         })
 
+    callback_ready = _agent_callback_delivery_ready(info)
     if info.get("callback_url"):
         cb_url = info["callback_url"]
         is_https = cb_url.startswith("https://")
         delivery_findings.append({
             "check": "callback_url_configured",
-            "status": "pass",
+            "status": "info",
             "detail": f"Callback URL set: {cb_url[:60]}..."
         })
-        delivery_score += 20
+        if callback_ready:
+            delivery_findings.append({
+                "check": "callback_delivery_ready",
+                "status": "pass",
+                "detail": "Callback is currently verified and has no more-recent delivery failure."
+            })
+            delivery_score += 20
+        else:
+            failure_detail = info.get("callback_error") or info.get("callback_last_status") or "latest callback attempt did not succeed"
+            delivery_findings.append({
+                "check": "callback_delivery_ready",
+                "status": "warn",
+                "detail": f"Callback is configured but not currently delivery-ready ({failure_detail})."
+            })
         if is_https:
             delivery_findings.append({
                 "check": "callback_https",
