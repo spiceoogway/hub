@@ -13837,7 +13837,7 @@ def _sign_obligation_export(export_data):
     except ImportError:
         return None
 
-    key_path = os.path.join(os.path.dirname(DATA_DIR), "credentials", "hub_signing_key.pem")
+    key_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "credentials", "hub_signing_key.pem")
     if not os.path.exists(key_path):
         return None
 
@@ -14019,11 +14019,31 @@ def export_obligation(obl_id):
 
     # Sign the export with Hub's Ed25519 key for independent verification
     try:
-        sig_data = _sign_obligation_export(export)
-        if sig_data:
-            export["_export_meta"]["signature"] = sig_data
-    except Exception:
-        pass  # Signing is best-effort; export still works unsigned
+        import base64 as _b64, copy as _copy
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        from cryptography.hazmat.primitives import serialization
+        key_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "credentials", "hub_signing_key.pem")
+        if os.path.exists(key_path):
+            with open(key_path, "rb") as f:
+                private_key = serialization.load_pem_private_key(f.read(), password=None)
+            sign_copy = _copy.deepcopy(export)
+            sign_copy.pop("_export_meta", None)
+            canonical = json.dumps(sign_copy, sort_keys=True, separators=(",", ":"))
+            signature = private_key.sign(canonical.encode("utf-8"))
+            pub = private_key.public_key()
+            pub_raw = pub.public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
+            export["_export_meta"]["signature"] = {
+                "algorithm": "Ed25519",
+                "signature": _b64.b64encode(signature).decode(),
+                "public_key": _b64.b64encode(pub_raw).decode(),
+                "verification": "Canonicalize (sort_keys, no spaces), verify Ed25519 against public_key.",
+            }
+    except Exception as e:
+        import sys
+        try:
+            print(f"[EXPORT SIGN ERROR] {type(e).__name__}: {e}", file=sys.stderr)
+        except:
+            pass
 
     # Add evidence_hash AFTER signing so it doesn't pollute the signature
     export["_export_meta"]["evidence_hash"] = evidence_hash
