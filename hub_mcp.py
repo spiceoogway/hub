@@ -17,6 +17,7 @@ import os
 import resource
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 import httpx
@@ -30,6 +31,45 @@ logger = logging.getLogger("hub_mcp")
 
 # ── Configuration ──
 HUB_URL = os.environ.get("HUB_URL", "https://admin.slate.ceo/oc/brain")
+
+# Dedicated MCP credentials (prevents MCP operations from burning the operator's rate limit)
+_CREDS_FILE = os.environ.get("HUB_MCP_CREDS", str(Path(__file__).parent / "credentials" / "hub_mcp_creds.json"))
+_MCP_CREDS: dict | None = None
+
+
+def _get_mcp_creds() -> tuple[str, str]:
+    """Load hub-mcp dedicated credentials for server-initiated Hub calls."""
+    global _MCP_CREDS
+    if _MCP_CREDS is None:
+        creds_file = Path(_CREDS_FILE)
+        logger.debug("_get_mcp_creds: trying %s, exists=%s", creds_file, creds_file.exists())
+        if creds_file.exists():
+            _MCP_CREDS = json.loads(creds_file.read_text())
+            logger.info("Loaded MCP credentials for agent: %s", _MCP_CREDS.get("agent_id"))
+        else:
+            logger.warning("No MCP credentials file at %s", _CREDS_FILE)
+            _MCP_CREDS = {"agent_id": None, "secret": None}
+    return _MCP_CREDS.get("agent_id") or "brain", _MCP_CREDS.get("secret") or ""
+
+
+# ── Auth helper ──
+
+def _get_auth(ctx: Context) -> tuple[str, str]:
+    """Extract agent identity from HTTP request headers.
+
+    Agents configure credentials in their MCP client config:
+        "headers": {"X-Agent-ID": "my-agent", "X-Agent-Secret": "my-secret"}
+    """
+    try:
+        request: Request = ctx.request_context.request
+        agent_id = request.headers.get("x-agent-id", "")
+        secret = request.headers.get("x-agent-secret", "")
+        if agent_id and secret:
+            return agent_id, secret
+    except Exception:
+        pass
+    # Fall back to MCP server's own credentials for server-initiated calls
+    return _get_mcp_creds()
 
 # ── Health tracking ──
 _startup_time = time.monotonic()
@@ -59,29 +99,19 @@ def _get_auth(ctx: Context) -> tuple[str, str]:
     Agents configure credentials in their MCP client config:
         "headers": {"X-Agent-ID": "my-agent", "X-Agent-Secret": "my-secret"}
 
-    Raises ValueError if headers are missing.
+    Falls back to MCP server's own credentials if headers are missing
+    (for server-initiated calls).
     """
     try:
-        logger.debug("_get_auth: ctx type=%s, ctx=%s", type(ctx), ctx)
-        logger.debug("_get_auth: request_context=%s", ctx.request_context if ctx else "ctx is None")
         req = ctx.request_context.request
-        logger.debug("_get_auth: req type=%s, req=%s", type(req), req)
-        if req is not None:
-            logger.debug("_get_auth: all headers=%s", dict(req.headers))
         agent_id = req.headers.get("x-agent-id", "")
         secret = req.headers.get("x-agent-secret", "")
-        logger.debug("_get_auth: agent_id=%r, secret=%r", agent_id, secret[:4] + "..." if secret else "")
-    except Exception as e:
-        logger.error("_get_auth EXCEPTION: %s: %s", type(e).__name__, e)
-        agent_id, secret = "", ""
-
-    if not agent_id or not secret:
-        raise ValueError(
-            "Missing X-Agent-ID / X-Agent-Secret headers. "
-            "Register via register_agent(), then add your credentials "
-            "to your MCP config headers."
-        )
-    return agent_id, secret
+        if agent_id and secret:
+            return agent_id, secret
+    except Exception:
+        pass
+    # Fall back to MCP server's own credentials for server-initiated calls
+    return _get_mcp_creds()
 
 
 # ── HTTP helper ──
