@@ -29,7 +29,7 @@ logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger("hub_mcp")
 
 # ── Configuration ──
-HUB_URL = os.environ.get("HUB_URL", "http://localhost:8080")
+HUB_URL = os.environ.get("HUB_URL", "https://admin.slate.ceo/oc/brain")
 
 # ── Health tracking ──
 _startup_time = time.monotonic()
@@ -512,6 +512,75 @@ async def advance_obligation_status(
 
     result = await _hub_request("POST", f"/obligations/{obligation_id}/advance", json_body=body)
     return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+async def manage_obligation_checkpoint(
+    action: str,
+    obligation_id: str,
+    summary: str = "",
+    checkpoint_id: str = "",
+    reason: str = "",
+    note: Optional[str] = None,
+    scope_update: Optional[str] = None,
+    questions: Optional[list[str]] = None,
+    open_question: Optional[str] = None,
+    reentry_hook: Optional[str] = None,
+    partial_delivery_expected: Optional[str] = None,
+    ctx: Context = None,
+) -> str:
+    """Unified checkpoint dispatcher — routes action to the appropriate checkpoint sub-operation.
+
+    This is a convenience wrapper around the three standalone checkpoint tools:
+      checkpoint_propose  (action="propose")
+      checkpoint_confirm  (action="confirm")
+      checkpoint_reject   (action="reject")
+
+    Args:
+        action: One of "propose", "confirm", "reject"
+        obligation_id: Obligation ID the checkpoint belongs to
+        summary: Required for action="propose". Short description of the checkpoint.
+        checkpoint_id: Required for action="confirm" and action="reject".
+        reason: Required for action="reject". Why the checkpoint is rejected.
+        note: Optional note for any action.
+        scope_update: Optional for action="propose".
+        questions: Optional list of open questions for action="propose".
+        open_question: Optional single re-entry question for action="propose".
+        reentry_hook: Optional state pointer for action="propose".
+        partial_delivery_expected: Optional for action="propose".
+        ctx: MCP request context (provides auth headers).
+    """
+    if action == "propose":
+        return await checkpoint_propose(
+            obligation_id=obligation_id,
+            summary=summary,
+            scope_update=scope_update,
+            questions=questions,
+            open_question=open_question,
+            reentry_hook=reentry_hook,
+            partial_delivery_expected=partial_delivery_expected,
+            note=note,
+            ctx=ctx,
+        )
+    elif action == "confirm":
+        return await checkpoint_confirm(
+            obligation_id=obligation_id,
+            checkpoint_id=checkpoint_id,
+            note=note,
+            ctx=ctx,
+        )
+    elif action == "reject":
+        return await checkpoint_reject(
+            obligation_id=obligation_id,
+            checkpoint_id=checkpoint_id,
+            reason=reason,
+            note=note,
+            ctx=ctx,
+        )
+    else:
+        return json.dumps({
+            "error": f"Invalid action '{action}'. Must be one of: propose, confirm, reject"
+        })
 
 
 @mcp.tool()
