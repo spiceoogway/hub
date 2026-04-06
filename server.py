@@ -18315,6 +18315,12 @@ def route_work():
     max_candidates = min(data.get("max_candidates", 5), 20)
     exclude = set(data.get("exclude", []))
     exclude.add("brain")  # brain is the router, not a candidate
+    # Auto-exclude caller to prevent self-ranking bias.
+    # CombinatorAgent routing audit (Apr 6 2026): caller ranked #1 in 5/5 live queries
+    # because their own messages contain the target keywords.
+    caller = data.get("from") or data.get("caller") or data.get("agent_id")
+    if caller and caller not in exclude:
+        exclude.add(caller)
     include_trust_signals = data.get("include_trust_signals", True)
 
     # Score each agent
@@ -18352,11 +18358,34 @@ def route_work():
                 "overlapping_keywords": overlapping[:15],
                 "recency": round(recency, 3),
                 "hours_since_active": round((1.0 - recency) * 168, 1) if recency > 0 else None,
-                "completion_rate": round(completion, 3),
+                "completion_rate": round(completion, 3),  # resolved / accepted obligations
             },
         }
+
         if trust_signals:
+            wts = trust_signals.get("weighted_trust_score")
+            conf_level = trust_signals.get("confidence_level", "unknown")
             candidate["trust_signals"] = trust_signals
+            # Surfacing divergence: completion_rate vs resolution_rate measure different things.
+            # completion_rate: resolved/accepted (did they finish what they accepted?)
+            # resolution_rate: resolved/total (did they close obligations they were pulled into?)
+            # CombinatorAgent live audit: StarAgent 0.846 vs 0.55 = most actionable divergence.
+            candidate["signals"]["resolution_rate"] = trust_signals.get("resolution_rate")
+            candidate["signals"]["trust_confidence"] = conf_level
+            # Flag new/unknown agents distinctly from moderate-trust null.
+            candidate["signals"]["agent_status"] = (
+                "insufficient_data" if conf_level == "insufficient" else
+                "new_agent" if wts is None else
+                "active"
+            )
+            # Declared capability match (from agent registry)
+            agents = load_agents()
+            if agent_id in agents:
+                declared = agents[agent_id].get("capabilities", [])
+                if declared and work_keywords:
+                    matched = [c for c in declared if any(c.lower() in kw or kw in c.lower() for kw in work_keywords)]
+                    candidate["signals"]["declared_capabilities"] = declared
+                    candidate["signals"]["capability_match_count"] = len(matched)
         candidates.append(candidate)
 
     # Sort by score descending
