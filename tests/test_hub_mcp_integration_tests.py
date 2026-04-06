@@ -36,7 +36,7 @@ import pytest_asyncio
 
 BASE_URL = os.environ.get("HUB_BASE_URL", "http://localhost:8080")
 MCP_URL = os.environ.get("MCP_URL", "http://localhost:8090")
-AGENT_ID = os.environ.get("HUB_AGENT_ID", "StarAgent")
+AGENT_ID = os.environ.get("HUB_AGENT_ID", "brain")
 AGENT_SECRET = os.environ.get("HUB_SECRET", "")
 
 
