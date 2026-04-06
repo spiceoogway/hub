@@ -7417,6 +7417,33 @@ def _get_commitment_evidence(agent_id):
     timeliness_weight = round(timely_count / resolved, 3) if resolved > 0 else 0
     attestation_depth = round(attestation_sum / total, 3) if total > 0 else 0
 
+    raw_wts = (
+        (0.5 * (resolved / total if total > 0 else 0)) +
+        (0.3 * timeliness_weight) +
+        (0.2 * min(attestation_depth, 1.0))
+    )
+
+    # Confidence-adjusted wts: small-sample scores are statistically meaningless.
+    # Thresholds derived from CombinatorAgent routing instrumentation (Apr 6, 2026).
+    # opspawn case: wts=0.5 from n=1 was misleading (decorative, not informative).
+    if total < 3:
+        confidence_factor = 0.0   # null out — insufficient data
+    elif total < 5:
+        confidence_factor = 0.5  # 50% confidence
+    elif total < 8:
+        confidence_factor = 0.75  # 75% confidence
+    else:
+        confidence_factor = 1.0   # full confidence
+
+    confidence_level = (
+        "insufficient" if total < 3 else
+        "low" if total < 5 else
+        "medium" if total < 8 else
+        "high"
+    )
+
+    adjusted_wts = round(raw_wts * confidence_factor, 3)
+
     return {
         "total_obligations": total,
         "resolved": resolved,
@@ -7429,13 +7456,11 @@ def _get_commitment_evidence(agent_id):
         "unique_obligation_partners": len(unique_partners),
         "timeliness_weight": timeliness_weight,
         "attestation_depth": attestation_depth,
-        "weighted_trust_score": round(
-            (0.5 * (resolved / total if total > 0 else 0)) +
-            (0.3 * timeliness_weight) +
-            (0.2 * min(attestation_depth, 1.0)),
-            3
-        ),
-        "note": "Derived from Hub obligation lifecycle records. weighted_trust_score = 0.5×resolution_rate + 0.3×timeliness_weight + 0.2×attestation_depth. Each obligation is independently verifiable via /obligations/{id}/export."
+        "raw_weighted_trust_score": round(raw_wts, 3),       # pre-adjustment, for diagnostics
+        "confidence_factor": confidence_factor,
+        "confidence_level": confidence_level,
+        "weighted_trust_score": adjusted_wts,                # confidence-adjusted — use this
+        "note": "Derived from Hub obligation lifecycle records. weighted_trust_score = (0.5×resolution_rate + 0.3×timeliness_weight + 0.2×attestation_depth) × confidence_factor. confidence_factor: 0.0 if n<3, 0.5 if n<5, 0.75 if n<8, 1.0 if n≥8. Each obligation independently verifiable via /obligations/{id}/export."
     }
 
 def _get_collaboration_summary(agent_id):
@@ -18230,7 +18255,10 @@ def _get_trust_signals(agent_id):
     balances = load_hub_balances()
     hub_balance = balances.get(agent_id) if isinstance(balances, dict) else None
     return {
-        "weighted_trust_score": signals.get("weighted_trust_score"),
+        "weighted_trust_score": signals.get("weighted_trust_score"),  # confidence-adjusted
+        "raw_weighted_trust_score": signals.get("raw_weighted_trust_score"),  # pre-adjustment
+        "confidence_factor": signals.get("confidence_factor"),
+        "confidence_level": signals.get("confidence_level"),
         "attestation_depth": signals.get("attestation_depth"),
         "resolution_rate": signals.get("resolution_rate"),
         "hub_balance": hub_balance,
