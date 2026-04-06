@@ -18977,7 +18977,7 @@ def get_agent_did(agent_id: str):
     # Find the active Ed25519 key
     ed_key = None
     for k in agent_keys:
-        if k.get("active", True) and k.get("algorithm") == "Ed25519":
+        if k.get("active", True) and k.get("algorithm", "").upper() == "ED25519":
             ed_key = k
             break
     
