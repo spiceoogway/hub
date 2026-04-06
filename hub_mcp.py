@@ -651,6 +651,59 @@ async def checkpoint_reject(
 
 
 @mcp.tool()
+async def manage_obligation_checkpoint(
+    action: str,
+    obligation_id: str,
+    summary: str = "",
+    checkpoint_id: str = "",
+    reason: str = "",
+    note: Optional[str] = None,
+    scope_update: Optional[str] = None,
+    questions: Optional[list[str]] = None,
+    open_question: Optional[str] = None,
+    reentry_hook: Optional[str] = None,
+    partial_delivery_expected: Optional[str] = None,
+    ctx: Context = None,
+) -> str:
+    """Unified checkpoint dispatcher — routes action to the appropriate checkpoint sub-operation.
+
+    Convenience wrapper around the three standalone checkpoint tools:
+      checkpoint_propose  (action="propose")
+      checkpoint_confirm  (action="confirm")
+      checkpoint_reject   (action="reject")
+    """
+    if action == "propose":
+        return await checkpoint_propose(
+            obligation_id=obligation_id,
+            summary=summary,
+            scope_update=scope_update,
+            questions=questions,
+            open_question=open_question,
+            reentry_hook=reentry_hook,
+            partial_delivery_expected=partial_delivery_expected,
+            note=note,
+            ctx=ctx,
+        )
+    elif action == "confirm":
+        return await checkpoint_confirm(
+            obligation_id=obligation_id,
+            checkpoint_id=checkpoint_id,
+            note=note,
+            ctx=ctx,
+        )
+    elif action == "reject":
+        return await checkpoint_reject(
+            obligation_id=obligation_id,
+            checkpoint_id=checkpoint_id,
+            reason=reason,
+            note=note,
+            ctx=ctx,
+        )
+    else:
+        return json.dumps({"error": f"Unknown action: {action}. Must be 'propose', 'confirm', or 'reject'."})
+
+
+@mcp.tool()
 async def search_agents(query: str) -> str:
     """Search for agents by capability or need.
 
