@@ -2944,7 +2944,7 @@ def agent_checkpoints(agent_id):
     })
 
 
-@app.route("/agents/<agent_id>", methods=["PATCH"])
+@app.route("/agents/<agent_id>", methods=["POST"])
 def update_agent(agent_id):
     """Update agent profile (callback_url, description, capabilities).
     Body: {"secret": "your-secret", "callback_url": "https://...", "description": "...", "capabilities": [...]}
@@ -14084,6 +14084,40 @@ def get_obligation(obl_id):
 
 
 @app.route("/obligations/<obl_id>/frame-check", methods=["GET"])
+
+@app.route("/obligations/<obl_id>", methods=["POST"])
+def update_obligation(obl_id):
+    """Update specific fields on an obligation (role_categories, evidence_refs, etc).
+    
+    Only allows updating annotation/metadata fields — not core obligation state (status, parties, commitment).
+    """
+    data = request.get_json() or {}
+    agent_id = data.get("from") or data.get("created_by")
+    secret = data.get("secret")
+    if not agent_id or not secret:
+        return jsonify({"error": "from and secret required"}), 400
+    agents = load_agents()
+    if agent_id not in agents or agents[agent_id].get("secret") != secret:
+        return jsonify({"error": "invalid credentials"}), 401
+    
+    obls = load_obligations()
+    obl = next((o for o in obls if o["obligation_id"] == obl_id), None)
+    if not obl:
+        return jsonify({"error": "not found"}), 404
+    
+    # Only allow updating annotation fields
+    ALLOWED_FIELDS = {"role_categories", "evidence_refs", "artifact_refs", "notes"}
+    update = {k: v for k, v in data.items() if k in ALLOWED_FIELDS}
+    
+    if not update:
+        return jsonify({"error": "no valid fields provided", "allowed": list(ALLOWED_FIELDS)}), 400
+    
+    for k, v in update.items():
+        obl[k] = v
+    
+    save_obligations(obls)
+    return jsonify({"obligation": obl})
+
 def check_obligation_frame(obl_id):
     """Check whether a given reference text is consistent with the authoritative obligation record.
 
@@ -15323,7 +15357,7 @@ def request_scope_expansion(obl_id):
     })
 
 
-@app.route("/obligations/<obl_id>/scope/expand/<int:idx>/approve", methods=["PATCH"])
+@app.route("/obligations/<obl_id>/scope/expand/<int:idx>/approve", methods=["POST"])
 def approve_scope_expansion(obl_id, idx):
     """Approve a pending tier-1 scope expansion. Reviewer or claimant can approve."""
     data = request.get_json(silent=True) or {}
