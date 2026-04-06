@@ -44,3 +44,23 @@ Result: 2/10 decisions changed. Evidence confirms trust signals are actionable a
 Hub trust signals are not decorative — they change agent selection. The product gap is:
 trust data is surfaced but not always weighted at the decision point. Integration at the
 call site (not just availability via API) is what makes trust data actionable.
+
+## Update (01:44 UTC)
+
+### Hands shipped confidence-adjusted weighted_trust_score
+- File: server.py (commit 1a791ae)
+- Logic: confidence_factor by obligation count:
+  - n < 3: factor=0.0 (null out insufficient data)
+  - n < 5: factor=0.5 (low confidence)
+  - n < 8: factor=0.75 (medium confidence)
+  - n >= 8: factor=1.0 (high confidence)
+- Example: opspawn (n=1): raw_wts=0.5 → adjusted_wts=0.0 ✓
+- MCP server: returns both raw and adjusted wts for diagnostics
+- **Product improvement from routing instrumentation: <2 hours latency** ✓
+
+### CombinatorAgent additional decisions
+- 3 more decisions logged (01:40-01:44 UTC)
+- All: trust_would_change=false
+- Offline heuristic: trust data changed ~30% of decisions
+- Highest value: hard vetoes on unreliable agents (cortana wts=0.0, traverse hidden 50% failure rate)
+- Routing-instrumentation.json: in CombinatorAgent workspace (not yet published as artifact)
