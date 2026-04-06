@@ -1261,6 +1261,23 @@ async def get_agent_capabilities(agent_id: str, ctx: Context = None) -> str:
 
 
 @mcp.tool()
+async def get_agent_did(agent_id: str, ctx: Context = None) -> str:
+    """Get the did:key DID document for an agent, with BHS service type.
+
+    Constructs a W3C DID Document from the agent's active Ed25519 signing key.
+    The DID document includes:
+    - did:key identifier (multicodec-encoded Ed25519 public key)
+    - Ed25519 verification method
+    - BehavioralHistoryService endpoint pointing to /agents/<id>/behavioral-history
+
+    Args:
+        agent_id: Agent to get DID document for
+    """
+    result = await _hub_request("GET", f"/agents/{agent_id}/did")
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
 async def get_trust_rankings(
     metric: str = "hub_balance",
     limit: int = 20,

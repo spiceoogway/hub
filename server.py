@@ -18953,3 +18953,67 @@ def agent_security_check(agent_id):
         "recommendations": recommendations,
         "usage": "GET /agents/<agent_id>/security-check — run on any agent to audit their Hub security posture. Useful for evaluator workflows, ClawHavoc threat modeling, and self-assessment.",
     })
+
+
+def _base58_encode(data: bytes) -> str:
+    """Encode bytes as base58 (Bitcoin alphabet)."""
+    import base58
+    return base58.b58encode(data).decode()
+
+
+@app.route("/agents/<agent_id>/did", methods=["GET"])
+def get_agent_did(agent_id: str):
+    """Return a did:key DID document for an agent with BHS service type.
+    
+    Constructs did:key from the agent's active Ed25519 signing key.
+    No auth required (public read).
+    """
+    agents = load_agents()
+    if agent_id not in agents:
+        return jsonify(_behavioral_404("agent")), 404
+    
+    pubkeys = _load_pubkeys()
+    agent_keys = pubkeys.get(agent_id, [])
+    # Find the active Ed25519 key
+    ed_key = None
+    for k in agent_keys:
+        if k.get("active", True) and k.get("algorithm") == "Ed25519":
+            ed_key = k
+            break
+    
+    if not ed_key:
+        return jsonify({
+            "error": f"No active Ed25519 key found for agent {agent_id}. "
+                     "Register an Ed25519 signing key via POST /agents/<id>/pubkeys."
+        }), 404
+    
+    raw_key = __import__("base64").b64decode(ed_key["public_key"])
+    multicodec = bytes([0xED, 0x01]) + raw_key  # Ed25519 multicodec prefix
+    did_key = "did:key:" + _base58_encode(multicodec)
+    vm_id = f"{did_key}#key-1"
+    
+    hub_url = "https://admin.slate.ceo/oc/brain"
+    bhs_endpoint = f"{hub_url}/agents/{agent_id}/behavioral-history"
+    
+    doc = {
+        "@context": [
+            "https://www.w3.org/ns/did/v1",
+            "https://w3id.org/did-resolution/v1",
+        ],
+        "id": did_key,
+        "verificationMethod": [{
+            "id": vm_id,
+            "type": "Ed25519VerificationKey2018",
+            "controller": did_key,
+            "publicKeyBase58": _base58_encode(raw_key),
+        }],
+        "authentication": [vm_id],
+        "assertionMethod": [vm_id],
+        "service": [{
+            "id": f"{did_key}#hub-behavioral-history",
+            "type": "BehavioralHistoryService",
+            "serviceEndpoint": bhs_endpoint,
+            "description": "Behavioral trust history and obligation delivery record for this agent",
+        }],
+    }
+    return jsonify(doc)
