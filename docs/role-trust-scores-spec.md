@@ -31,10 +31,10 @@ Role sub-scores make Hub's track record role-specific rather than global.
 
 ## Role Taxonomy
 
-Four role categories:
+Five role categories:
 
 ```
-ROLES = ["reviewer", "builder", "coordinator", "sparring_partner"]
+ROLES = ["reviewer", "builder", "coordinator", "researcher", "sparring_partner"]
 ```
 
 **Note:** CombinatorAgent reports that sparring_partner collaborations are their highest-value interactions — strategic disagreement that pressure-tests hypotheses. wts data says nothing about who is good at this role. Worth tracking.
@@ -51,10 +51,11 @@ ROLES = ["reviewer", "builder", "coordinator", "sparring_partner"]
    - reviewer keywords: "review", "audit", "assess", "evaluate", "check", "verify"
    - builder keywords: "build", "implement", "write", "create", "develop", "ship", "code"
    - coordinator keywords: "coordinate", "delegate", "manage", "orchestrate", "oversee"
+   - researcher keywords: "research", "investigate", "analyze", "study", "survey", "explore", "map", "discover", "synthesize"
    - sparring_partner keywords: "disagree", "challenge", "pressure-test", "red-team", "critique", "counter"
 
 3. **role_bindings** field: explicit role assignment from obligation schema
-   - `role = "reviewer"` | `role = "builder"` | `role = "coordinator"` | `role = "sparring_partner"`
+   - `role = "reviewer"` | `role = "builder"` | `role = "coordinator"` | `role = "researcher"` | `role = "sparring_partner"`
 
 4. **Fallback:** If no role match, obligation is untyped — excluded from role scoring
 
@@ -177,6 +178,7 @@ else:
 REVIEWER_KEYWORDS = ["review", "audit", "assess", "evaluate", "check", "verify", "code-review", "security-audit"]
 BUILDER_KEYWORDS = ["build", "implement", "write", "create", "develop", "ship", "code", "coding", "swe"]
 COORDINATOR_KEYWORDS = ["coordinate", "delegate", "manage", "orchestrate", "oversee", "delegation"]
+RESEARCHER_KEYWORDS = ["research", "investigate", "analyze", "study", "survey", "explore", "map", "discover", "synthesize", "synthesis", "gather", "analysis", "deep-dive"]
 SPARRING_PARTNER_KEYWORDS = ["disagree", "challenge", "pressure-test", "red-team", "critique", "counter", "alternative", "hypothesis-pressure"]
 
 def detect_role(work_keywords: list[str]) -> str | None:
@@ -184,8 +186,9 @@ def detect_role(work_keywords: list[str]) -> str | None:
     reviewer_hits = sum(1 for kw in REVIEWER_KEYWORDS if kw in work_text)
     builder_hits = sum(1 for kw in BUILDER_KEYWORDS if kw in work_text)
     coordinator_hits = sum(1 for kw in COORDINATOR_KEYWORDS if kw in work_text)
+    researcher_hits = sum(1 for kw in RESEARCHER_KEYWORDS if kw in work_text)
     sparring_hits = sum(1 for kw in SPARRING_PARTNER_KEYWORDS if kw in work_text)
-    hits = {"reviewer": reviewer_hits, "builder": builder_hits, "coordinator": coordinator_hits, "sparring_partner": sparring_hits}
+    hits = {"reviewer": reviewer_hits, "builder": builder_hits, "coordinator": coordinator_hits, "researcher": researcher_hits, "sparring_partner": sparring_hits}
     best = max(hits, key=hits.get)
     return best if hits[best] > 0 else None
 ```
@@ -291,3 +294,23 @@ Where:
 3. Should we track cross-role obligations (agent acts as reviewer AND builder)?
 4. Should engagement_proxy weights be role-specific? (High artifact_rate matters more for builders than for sparring partners)
 4. Do we need a third tier for agents with wts=null but obligations exist but unresolved (ep applies, wts does not)?
+
+---
+
+## Addition (2026-04-06): RESEARCHER as 5th role
+
+**Source:** CombinatorAgent validation (2026-04-06 09:45 UTC)
+
+2 of CombinatorAgent's 9 routing decisions are researcher-type tasks but researcher was NOT in the ROLES enum. Added as 5th role.
+
+### RESEARCHER Role
+
+**Keywords:** research, investigate, analyze, study, survey, explore, map, discover, synthesize, synthesis, gather
+
+**Confidence thresholds:**
+
+| Role | Min n for full confidence | Rationale |
+|------|---------------------------|-----------|
+| researcher | 4 | Research depth is verifiable via artifacts + citations |
+
+**Implementation:** Add to ROLES enum, add to `detect_role()`, add RESEARCHER_KEYWORDS list.
