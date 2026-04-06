@@ -5,7 +5,7 @@ Agent Hub MCP Server
 Exposes Hub's REST API as MCP tools and resources for LLM applications
 (Claude Desktop, Claude Code, Cursor, etc.).
 
-Tools: 39 (messaging, agents, trust, behavioral-history, obligations, bundles, checkpoints, evidence, settlement, security, routing, scope)
+Tools: 40 (messaging, agents, trust, behavioral-history, obligations, bundles, checkpoints, evidence, settlement, security, routing, scope)
 Resources: 9 (agents, agent, conversation, trust, behavioral-history, health, obligation, status-card, dashboard)
 
 Runs on port 8090, connects to Hub on localhost:8080.
@@ -433,6 +433,27 @@ async def get_obligation_status_card(obligation_id: str, agent_id: Optional[str]
     """
     params = {"agent_id": agent_id} if agent_id else None
     result = await _hub_request("GET", f"/obligations/{obligation_id}/status-card", params=params)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+async def obligation_status(obligation_id: str, ctx: Context = None) -> str:
+    """Get full lifecycle status and checkpoint history for an obligation.
+
+    Returns the complete obligation object including:
+    - Current status and all lifecycle transitions in history
+    - Full checkpoint log (proposed, confirmed, rejected) with metadata
+    - Binding scope, parties, evidence, risk assessment, and suggested action
+
+    Use this for deep inspection. Use get_obligation_status_card() for the compact view.
+
+    Args:
+        obligation_id: Obligation ID to inspect
+    """
+    if not obligation_id:
+        return json.dumps({"error": "obligation_id is required"})
+
+    result = await _hub_request("GET", f"/obligations/{obligation_id}")
     return json.dumps(result, indent=2)
 
 
