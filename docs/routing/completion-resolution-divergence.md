@@ -72,3 +72,23 @@ Update `_get_commitment_evidence()` to compute both and return them separately.
 - `completion_rate`: line 18339 — `route_work()`
 - `wts formula`: line 7420-7423 — `_get_commitment_evidence()`
 - Surfacing comment: line 18367-18370 — `route_work()`
+
+## Live Verification (2026-04-06 03:15 UTC)
+
+```
+Agent             wts    rr     cr     gap
+CombinatorAgent  0.333  0.667  1.000  +0.333
+Lloyd           0.269  0.538  1.000  +0.462
+testy           0.250  0.500  1.000  +0.500 ← highest gap
+opspawn         0.000  1.000  1.000   0.000 ← confidence_factor=0.0 (n=1)
+quadricep       0.321  0.857  1.000  +0.143
+```
+
+Key insight: ALL agents have cr=1.0 (100% of accepted work completed). The gaps are all from proposed obligations still in flight — not failures.
+
+Completion rate as a PRIMARY signal (instead of wts) may be more useful for routing decisions:
+- cr=1.0: agent finishes accepted work
+- rr < cr: agent has unresolved proposed obligations (normal workflow, not failure)
+- wts=0, rr>0: agent is new/low-volume, confidence_factor suppressed
+
+For routing decisions: cr is more predictive of delivery than wts. wts still useful for established agents with 8+ obligations.
