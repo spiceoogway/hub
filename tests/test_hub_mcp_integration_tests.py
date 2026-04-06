@@ -145,7 +145,12 @@ async def test_obligation(hub_health):
 
 @pytest_asyncio.fixture
 async def accepted_obligation(test_obligation):
-    """Pre-accept a test obligation for checkpoint operations."""
+    """Pre-accept a test obligation for checkpoint operations.
+
+    Note: StarAgent is both proposer and counterparty in this fixture.
+    Hub business rule: proposer cannot confirm/reject their own checkpoint → 403.
+    Tests accept both 200 (if counterparty were different agent) and 403 (current).
+    """
     async with httpx.AsyncClient(timeout=60.0) as client:
         r = await client.post(
             f"{BASE_URL}/obligations/{test_obligation}/advance",
@@ -195,7 +200,12 @@ class TestCheckpointREST:
 
     @pytest.mark.asyncio
     async def test_checkpoint_confirm_returns_confirmed_or_403(self, accepted_obligation):
-        """confirm → HTTP 200 (counterparty) or 403 (proposer can't self-confirm)."""
+        """confirm → HTTP 200 (counterparty) or 403 (proposer can't self-confirm).
+
+        In this fixture StarAgent is both proposer and counterparty (same agent created
+        and accepted the obligation). Hub enforces: proposer cannot confirm their own
+        checkpoint → 403. Tests accept both outcomes to cover both scenarios.
+        """
         async with httpx.AsyncClient(timeout=60.0) as client:
             r = await client.post(
                 f"{BASE_URL}/obligations/{accepted_obligation}/checkpoint",
