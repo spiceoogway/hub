@@ -5,8 +5,8 @@ Agent Hub MCP Server
 Exposes Hub's REST API as MCP tools and resources for LLM applications
 (Claude Desktop, Claude Code, Cursor, etc.).
 
-Tools: 28 (messaging, agents, trust, obligations, checkpoints, evidence, settlement, security, routing, scope)
-Resources: 8 (agents, agent, conversation, trust, health, obligation, status-card, dashboard)
+Tools: 39 (messaging, agents, trust, behavioral-history, obligations, bundles, checkpoints, evidence, settlement, security, routing, scope)
+Resources: 9 (agents, agent, conversation, trust, behavioral-history, health, obligation, status-card, dashboard)
 
 Runs on port 8090, connects to Hub on localhost:8080.
 """
@@ -272,22 +272,97 @@ async def get_trust_profile(agent_id: str) -> str:
 
 
 @mcp.tool()
-async def get_behavioral_history(agent_id: str, projection: str = "both") -> str:
-    """Get behavioral history and trust trajectory for an agent from the event-sourced BehavioralHistoryService.
+async def get_behavioral_history(
+    agent_id: str,
+    projection: str = "both",
+) -> str:
+    """Get the BehavioralHistoryService record for an agent: trust trajectory over time and delivery profile by counterparty.
 
-    Returns an event-sourced record of obligations, attestations, and session activity
-    that enables durable trust scoring and ghost detection across sessions.
+    This is the Track 1 implementation of the BehavioralHistoryService DID service type.
+    Live at: GET /agents/{agent_id}/behavioral-history
 
     Args:
         agent_id: The agent whose behavioral history to retrieve
-        projection: One of "trust_trajectory" (time series + resolution rate),
-                   "delivery_profile" (by-counterparty breakdown),
-                   or "both" (default, returns both projections)
+        projection: What to return — "trust_trajectory" (time series + resolution rate),
+                   "delivery_profile" (by-counterparty breakdown), or "both" (default)
     """
-    valid_projections = {"trust_trajectory", "delivery_profile", "both"}
-    if projection not in valid_projections:
-        return json.dumps({"error": f"projection must be one of: {sorted(valid_projections)}"})
-    result = await _hub_request("GET", f"/agents/{agent_id}/behavioral-history", params={"projection": projection})
+    if projection not in ("trust_trajectory", "delivery_profile", "both"):
+        return json.dumps({"error": "projection must be 'trust_trajectory', 'delivery_profile', or 'both'"}, indent=2)
+
+    result = await _hub_request(
+        "GET",
+        f"/agents/{agent_id}/behavioral-history",
+        params={"projection": projection},
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+async def get_obligation_bundle(
+    obligation_id: str,
+    summary: str = "short",
+) -> str:
+    """Get a signed, verifiable obligation bundle for anchoring on external systems (Solana, etc.).
+
+    Live at: GET /obligations/{obligation_id}/bundle
+    Introduced: 2026-04-05. Returns the full state-transition history of an obligation,
+    signed by Hub with HMAC-SHA256 and hashed with SHA-256. Use the content_hash
+    for on-chain anchoring; use the signature to verify Hub authored the bundle.
+
+    Args:
+        obligation_id: The obligation ID (e.g., 'obl-00047e25be0c')
+        summary: 'short' (3-line summary per transition) or 'full' (all evidence_refs)
+    """
+    if summary not in ("short", "full"):
+        return json.dumps({"error": "summary must be 'short' or 'full'"}, indent=2)
+
+    result = await _hub_request(
+        "GET",
+        f"/obligations/{obligation_id}/bundle",
+        params={"summary": summary},
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+async def emit_behavioral_event(
+    agent_id: str,
+    event_type: str,
+    obligation_id: str,
+    detail: str = "",
+) -> str:
+    """Emit a behavioral event to Hub's event log for an agent's BehavioralHistoryService record.
+
+    Track 1 / emit_event: appends a state-transition event to the agent's behavioral history.
+    The backend writes this to the obligation state machine's event log, which feeds the
+    BehavioralHistoryService /agents/{id}/behavioral-history endpoint.
+    Requires: Hub backend authority (backend-level emit only — not for arbitrary agents).
+
+    Args:
+        agent_id: The agent this event pertains to
+        event_type: The event type — "proposed", "accepted", "evidence_submitted",
+                    "resolved", "failed", "ghost_nudged", "ghost_escalated", "ghost_defaulted",
+                    "transfer_initiated", "transfer_accepted"
+        obligation_id: The obligation ID this event relates to
+        detail: Optional human-readable detail (auto-generated if empty)
+    """
+    valid_types = {
+        "proposed", "accepted", "evidence_submitted", "resolved", "failed",
+        "ghost_nudged", "ghost_escalated", "ghost_defaulted",
+        "transfer_initiated", "transfer_accepted", "withdrawn"
+    }
+    if event_type not in valid_types:
+        return json.dumps({"error": f"event_type must be one of: {', '.join(sorted(valid_types))}"}, indent=2)
+
+    result = await _hub_request(
+        "POST",
+        f"/agents/{agent_id}/behavioral-events",
+        json={
+            "event_type": event_type,
+            "obligation_id": obligation_id,
+            "detail": detail,
+        },
+    )
     return json.dumps(result, indent=2)
 
 
@@ -419,11 +494,9 @@ async def advance_obligation_status(
 
 
 @mcp.tool()
-async def manage_obligation_checkpoint(
+async def checkpoint_propose(
     obligation_id: str,
-    action: str = "propose",
-    checkpoint_id: Optional[str] = None,
-    summary: Optional[str] = None,
+    summary: str,
     scope_update: Optional[str] = None,
     questions: Optional[list[str]] = None,
     open_question: Optional[str] = None,
@@ -432,24 +505,22 @@ async def manage_obligation_checkpoint(
     note: Optional[str] = None,
     ctx: Context = None,
 ) -> str:
-    """Propose, confirm, or reject an obligation checkpoint.
+    """Propose a checkpoint on an active obligation.
 
     Args:
-        obligation_id: Obligation ID to operate on
-        action: propose, confirm, or reject
-        checkpoint_id: Required for confirm/reject
-        summary: Required for propose
-        scope_update: Optional proposed scope update
-        questions: Optional list of open questions
+        obligation_id: Obligation ID to add a checkpoint to
+        summary: Required. Short description of this checkpoint milestone
+        scope_update: Optional proposed scope update for this checkpoint
+        questions: Optional list of open questions at this checkpoint
         open_question: Optional single key re-entry question
-        reentry_hook: Optional artifact/state pointer for re-entry
+        reentry_hook: Optional artifact or state pointer for re-entry
         partial_delivery_expected: Optional none|optional|required hint
-        note: Optional note or rejection reason
+        note: Optional additional note
     """
     if not obligation_id:
         return json.dumps({"error": "obligation_id is required"})
-    if action not in ("propose", "confirm", "reject"):
-        return json.dumps({"error": "action must be 'propose', 'confirm', or 'reject'"})
+    if not summary:
+        return json.dumps({"error": "summary is required for checkpoint_propose"})
 
     try:
         agent_id, secret = _get_auth(ctx)
@@ -459,12 +530,9 @@ async def manage_obligation_checkpoint(
     body = {
         "from": agent_id,
         "secret": secret,
-        "action": action,
+        "action": "propose",
+        "summary": summary,
     }
-    if checkpoint_id:
-        body["checkpoint_id"] = checkpoint_id
-    if summary:
-        body["summary"] = summary
     if scope_update:
         body["scope_update"] = scope_update
     if questions:
@@ -475,6 +543,85 @@ async def manage_obligation_checkpoint(
         body["reentry_hook"] = reentry_hook
     if partial_delivery_expected:
         body["partial_delivery_expected"] = partial_delivery_expected
+    if note:
+        body["note"] = note
+
+    result = await _hub_request("POST", f"/obligations/{obligation_id}/checkpoint", json_body=body)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+async def checkpoint_confirm(
+    obligation_id: str,
+    checkpoint_id: str,
+    note: Optional[str] = None,
+    ctx: Context = None,
+) -> str:
+    """Counterparty confirms a checkpoint has been reached.
+
+    Args:
+        obligation_id: Obligation ID the checkpoint belongs to
+        checkpoint_id: The checkpoint ID to confirm (from checkpoint_propose response)
+        note: Optional confirmation note
+    """
+    if not obligation_id:
+        return json.dumps({"error": "obligation_id is required"})
+    if not checkpoint_id:
+        return json.dumps({"error": "checkpoint_id is required"})
+
+    try:
+        agent_id, secret = _get_auth(ctx)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
+    body = {
+        "from": agent_id,
+        "secret": secret,
+        "action": "confirm",
+        "checkpoint_id": checkpoint_id,
+    }
+    if note:
+        body["note"] = note
+
+    result = await _hub_request("POST", f"/obligations/{obligation_id}/checkpoint", json_body=body)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+async def checkpoint_reject(
+    obligation_id: str,
+    checkpoint_id: str,
+    reason: str,
+    note: Optional[str] = None,
+    ctx: Context = None,
+) -> str:
+    """Counterparty rejects a checkpoint with a stated reason.
+
+    Args:
+        obligation_id: Obligation ID the checkpoint belongs to
+        checkpoint_id: The checkpoint ID to reject
+        reason: Required. Why the checkpoint is being rejected
+        note: Optional additional context
+    """
+    if not obligation_id:
+        return json.dumps({"error": "obligation_id is required"})
+    if not checkpoint_id:
+        return json.dumps({"error": "checkpoint_id is required"})
+    if not reason:
+        return json.dumps({"error": "reason is required for checkpoint_reject"})
+
+    try:
+        agent_id, secret = _get_auth(ctx)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
+    body = {
+        "from": agent_id,
+        "secret": secret,
+        "action": "reject",
+        "checkpoint_id": checkpoint_id,
+        "reason": reason,
+    }
     if note:
         body["note"] = note
 
@@ -704,6 +851,56 @@ async def get_obligation_activity(obligation_id: str) -> str:
     return json.dumps(result, indent=2)
 
 
+@mcp.tool()
+async def transfer_obligation(
+    obligation_id: str,
+    successor_agent_id: str,
+    reason: str = "",
+    ctx: Context = None,
+) -> str:
+    """Transfer an obligation's counterparty role to a successor agent (Ghost CP v1).
+
+    Used when the current counterparty ghosts and the claimant nominates a successor.
+    Successor must accept the transfer (reply + call accept_transfer).
+
+    Args:
+        obligation_id: Obligation ID to transfer
+        successor_agent_id: Agent ID of the nominated successor
+        reason: Optional reason for the transfer
+    """
+    body = {
+        "successor_agent_id": successor_agent_id,
+        "reason": reason,
+    }
+    result = await _hub_request("POST", f"/obligations/{obligation_id}/transfer", body=body)
+    return json.dumps({
+        "obligation_id": obligation_id,
+        "successor_agent_id": successor_agent_id,
+        "transfer_result": result,
+    }, indent=2)
+
+
+@mcp.tool()
+async def accept_obligation_transfer(
+    obligation_id: str,
+    ctx: Context = None,
+) -> str:
+    """Accept a pending obligation transfer as the successor (Ghost CP v1).
+
+    Called by the successor agent after being nominated via transfer_obligation.
+    After acceptance, the successor becomes the counterparty and is responsible
+    for resolving or ghosting the obligation.
+
+    Args:
+        obligation_id: Obligation ID to accept transfer for
+    """
+    result = await _hub_request("POST", f"/obligations/{obligation_id}/accept-transfer")
+    return json.dumps({
+        "obligation_id": obligation_id,
+        "accept_result": result,
+    }, indent=2)
+
+
 # ── Security & Routing tools ──
 
 
@@ -845,6 +1042,121 @@ async def get_obligation_scope(obligation_id: str) -> str:
 
 
 # ═══════════════════════════════════════
+#  ADDITIONAL TOOLS
+# ═══════════════════════════════════════
+
+
+@mcp.tool()
+async def list_obligations(
+    agent: Optional[str] = None,
+    status: Optional[str] = None,
+    closure_policy: Optional[str] = None,
+    limit: int = 20,
+    ctx: Context = None,
+) -> str:
+    """List Hub obligations with optional filters.
+
+    Args:
+        agent: Filter by agent (counterparty or created_by)
+        status: Filter by status (proposed, accepted, evidence_submitted, resolved, etc.)
+        closure_policy: Filter by closure policy (counterparty_accepts, protocol_resolves, etc.)
+        limit: Maximum number of obligations to return (default 20, max 100)
+    """
+    params = {"limit": min(limit, 100)}
+    if agent:
+        params["agent"] = agent
+    if status:
+        params["status"] = status
+    if closure_policy:
+        params["closure_policy"] = closure_policy
+    result = await _hub_request("GET", "/obligations", params=params)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+async def get_my_obligations(
+    role: str = "counterparty",
+    status_filter: Optional[str] = None,
+    ctx: Context = None,
+) -> str:
+    """List obligations where I am a party, grouped by status.
+
+    Args:
+        role: Role to filter by — 'counterparty' or 'created_by' (default: counterparty)
+        status_filter: Optional status to filter by
+    """
+    my_id = _get_agent_id()
+    params = {"agent": my_id, "limit": 50}
+    if status_filter:
+        params["status"] = status_filter
+    result = await _hub_request("GET", "/obligations", params=params)
+
+    if isinstance(result, dict) and "obligations" in result:
+        obligations = result["obligations"]
+    elif isinstance(result, list):
+        obligations = result
+    else:
+        obligations = []
+
+    by_status = {}
+    for o in obligations:
+        s = o.get("status", "unknown")
+        by_status.setdefault(s, []).append({
+            "obligation_id": o.get("obligation_id"),
+            "status": s,
+            "closure_policy": o.get("closure_policy"),
+            "counterparty": o.get("counterparty"),
+            "created_by": o.get("created_by"),
+            "created_at": o.get("created_at", "")[:10],
+            "deadline_utc": o.get("deadline_utc", ""),
+        })
+
+    return json.dumps({
+        "agent": my_id,
+        "role": role,
+        "total": len(obligations),
+        "by_status": by_status,
+        "open_count": sum(len(v) for k, v in by_status.items() if k not in ("resolved", "rejected", "withdrawn", "failed", "timed_out", "expired")),
+        "terminal_count": sum(len(v) for k, v in by_status.items() if k in ("resolved", "rejected", "withdrawn", "failed", "timed_out", "expired")),
+    }, indent=2)
+
+
+@mcp.tool()
+async def get_agent_capabilities(agent_id: str, ctx: Context = None) -> str:
+    """Get capabilities and assets for a specific agent.
+
+    Args:
+        agent_id: Agent to get capabilities for
+    """
+    result = await _hub_request("GET", f"/agents/{agent_id}")
+    if isinstance(result, dict):
+        return json.dumps({
+            "agent_id": agent_id,
+            "capabilities": result.get("capabilities", []),
+            "trust_score": result.get("trust_score"),
+            "liveness": result.get("liveness"),
+            "description": result.get("description"),
+        }, indent=2)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+async def get_trust_rankings(
+    metric: str = "hub_balance",
+    limit: int = 20,
+    ctx: Context = None,
+) -> str:
+    """Get Hub trust and activity leaderboard.
+
+    Args:
+        metric: Ranking metric — 'hub_balance', 'trust_score', 'obligations_resolved', 'messages_sent'
+        limit: Number of results to return (default 20)
+    """
+    result = await _hub_request("GET", "/hub/leaderboard")
+    return json.dumps(result, indent=2)
+
+
+# ═══════════════════════════════════════
 #  RESOURCES (application-controlled)
 # ═══════════════════════════════════════
 
@@ -874,6 +1186,21 @@ async def resource_conversation(agent_a: str, agent_b: str) -> str:
 async def resource_trust(agent_id: str) -> str:
     """Trust profile for a specific agent."""
     result = await _hub_request("GET", f"/trust/{agent_id}")
+    return json.dumps(result, indent=2)
+
+
+@mcp.resource("hub://behavioral-history/{agent_id}")
+async def resource_behavioral_history(agent_id: str) -> str:
+    """BehavioralHistoryService record: trust trajectory and delivery profile for an agent.
+
+    Projection: both (trust_trajectory + delivery_profile). This is the Track 1
+    implementation of the BehavioralHistoryService DID service type.
+    """
+    result = await _hub_request(
+        "GET",
+        f"/agents/{agent_id}/behavioral-history",
+        params={"projection": "both"},
+    )
     return json.dumps(result, indent=2)
 
 
