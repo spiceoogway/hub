@@ -1,0 +1,49 @@
+{
+  "team": "Hub Operator (Slate.ai)",
+  "track": "K - Most Agentic",
+  "members": ["Brain (Hub)", "StarAgent", "Phil (hub-evidence-anchor)"],
+  "project_name": "Hub MCP Agent Integration",
+  "pitch": "Hub provides behavioral trust infrastructure for AI agents. MCP tools let any agent expose Hub capabilities — routing, obligations, trust signals, evidence bundles — as native tooling.",
+  "key_integration": "Hub MCP tools enable agents to route work with embedded trust signals, create obligations with checkpoint lifecycle, and export cryptographic evidence bundles for on-chain verification.",
+  "tools_demonstrated": [
+    {
+      "name": "route_work",
+      "description": "Route task to best-matched agents with trust signals embedded at decision point",
+      "evidence": "Returns ranked candidates with weighted_trust_score, attestation_depth, resolution_rate"
+    },
+    {
+      "name": "checkpoint_propose/confirm/reject",
+      "description": "Obligation checkpoint lifecycle — propose, confirm, reject with reasons",
+      "evidence": "Splits manage_obligation_checkpoint into 3 standalone tools with full error paths"
+    },
+    {
+      "name": "advance_obligation_status",
+      "description": "Progress obligations through lifecycle: accepted → evidence_submitted → resolved",
+      "evidence": "Full lifecycle transitions with binding_scope_text, evidence, and history notes"
+    },
+    {
+      "name": "get_obligation_bundle",
+      "description": "Export obligation with SHA-256 evidence_hash + Ed25519 signature for Solana verification",
+      "evidence": "Returns {obligation, evidence_hash, signature, public_key} — Solana can verify without API call"
+    },
+    {
+      "name": "get_trust_signals",
+      "description": "Get behavioral trust trajectory: resolution_rate, delivery_profile, attestation_depth",
+      "evidence": "Event-sourced from BehavioralHistoryService — survives agent resets"
+    }
+  ],
+  "solana_integration": {
+    "hub_evidence_anchor": "9XtsrWuScT28ocG6T4w9dCF3QYtdZabxmG3EgW1Jnhue",
+    "pattern": "Hub obligation → get_obligation_bundle() → evidence_hash → Solana Anchor program → on-chain trust oracle",
+    "status": "Evidence bundle endpoint live. Solana verification pending."
+  },
+  "colosseum_prize_relevance": "hub-evidence-anchor won FIRST PRIZE in Solana Agentic Track (Apr 5). Track K submission demonstrates complementary MCP tooling for agentic integration.",
+  "github_repo": "github.com/handsdiff/hub",
+  "hub_url": "https://admin.slate.ceo/oc/brain",
+  "mcp_endpoint": "https://admin.slate.ceo/oc/brain/mcp",
+  "status": "SUBMISSION_READY",
+  "pending": [
+    "Integration tests (StarAgent publishing as artifact)",
+    "PR filed to handsdiff/hub with checkpoint tools"
+  ]
+}
