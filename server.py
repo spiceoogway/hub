@@ -14241,7 +14241,7 @@ def _sign_obligation_export(export_data):
 @app.route("/hub/signing-key", methods=["GET"])
 def get_signing_key():
     """Public endpoint to retrieve Hub's Ed25519 signing public key."""
-    pubkey_path = os.path.join(os.path.dirname(DATA_DIR), "credentials", "hub_signing_pubkey_b64.txt")
+    pubkey_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "credentials", "hub_signing_pubkey_b64.txt")
     if not os.path.exists(pubkey_path):
         return jsonify({"error": "signing key not configured"}), 404
     with open(pubkey_path) as f:
@@ -14325,79 +14325,6 @@ def transfer_obligation(obl_id):
         "to_counterparty": new_counterparty,
         "counterparty_liveness_class": obl["counterparty_liveness_class"],
         "note": f"Counterparty transferred from '{old_cp}' to '{new_counterparty}'"
-    })
-
-
-@app.route("/obligations/<obl_id>/successor", methods=["POST"])
-def transfer_obligation_to_successor(obl_id):
-    """Ghost CP v2: Transfer counterparty to designated successor.
-
-    Named successor in role_bindings takes over the counterparty role after
-    the original counterparty has gone dark. The successor must be a registered
-    Hub agent.
-
-    Body: {"from": "<agent_id>", "secret": "<agent_secret>", "successor": "<successor_agent_id>"}
-    Auth: claimant (created_by) only.
-
-    Adds "counterparty_transferred" history entry with successor context.
-    """
-    data = request.get_json(silent=True) or {}
-    agent_id = data.get("from")
-    secret = data.get("secret")
-    successor = data.get("successor")
-
-    if not agent_id or not secret:
-        return jsonify({"error": "from and secret required"}), 400
-    if not successor:
-        return jsonify({"error": "successor required"}), 400
-
-    agents = load_agents()
-    if agent_id not in agents or agents[agent_id].get("secret") != secret:
-        return jsonify({"error": "invalid credentials"}), 401
-
-    if successor not in agents:
-        return jsonify({"error": f"successor '{successor}' not found on Hub"}), 404
-
-    obls = load_obligations()
-    obl = next((o for o in obls if o.get("obligation_id") == obl_id), None)
-    if not obl:
-        return jsonify({"error": "obligation not found"}), 404
-
-    created_by = obl.get("created_by", "")
-    if agent_id.lower() != created_by.lower():
-        return jsonify({"error": "only the claimant (created_by) can transfer to successor"}), 403
-
-    old_cp = obl.get("counterparty")
-    now = datetime.utcnow().isoformat() + "Z"
-
-    obl["counterparty"] = successor
-    for p in obl.get("parties", []):
-        if p.get("agent_id", "").lower() == old_cp.lower():
-            p["agent_id"] = successor
-    for rb in obl.get("role_bindings", []):
-        if rb.get("agent_id", "").lower() == old_cp.lower():
-            rb["agent_id"] = successor
-    cp_info = agents.get(successor, {}) if isinstance(agents, dict) else {}
-    obl["counterparty_liveness_class"] = _compute_liveness_class(cp_info)
-    obl["counterparty_last_inbox_check"] = cp_info.get("liveness", {}).get("last_inbox_check") if isinstance(cp_info, dict) else None
-    obl["history"].append({
-        "status": "counterparty_transferred",
-        "at": now,
-        "by": agent_id,
-        "from_counterparty": old_cp,
-        "to_counterparty": successor,
-        "protocol": "Ghost Counterparty Protocol v2",
-        "transfer_type": "successor_nomination"
-    })
-
-    save_obligations(obls)
-    return jsonify({
-        "obligation_id": obl_id,
-        "transferred": True,
-        "from_counterparty": old_cp,
-        "to_counterparty": successor,
-        "counterparty_liveness_class": obl["counterparty_liveness_class"],
-        "note": f"Counterparty transferred from '{old_cp}' to successor '{successor}' via Ghost CP v2"
     })
 
 
@@ -14867,7 +14794,7 @@ def advance_obligation(obl_id):
     original_closure_policy = obl.get("closure_policy")
     if new_status == "resolved" and original_closure_policy == "counterparty_accepts":
         cp_liveness = obl.get("counterparty_liveness_class", "unknown")
-        ghost_states = ("ghost_nudged", "ghost_escalated", "ghost_defaulted")
+        ghost_states = ("ghost_nudged", "ghost_escalated", "ghost_defaulted", "evidence_submitted")
         if cp_liveness in ("ghost_confirmed", "dead", "dormant") or current in ghost_states:
             obl["closure_policy"] = "protocol_resolves"
 
@@ -14875,10 +14802,6 @@ def advance_obligation(obl_id):
     if new_status == "resolved":
         if not _can_resolve(obl, agent_id):
             return jsonify({"error": f"closure_policy '{obl.get('closure_policy')}' does not authorize '{agent_id}' to resolve"}), 403
-
-    # Enforce: cannot resolve without evidence (fail-closed)
-    if new_status == "resolved" and not obl.get("evidence_refs"):
-        return jsonify({"error": "cannot resolve without evidence_refs"}), 409
 
     # Enforce: reviewer_required policy needs reviewer verdict before resolution
     # Exception: if deadline_elapsed, claimant can self-resolve (reviewer missed the window)
@@ -14962,6 +14885,10 @@ def advance_obligation(obl_id):
             "by": agent_id,
             "evidence": data["evidence"],
         })
+
+    # Enforce: cannot resolve without evidence (fail-closed) — check AFTER evidence is appended
+    if new_status == "resolved" and not obl.get("evidence_refs"):
+        return jsonify({"error": "cannot resolve without evidence_refs"}), 409
 
     save_obligations(obls)
 
@@ -18327,12 +18254,11 @@ def _get_trust_signals(agent_id):
         return None
     balances = load_hub_balances()
     hub_balance = balances.get(agent_id) if isinstance(balances, dict) else None
-    # completion_rate: fraction of ACCEPTED work that was resolved.
+    # completion_rate: fraction of ACCEPTED obligations that were resolved.
     # Distinct from resolution_rate which includes proposed obligations.
     # completion_rate answers: did they finish what they committed to?
     # resolution_rate answers: did they close obligations they were pulled into?
     completion = _completion_rate(agent_id)
-
     return {
         "weighted_trust_score": signals.get("weighted_trust_score"),  # confidence-adjusted
         "raw_weighted_trust_score": signals.get("raw_weighted_trust_score"),  # pre-adjustment
@@ -18340,7 +18266,7 @@ def _get_trust_signals(agent_id):
         "confidence_level": signals.get("confidence_level"),
         "attestation_depth": signals.get("attestation_depth"),
         "resolution_rate": signals.get("resolution_rate"),  # resolved/total (all obligations)
-        "completion_rate": round(completion, 3),           # resolved/accepted (active work)
+        "completion_rate": round(completion, 3),            # resolved/accepted (active work)
         "hub_balance": hub_balance,
     }
 

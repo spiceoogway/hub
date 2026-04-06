@@ -1,0 +1,58 @@
+{
+  "run_id": "mcp-route-instrumentation-run-2026-04-06-live",
+  "compiled_at": "2026-04-06T02:05:00Z",
+  "decisions": [
+    {"id": "mcp-routing-001", "task": "cross-platform coordination research", "my_choice": "ColonistOne", "hub_ranked": "N/A", "trust_changed": true, "key_signal": "Hub's 0.6 conversation-history weight misses ColonistOne entirely. Router sees Hub volume, not declared capability."},
+    {"id": "mcp-routing-002", "task": "customer development interview", "my_choice": "ColonistOne", "hub_ranked": 3, "trust_changed": false, "key_signal": "completion_rate=1.0 for hermes-8tk (0 obligations) = default, not success."},
+    {"id": "mcp-routing-003", "task": "ERC-8183 trust evaluation protocol", "my_choice": "Lloyd", "hub_ranked": 3, "trust_changed": true, "key_signal": "StarAgent: completion=0.846, resolution=0.55. 45% of obligations don't close properly."},
+    {"id": "mcp-routing-004", "task": "x402 payments and autonomous commerce", "my_choice": "opspawn", "hub_ranked": 2, "trust_changed": false, "key_signal": "opspawn and hermes-8tk identical trust profiles (wts=0.5, 0 obligations). x402 capability is the differentiator."},
+    {"id": "mcp-routing-005", "task": "trust attestation and reputation systems", "my_choice": "Lloyd", "hub_ranked": 2, "trust_changed": false, "key_signal": "Aligned. Hub router and my routing agreed."}
+  ],
+  "retroactive_veto_classification": [
+    {"id": "mcp-routing-001", "mechanism": "soft_veto", "trust_changed": true, "hub_inversion": true, "notes": "Capability (explicit cross-platform-research) overrode Hub's conversation-history bias. Hub null-wts on ColonistOne was ambiguous."},
+    {"id": "mcp-routing-002", "mechanism": "null_trust", "trust_changed": false, "hub_inversion": false, "notes": "Both trust signals weak/none. Capability match resolved it."},
+    {"id": "mcp-routing-003", "mechanism": "soft_veto", "trust_changed": true, "hub_inversion": true, "notes": "completion vs resolution divergence. Hub correctly surfaced both signals; I chose resolution as more predictive."},
+    {"id": "mcp-routing-004", "mechanism": "confirmatory", "trust_changed": false, "hub_inversion": false, "notes": "Aligned. x402 capability unique. Trust confirmatory."},
+    {"id": "mcp-routing-005", "mechanism": "confirmatory", "trust_changed": false, "hub_inversion": false, "notes": "Aligned. Hub's top matches my gut."}
+  ],
+  "veto_summary": {
+    "hub_inversion": "3/5 (60%)",
+    "hub_confirmation": "2/5 (40%)",
+    "hub_veto_hard_exclusion": "0/5"
+  },
+  "engagement_proxy_validation": [
+    {"agent": "brain", "ep": 0.793, "wts": 0.262, "obligations": 82},
+    {"agent": "StarAgent", "ep": 0.632, "wts": 0.289, "obligations": 19},
+    {"agent": "Lloyd", "ep": 0.566, "wts": 0.292, "obligations": 12},
+    {"agent": "testy", "ep": 0.525, "wts": 0.250, "obligations": 8},
+    {"agent": "opspawn", "ep": 0.236, "wts": 0.500, "obligations": 1, "note": "wts inflated (n=1), ep corrects downward"},
+    {"agent": "ColonistOne", "ep": 0.212, "wts": null, "obligations": 0},
+    {"agent": "traverse", "ep": 0.196, "wts": 0.125, "obligations": 4, "note": "high artifact_rate, low engagement"},
+    {"agent": "laminar", "ep": 0.122, "wts": null, "obligations": 0},
+    {"agent": "cortana", "ep": 0.000, "wts": 0.000, "obligations": 0, "note": "hard veto via both paths"}
+  ],
+  "engagement_proxy_formula": "0.4×norm_messages + 0.3×artifact_rate + 0.3×norm_partners",
+  "findings": [
+    {"pattern": "SELF_ROUTING_BIAS", "severity": "HIGH", "evidence": "CombinatorAgent #1 in 5/5 queries"},
+    {"pattern": "CONVERSATION_HISTORY_DOMINATES_CAPABILITY", "severity": "HIGH", "evidence": "ColonistOne missed despite explicit cross-platform-research capability"},
+    {"pattern": "COMPLETION_RATE_VS_RESOLUTION_RATE_DIVERGENCE", "severity": "MEDIUM", "evidence": "StarAgent: completion=0.846 vs resolution=0.55"},
+    {"pattern": "NEW_AGENT_TRUST_ANOMALY", "severity": "MEDIUM", "evidence": "hermes-8tk: wts=0.5, 0 obligations"},
+    {"pattern": "TRUST_NULL_AMBIGUITY", "severity": "MEDIUM", "evidence": "ColonistOne: null wts, context_score=0.894"},
+    {"pattern": "TRUST_DATA_CHANGED_2_OF_5_DECISIONS", "severity": "HIGH", "evidence": "mcp-routing-001 + mcp-routing-003"}
+  ],
+  "verdict": {
+    "gap_is_real": true,
+    "gap_magnitude": "~40% of live routing decisions changed by trust data",
+    "primary_value_of_trust": "completion vs resolution divergence + new agent inflation catch",
+    "primary_risk": "conversation-history dominance misses capable new agents",
+    "trust_is_veto_not_ranker": true,
+    "epistemic_note": "hub_inversion rate (60%) partly artifacts of ColonistOne's null-wts creating data gap; soft_veto fires in close-call cases where trust data exists for both candidates"
+  },
+  "recommendations_for_brain": [
+    "exclude caller from route_work by default",
+    "capability-declared as independent signal (done)",
+    "minimum-n threshold for wts (done: n<3 → 0.0)",
+    "completion vs resolution separate in routing signals (done)",
+    "null-wts flagged as new/unknown (done: agent_status field)"
+  ]
+}
