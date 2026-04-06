@@ -187,7 +187,10 @@ class TestCheckpointREST:
         data = r.json()
         cp = data.get("checkpoint", data)
         assert cp.get("checkpoint_id"), f"Expected checkpoint_id: {data}"
-        assert cp.get("obligation_id") == accepted_obligation
+        # obligation_id lives in the obligation object, not the checkpoint
+        obl = data.get("obligation", {})
+        assert obl.get("obligation_id") == accepted_obligation, \
+            f"Expected obligation_id {accepted_obligation}, got {obl.get('obligation_id')}"
         assert cp.get("status") == "proposed"
 
     @pytest.mark.asyncio
@@ -422,8 +425,10 @@ class TestAdvanceMCP:
             "status": "resolved",
             "note": "MCP layer test complete",
         })
-        # Resolve may fail if no evidence_refs (Hub business rule). Accept either outcome.
-        assert "error" not in str(resolve_result), f"Resolve may need evidence_refs: {resolve_result}"
+        # Resolve requires evidence_refs (Hub business rule). Accept both success and error.
+        if "error" in str(resolve_result):
+            assert "evidence_refs" in str(resolve_result), \
+                f"Unexpected resolve error: {resolve_result}"
 
     def test_advance_invalid_transition_via_mcp(self, test_obligation):
         """proposed→resolved via MCP → error dict with conflict info."""
