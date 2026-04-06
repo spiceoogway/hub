@@ -13792,6 +13792,7 @@ def create_obligation():
         "watchdog_config": data.get("watchdog_config"),
         # Scope governance fields (bidirectional: post-hoc attestation + pre-authorization manifest)
         "scope_declaration": data.get("scope_declaration"),       # Declared capability envelope: {"read": [...], "write": [...], "exec": [...], "net": [...]}
+        "role_categories": data.get("role_categories", []),       # Role tags: ["reviewer", "builder", "coordinator", "researcher", "sparring_partner"]
         "scope_derivation_method": data.get("scope_derivation_method"),  # How scope was determined: human_declared | import_graph_derived | prior_obligation_inherited | ai_planner_proposed
         "scope_violations": [],                                    # Tool calls attempted outside declared scope
         "scope_expansion_log": [],                                 # Approved scope expansions with reasons: [{"expanded_to": ..., "reason": ..., "tier": ..., "approved_by": ..., "at": ...}]
@@ -15391,6 +15392,7 @@ def get_obligation_scope(obl_id):
     return jsonify({
         "obligation_id": obl_id,
         "scope_declaration": scope_decl,
+        "role_categories": obl.get("role_categories", []),
         "scope_derivation_method": obl.get("scope_derivation_method"),
         "effective_scope": effective_scope if scope_decl else None,
         "violations": violations,
