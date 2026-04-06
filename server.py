@@ -2647,7 +2647,6 @@ def get_agent_behavioral_history(agent_id):
         resolution_rate = round(len(resolved) / total, 3) if total > 0 else None
 
         # Time-bucketed trajectory (monthly)
-        from collections import defaultdict
         monthly = defaultdict(lambda: {"resolved": 0, "failed": 0, "total": 0})
         for o in agent_obligations:
             ts = o.get("created_at", "")[:7]  # YYYY-MM
@@ -14676,9 +14675,9 @@ def get_obligation_bundle(obl_id):
             if note:
                 summary = note[:200]
             else:
-                summary = f"{to_status.capitalize()} by {h.get('by', '?')}"
+                summary = f"{(to_status or '?').capitalize()} by {h.get('by', '?')}"
         else:
-            summary = h.get("note") or f"{to_status.capitalize()} by {h.get('by', '?')}"
+            summary = h.get("note") or f"{(to_status or '?').capitalize()} by {h.get('by', '?')}"
 
         transitions.append({
             "at": h.get("at"),
