@@ -249,6 +249,42 @@ def _parse_iso_utc(value):
         return None
 
 
+def _validate_callback_url(url):
+    """Validate a callback URL to prevent SSRF.
+    Returns (is_safe, error_message). Only allows http/https to public IPs."""
+    import ipaddress
+    import socket
+    from urllib.parse import urlparse
+
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False, "Malformed URL"
+
+    if parsed.scheme not in ("http", "https"):
+        return False, f"Scheme '{parsed.scheme}' not allowed (must be http or https)"
+
+    hostname = parsed.hostname
+    if not hostname:
+        return False, "No hostname in URL"
+
+    # Block obvious localhost aliases
+    if hostname in ("localhost", "0.0.0.0"):
+        return False, f"Hostname '{hostname}' not allowed"
+
+    try:
+        addrinfos = socket.getaddrinfo(hostname, parsed.port or (443 if parsed.scheme == "https" else 80))
+    except socket.gaierror:
+        return False, f"Cannot resolve hostname '{hostname}'"
+
+    for family, _, _, _, sockaddr in addrinfos:
+        ip = ipaddress.ip_address(sockaddr[0])
+        if not ip.is_global or ip.is_multicast:
+            return False, f"Resolved IP {ip} is not a public address"
+
+    return True, None
+
+
 def _agent_callback_delivery_ready(agent_info):
     callback_url = agent_info.get("callback_url")
     if not callback_url or not agent_info.get("callback_verified"):
@@ -1314,26 +1350,33 @@ def _attempt_transport_delivery(agent_id, msg, callback_url=None, callback_failu
     callback_status = None
     callback_error = None
     if callback_url:
-        try:
-            import requests
+        # Re-validate URL at delivery time to catch DNS rebinding / stale records
+        cb_safe, cb_err = _validate_callback_url(callback_url)
+        if not cb_safe:
+            callback_status = "blocked"
+            callback_error = f"SSRF blocked: {cb_err}"
+            _log_agent_event(agent_id, "callback_blocked", {"url": callback_url, "reason": cb_err})
+        else:
+            try:
+                import requests
 
-            response = requests.post(callback_url, json=msg, timeout=5)
-            callback_status = response.status_code
-            if response.status_code >= 400:
+                response = requests.post(callback_url, json=msg, timeout=5, allow_redirects=False)
+                callback_status = response.status_code
+                if response.status_code >= 400:
+                    if callback_failure_meta is not None:
+                        meta = dict(callback_failure_meta)
+                        meta.update({"url": callback_url, "status": response.status_code})
+                        _log_agent_event(agent_id, "callback_failed", meta)
+                else:
+                    delivered_channels = _merge_delivery_channels(delivered_channels, ["callback"])
+                    delivered_at = delivered_at or (datetime.utcnow().isoformat() + "Z")
+            except Exception as e:
+                callback_status = "failed"
+                callback_error = str(e)[:200]
                 if callback_failure_meta is not None:
                     meta = dict(callback_failure_meta)
-                    meta.update({"url": callback_url, "status": response.status_code})
+                    meta.update({"url": callback_url, "error": str(e)[:100]})
                     _log_agent_event(agent_id, "callback_failed", meta)
-            else:
-                delivered_channels = _merge_delivery_channels(delivered_channels, ["callback"])
-                delivered_at = delivered_at or (datetime.utcnow().isoformat() + "Z")
-        except Exception as e:
-            callback_status = "failed"
-            callback_error = str(e)[:200]
-            if callback_failure_meta is not None:
-                meta = dict(callback_failure_meta)
-                meta.update({"url": callback_url, "error": str(e)[:100]})
-                _log_agent_event(agent_id, "callback_failed", meta)
         _record_callback_attempt(agent_id, callback_url, callback_status, callback_error)
 
     return delivered_channels, delivered_at, callback_status, callback_error
@@ -2208,13 +2251,19 @@ def register_agent():
         except Exception as e:
             print(f"[WALLET] Wallet generation failed for {agent_id}: {type(e).__name__}: {e}")
 
+    reg_callback = data.get("callback_url")
+    if reg_callback:
+        cb_safe, cb_err = _validate_callback_url(reg_callback)
+        if not cb_safe:
+            return jsonify({"ok": False, "error": f"Invalid callback_url: {cb_err}"}), 400
+
     agents[agent_id] = {
         "description": data.get("description", ""),
         "capabilities": data.get("capabilities", []),
         "registered_at": datetime.utcnow().isoformat(),
         "secret": agent_secret,
         "messages_received": 0,
-        "callback_url": data.get("callback_url"),  # Optional
+        "callback_url": reg_callback,  # Validated above
         "solana_wallet": solana_wallet,
         "custodial": custodial_keypair is not None,
     }
@@ -2968,15 +3017,24 @@ def update_agent(agent_id):
     callback_update = None
     if "callback_url" in data:
         new_callback = data["callback_url"]
-        # Test the callback URL before saving
+        # Validate callback URL against SSRF before making any request
         callback_ok = False
         callback_error = None
         if new_callback:
+            url_safe, url_err = _validate_callback_url(new_callback)
+            if not url_safe:
+                return jsonify({"ok": False, "error": f"Invalid callback_url: {url_err}"}), 400
             try:
-                import urllib.request
+                import urllib.request, urllib.error
+
+                class _NoRedirect(urllib.request.HTTPRedirectHandler):
+                    def redirect_request(self, req, fp, code, msg, headers, newurl):
+                        raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
+
+                _opener = urllib.request.build_opener(_NoRedirect)
                 test_payload = json.dumps({"type": "callback_test", "from": "hub", "message": "Callback verification test"}).encode()
                 req = urllib.request.Request(new_callback, data=test_payload, headers={"Content-Type": "application/json"}, method="POST")
-                resp = urllib.request.urlopen(req, timeout=10)
+                resp = _opener.open(req, timeout=10)
                 callback_ok = resp.status < 400
             except Exception as e:
                 callback_error = f"{type(e).__name__}: {str(e)[:100]}"
@@ -3070,6 +3128,10 @@ def update_agent(agent_id):
             owu = data["obligation_webhook_url"]
             if owu and not isinstance(owu, str):
                 return jsonify({"ok": False, "error": "obligation_webhook_url must be a URL string or empty"}), 400
+            if owu:
+                owu_safe, owu_err = _validate_callback_url(owu)
+                if not owu_safe:
+                    return jsonify({"ok": False, "error": f"Invalid obligation_webhook_url: {owu_err}"}), 400
             agents[agent_id]["obligation_webhook_url"] = owu or ""
             updated.append("obligation_webhook_url")
         if "solana_wallet" in data:
@@ -3606,20 +3668,27 @@ def send_message(agent_id):
     callback_status = None
     callback_error = None
     if callback_url:
-        try:
-            import requests
-            r = requests.post(callback_url, json=msg, timeout=5)
-            callback_status = r.status_code
-            if r.status_code >= 400:
-                _log_agent_event(agent_id, "callback_failed", {"url": callback_url, "status": r.status_code, "from": from_agent})
-            else:
-                if "callback" not in delivered_channels:
-                    delivered_channels.append("callback")
-                delivered_at = delivered_at or (datetime.utcnow().isoformat() + "Z")
-        except Exception as e:
-            callback_status = "failed"
-            callback_error = str(e)[:200]
-            _log_agent_event(agent_id, "callback_failed", {"url": callback_url, "error": str(e)[:100], "from": from_agent})
+        # Re-validate URL at delivery time to catch DNS rebinding / stale records
+        cb_safe, cb_err = _validate_callback_url(callback_url)
+        if not cb_safe:
+            callback_status = "blocked"
+            callback_error = f"SSRF blocked: {cb_err}"
+            _log_agent_event(agent_id, "callback_blocked", {"url": callback_url, "reason": cb_err})
+        else:
+            try:
+                import requests
+                r = requests.post(callback_url, json=msg, timeout=5, allow_redirects=False)
+                callback_status = r.status_code
+                if r.status_code >= 400:
+                    _log_agent_event(agent_id, "callback_failed", {"url": callback_url, "status": r.status_code, "from": from_agent})
+                else:
+                    if "callback" not in delivered_channels:
+                        delivered_channels.append("callback")
+                    delivered_at = delivered_at or (datetime.utcnow().isoformat() + "Z")
+            except Exception as e:
+                callback_status = "failed"
+                callback_error = str(e)[:200]
+                _log_agent_event(agent_id, "callback_failed", {"url": callback_url, "error": str(e)[:100], "from": from_agent})
         _record_callback_attempt(agent_id, callback_url, callback_status, callback_error)
 
     delivery_state = _derive_delivery_state(delivered_channels, callback_status)
@@ -6216,11 +6285,15 @@ def discover_agent():
     if not url.startswith("https://"):
         return jsonify({"ok": False, "error": "URL must be https"}), 400
 
+    url_safe, url_err = _validate_callback_url(url)
+    if not url_safe:
+        return jsonify({"ok": False, "error": f"Invalid URL: {url_err}"}), 400
+
     # Fetch agent card
     import requests as req
     agent_card_url = f"{url}/.well-known/agent.json"
     try:
-        r = req.get(agent_card_url, timeout=10)
+        r = req.get(agent_card_url, timeout=10, allow_redirects=False)
         if r.status_code != 200:
             return jsonify({"ok": False, "error": f"No agent card at {agent_card_url} (status {r.status_code})"}), 404
         card = r.json()
@@ -6236,7 +6309,7 @@ def discover_agent():
     try:
         import time
         start = time.time()
-        hr = req.get(health_url, timeout=10)
+        hr = req.get(health_url, timeout=10, allow_redirects=False)
         latency_ms = int((time.time() - start) * 1000)
         health_ok = hr.status_code == 200
     except:
@@ -13685,12 +13758,16 @@ def _fire_obligation_state_webhook(obl, acting_agent, old_status, new_status, no
             webhook_url = cp_agent.get("obligation_webhook_url") or cp_agent.get("callback_url")
 
         if webhook_url:
-            try:
-                import requests as _req
-                _req.post(webhook_url, json=webhook_payload, timeout=5)
-                print(f"[OBL-WEBHOOK] Notified {cp} via webhook: {old_status}→{new_status} on {obl_id}")
-            except Exception as e:
-                print(f"[OBL-WEBHOOK] Webhook to {cp} failed: {e}")
+            wh_safe, wh_err = _validate_callback_url(webhook_url)
+            if not wh_safe:
+                print(f"[OBL-WEBHOOK] SSRF blocked for {cp}: {wh_err}")
+            else:
+                try:
+                    import requests as _req
+                    _req.post(webhook_url, json=webhook_payload, timeout=5, allow_redirects=False)
+                    print(f"[OBL-WEBHOOK] Notified {cp} via webhook: {old_status}→{new_status} on {obl_id}")
+                except Exception as e:
+                    print(f"[OBL-WEBHOOK] Webhook to {cp} failed: {e}")
 
         _send_system_dm(
             cp,
@@ -17260,17 +17337,28 @@ def _verify_url_liveness(url):
     import urllib.request, urllib.error
     if not url or not url.startswith(("http://", "https://")):
         return False, None, "invalid_url"
+    url_safe, url_err = _validate_callback_url(url)
+    if not url_safe:
+        return False, None, f"ssrf_blocked: {url_err}"
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
+
+    opener = urllib.request.build_opener(_NoRedirect)
     try:
         req = urllib.request.Request(url, method="HEAD")
         req.add_header("User-Agent", "AgentHub/0.5 artifact-verify")
-        resp = urllib.request.urlopen(req, timeout=10)
+        resp = opener.open(req, timeout=10)
         return resp.status == 200, resp.status, None
     except urllib.error.HTTPError as e:
+        if e.code in (301, 302, 303, 307, 308):
+            return False, e.code, "redirect_blocked"
         # HEAD might be rejected, try GET
         try:
             req2 = urllib.request.Request(url, method="GET")
             req2.add_header("User-Agent", "AgentHub/0.5 artifact-verify")
-            resp2 = urllib.request.urlopen(req2, timeout=10)
+            resp2 = opener.open(req2, timeout=10)
             return resp2.status == 200, resp2.status, None
         except Exception as e2:
             return False, getattr(e, 'code', None), str(e2)[:200]
