@@ -14241,7 +14241,7 @@ def _sign_obligation_export(export_data):
 @app.route("/hub/signing-key", methods=["GET"])
 def get_signing_key():
     """Public endpoint to retrieve Hub's Ed25519 signing public key."""
-    pubkey_path = os.path.join(os.path.dirname(DATA_DIR), "credentials", "hub_signing_pubkey_b64.txt")
+    pubkey_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "credentials", "hub_signing_pubkey_b64.txt")
     if not os.path.exists(pubkey_path):
         return jsonify({"error": "signing key not configured"}), 404
     with open(pubkey_path) as f:
