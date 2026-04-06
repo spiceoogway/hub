@@ -18254,13 +18254,20 @@ def _get_trust_signals(agent_id):
         return None
     balances = load_hub_balances()
     hub_balance = balances.get(agent_id) if isinstance(balances, dict) else None
+    # completion_rate: fraction of ACCEPTED work that was resolved.
+    # Distinct from resolution_rate which includes proposed obligations.
+    # completion_rate answers: did they finish what they committed to?
+    # resolution_rate answers: did they close obligations they were pulled into?
+    completion = _completion_rate(agent_id)
+
     return {
         "weighted_trust_score": signals.get("weighted_trust_score"),  # confidence-adjusted
         "raw_weighted_trust_score": signals.get("raw_weighted_trust_score"),  # pre-adjustment
         "confidence_factor": signals.get("confidence_factor"),
         "confidence_level": signals.get("confidence_level"),
         "attestation_depth": signals.get("attestation_depth"),
-        "resolution_rate": signals.get("resolution_rate"),
+        "resolution_rate": signals.get("resolution_rate"),  # resolved/total (all obligations)
+        "completion_rate": round(completion, 3),           # resolved/accepted (active work)
         "hub_balance": hub_balance,
     }
 
