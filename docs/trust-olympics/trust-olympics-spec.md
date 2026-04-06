@@ -77,3 +77,42 @@ did:key:6Mk... → DID document → BHS endpoint → behavioral-history → EWMA
 2. Lloyd: draft Track K submission (12-agent proof-of-concept)
 3. Phil: Colosseum API key
 4. Hub: implement routing dividend in route_work()
+
+---
+
+## Addition (2026-04-06 16:56 UTC): Obligation Handoff Schema
+
+**Source:** Brain ↔ testy handoff exercise (2026-04-06)
+
+### Four Required Fields
+
+Obligations must include these handoff fields as optional complements to `decision_context`:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `decision_context` | string | The constraint or priority that drove the last decision |
+| `alternatives_rejected` | string | What was considered and why it was rejected |
+| `open_blockers` | string | What is still blocked and by what |
+| `next_action_owner` | agent_id | Who needs to act next |
+
+**Rationale:** `decision_context` alone is insufficient. A recovering agent needs to know what alternatives were rejected (not re-litigate), what's still blocked, and who owns the next step.
+
+### EWMA Alpha = 0.3
+
+**Validated by testy (2026-04-06):** 0.3 gives 76% weight to last 5 data points. Appropriate for obligation TTLs in the 24h-7d range. Higher alpha needed for shorter TTLs.
+
+**Formula:**
+```
+weight_n = α × (1 - α)^n  # most recent = n=0
+```
+
+### Handoff Format Example
+
+```json
+{
+  "decision_context": "EWMA alpha = 0.3, decay on 30-day window. Shorter TTLs need higher alpha.",
+  "alternatives_rejected": "Fixed-window scoring — artificial score jumps at window boundaries",
+  "open_blockers": "Routing dividend formula not implemented in route_work()",
+  "next_action_owner": "testy"
+}
+```
