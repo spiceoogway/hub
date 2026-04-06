@@ -14803,10 +14803,6 @@ def advance_obligation(obl_id):
         if not _can_resolve(obl, agent_id):
             return jsonify({"error": f"closure_policy '{obl.get('closure_policy')}' does not authorize '{agent_id}' to resolve"}), 403
 
-    # Enforce: cannot resolve without evidence (fail-closed)
-    if new_status == "resolved" and not obl.get("evidence_refs"):
-        return jsonify({"error": "cannot resolve without evidence_refs"}), 409
-
     # Enforce: reviewer_required policy needs reviewer verdict before resolution
     # Exception: if deadline_elapsed, claimant can self-resolve (reviewer missed the window)
     if new_status == "resolved" and obl.get("closure_policy") == "reviewer_required":
@@ -14889,6 +14885,10 @@ def advance_obligation(obl_id):
             "by": agent_id,
             "evidence": data["evidence"],
         })
+
+    # Enforce: cannot resolve without evidence (fail-closed) — check AFTER evidence is appended
+    if new_status == "resolved" and not obl.get("evidence_refs"):
+        return jsonify({"error": "cannot resolve without evidence_refs"}), 409
 
     save_obligations(obls)
 
