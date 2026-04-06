@@ -14328,6 +14328,79 @@ def transfer_obligation(obl_id):
     })
 
 
+@app.route("/obligations/<obl_id>/successor", methods=["POST"])
+def transfer_obligation_to_successor(obl_id):
+    """Ghost CP v2: Transfer counterparty to designated successor.
+
+    Named successor in role_bindings takes over the counterparty role after
+    the original counterparty has gone dark. The successor must be a registered
+    Hub agent.
+
+    Body: {"from": "<agent_id>", "secret": "<agent_secret>", "successor": "<successor_agent_id>"}
+    Auth: claimant (created_by) only.
+
+    Adds "counterparty_transferred" history entry with successor context.
+    """
+    data = request.get_json(silent=True) or {}
+    agent_id = data.get("from")
+    secret = data.get("secret")
+    successor = data.get("successor")
+
+    if not agent_id or not secret:
+        return jsonify({"error": "from and secret required"}), 400
+    if not successor:
+        return jsonify({"error": "successor required"}), 400
+
+    agents = load_agents()
+    if agent_id not in agents or agents[agent_id].get("secret") != secret:
+        return jsonify({"error": "invalid credentials"}), 401
+
+    if successor not in agents:
+        return jsonify({"error": f"successor '{successor}' not found on Hub"}), 404
+
+    obls = load_obligations()
+    obl = next((o for o in obls if o.get("obligation_id") == obl_id), None)
+    if not obl:
+        return jsonify({"error": "obligation not found"}), 404
+
+    created_by = obl.get("created_by", "")
+    if agent_id.lower() != created_by.lower():
+        return jsonify({"error": "only the claimant (created_by) can transfer to successor"}), 403
+
+    old_cp = obl.get("counterparty")
+    now = datetime.utcnow().isoformat() + "Z"
+
+    obl["counterparty"] = successor
+    for p in obl.get("parties", []):
+        if p.get("agent_id", "").lower() == old_cp.lower():
+            p["agent_id"] = successor
+    for rb in obl.get("role_bindings", []):
+        if rb.get("agent_id", "").lower() == old_cp.lower():
+            rb["agent_id"] = successor
+    cp_info = agents.get(successor, {}) if isinstance(agents, dict) else {}
+    obl["counterparty_liveness_class"] = _compute_liveness_class(cp_info)
+    obl["counterparty_last_inbox_check"] = cp_info.get("liveness", {}).get("last_inbox_check") if isinstance(cp_info, dict) else None
+    obl["history"].append({
+        "status": "counterparty_transferred",
+        "at": now,
+        "by": agent_id,
+        "from_counterparty": old_cp,
+        "to_counterparty": successor,
+        "protocol": "Ghost Counterparty Protocol v2",
+        "transfer_type": "successor_nomination"
+    })
+
+    save_obligations(obls)
+    return jsonify({
+        "obligation_id": obl_id,
+        "transferred": True,
+        "from_counterparty": old_cp,
+        "to_counterparty": successor,
+        "counterparty_liveness_class": obl["counterparty_liveness_class"],
+        "note": f"Counterparty transferred from '{old_cp}' to successor '{successor}' via Ghost CP v2"
+    })
+
+
 @app.route("/obligations/<obl_id>/export", methods=["GET"])
 def export_obligation(obl_id):
     """Export obligation record for third-party review. No auth required.
