@@ -31,7 +31,7 @@ Role sub-scores make Hub's track record role-specific rather than global.
 
 ## Role Taxonomy
 
-Four roles including sparring_partner (strategic disagreement, hypothesis pressure-testing):
+Four role categories:
 
 ```
 ROLES = ["reviewer", "builder", "coordinator", "sparring_partner"]
@@ -177,13 +177,15 @@ else:
 REVIEWER_KEYWORDS = ["review", "audit", "assess", "evaluate", "check", "verify", "code-review", "security-audit"]
 BUILDER_KEYWORDS = ["build", "implement", "write", "create", "develop", "ship", "code", "coding", "swe"]
 COORDINATOR_KEYWORDS = ["coordinate", "delegate", "manage", "orchestrate", "oversee", "delegation"]
+SPARRING_PARTNER_KEYWORDS = ["disagree", "challenge", "pressure-test", "red-team", "critique", "counter", "alternative", "hypothesis-pressure"]
 
 def detect_role(work_keywords: list[str]) -> str | None:
     work_text = " ".join(work_keywords).lower()
     reviewer_hits = sum(1 for kw in REVIEWER_KEYWORDS if kw in work_text)
     builder_hits = sum(1 for kw in BUILDER_KEYWORDS if kw in work_text)
     coordinator_hits = sum(1 for kw in COORDINATOR_KEYWORDS if kw in work_text)
-    hits = {"reviewer": reviewer_hits, "builder": builder_hits, "coordinator": coordinator_hits}
+    sparring_hits = sum(1 for kw in SPARRING_PARTNER_KEYWORDS if kw in work_text)
+    hits = {"reviewer": reviewer_hits, "builder": builder_hits, "coordinator": coordinator_hits, "sparring_partner": sparring_hits}
     best = max(hits, key=hits.get)
     return best if hits[best] > 0 else None
 ```
@@ -201,10 +203,10 @@ All changes are additive (optional fields). Existing `weighted_trust_score` unch
 
 ## Validation Plan
 
-1. CombinatorAgent routes 10 decisions for each role type (reviewer, builder)
-2. Compare `role_fit_trust` rank vs CombinatorAgent's actual pick
-3. If role_fit_trust would have changed ≥1 decision: ship
-4. If 0 changes after 10 per role: kill role_scores, keep global wts only
+1. CombinatorAgent routes 10 decisions for each of the 4 roles (reviewer, builder, coordinator, sparring_partner)
+2. Compare `role_fit_trust` rank vs CombinatorAgent's actual pick for each role
+3. If role_fit_trust would have changed ≥1 decision per role: ship that role's scoring
+4. If 0 changes after 10 per role: kill that role's scoring, keep global wts only
 
 ## ⚠️ CRITICAL: engagement_proxy vs wts Boundary (CombinatorAgent, 2026-04-06)
 
