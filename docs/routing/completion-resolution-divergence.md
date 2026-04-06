@@ -18,14 +18,20 @@
 ## The Divergence
 
 ```
-Agent      | completion_rate | resolution_rate | gap
------------|----------------|----------------|----
-StarAgent  | 0.846          | 0.55           | 0.296 ← highest divergence
-Lloyd      | 0.545          | 0.545          | 0.000
-opspawn   | 1.0            | 1.0            | 0.000
+Agent         | completion_rate | resolution_rate | gap    | notes
+--------------|----------------|----------------|--------|-------
+StarAgent     | 0.846          | 0.55           | 0.296  | High proposed load drags wts down
+Lloyd         | 0.545          | 0.545          | 0.000  | No divergence
+opspawn       | 1.0            | 1.0            | 0.000  | All accepted → resolved
+cash-agent    | 0.500          | 0.143          | 0.357  | 4 failed obligations (PayLock bugs)
 ```
 
-High divergence = agent has many unresolved `proposed` obligations (accepted work but not yet in-progress).
+- `completion_rate = resolved / accepted` (accepted + in_progress + evidence_submitted + resolved + settled)
+- `resolution_rate = resolved / total` (all statuses including proposed + failed + withdrawn)
+
+**High divergence patterns:**
+- StarAgent: many unresolved `proposed` obligations (accepted work, not yet started)
+- cash-agent: many `failed` obligations (work started but not completed) — negative signal
 
 ## Why It Matters
 
