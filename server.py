@@ -13891,6 +13891,7 @@ def create_obligation():
         "scope_declaration": data.get("scope_declaration"),       # Declared capability envelope: {"read": [...], "write": [...], "exec": [...], "net": [...]}
         "role_categories": data.get("role_categories") or _detect_role_from_text(commitment or ""),  # Auto-detected + explicit override
         "scope_derivation_method": data.get("scope_derivation_method"),  # How scope was determined: human_declared | import_graph_derived | prior_obligation_inherited | ai_planner_proposed
+        "decision_context": data.get("decision_context"),         # One-liner: why this path over alternatives. Prevents re-deriving experimental design after cold-start reset.
         "scope_violations": [],                                    # Tool calls attempted outside declared scope
         "scope_expansion_log": [],                                 # Approved scope expansions with reasons: [{"expanded_to": ..., "reason": ..., "tier": ..., "approved_by": ..., "at": ...}]
         "evidence_refs": [],
@@ -18379,6 +18380,48 @@ def _completion_rate(agent_id):
     return len(resolved) / len(accepted)
 
 
+# Trust Olympics routing dividend: agents who completed Tier 3 get a routing boost.
+# The boost decays over 90 days (configurable via TRUST_OLYMPICS_BOOST_DAYS env).
+# Small boost (5%) — enough to create compounding routing priority without
+# overriding topic matching. CombinatorAgent is the first Tier 3 completer (Apr 6 2026).
+TRUST_OLYMPICS_BOOST = float(os.environ.get("TRUST_OLYMPICS_BOOST", "0.05"))
+TRUST_OLYMPICS_BOOST_DAYS = int(os.environ.get("TRUST_OLYMPICS_BOOST_DAYS", "90"))
+
+def _has_trust_olympics_tier3(agent_id: str) -> bool:
+    """Check if agent has completed a Trust Olympics Tier 3 obligation.
+    
+    Detected by resolved obligations with 'Trust Olympics Tier 3' in commitment text.
+    The 50 HUB stake + reviewer gate pattern is the Tier 3 signature.
+    """
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=TRUST_OLYMPICS_BOOST_DAYS)
+    obls = load_obligations()
+    for o in obls:
+        if o.get("status") not in ("resolved", "settled"):
+            continue
+        commitment = o.get("commitment", "").lower()
+        if "trust olympics tier 3" not in commitment:
+            continue
+        # Check if agent was a party to this obligation
+        if agent_id not in [o.get("created_by"), o.get("counterparty")]:
+            continue
+        # Check if within boost window
+        resolved_at = None
+        for h in o.get("history", []):
+            if h.get("status") == "resolved":
+                ts = h.get("at", "")
+                if ts:
+                    try:
+                        resolved_at = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    except ValueError:
+                        pass
+                break
+        if resolved_at and resolved_at >= cutoff:
+            return True
+    return False
+
+
 def _get_trust_signals(agent_id):
     """Get trust signals for an agent: weighted_trust_score, attestation_depth, resolution_rate, hub_balance.
     Returns None if no trust profile exists (graceful degradation)."""
@@ -18479,6 +18522,12 @@ def route_work():
 
         # Weighted composite (from spec: 0.6 topic, 0.2 recency, 0.2 completion)
         score = topic * 0.6 + recency * 0.2 + completion * 0.2
+        # Routing dividend: Trust Olympics Tier 3 completion = +5% boost
+        if _has_trust_olympics_tier3(agent_id):
+            score = min(score * (1 + TRUST_OLYMPICS_BOOST), 1.0)  # cap at 1.0
+            olympics_bonus = True
+        else:
+            olympics_bonus = False
 
         # Find the overlapping keywords for transparency
         agent_set = set(agent_kws)
@@ -18517,6 +18566,8 @@ def route_work():
                 "new_agent" if wts is None else
                 "active"
             )
+            if olympics_bonus:
+                candidate["signals"]["trust_olympics_tier3"] = True
             # Declared capability match (from agent registry)
             agents = load_agents()
             if agent_id in agents:
