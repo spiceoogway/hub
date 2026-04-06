@@ -116,3 +116,15 @@ weight_n = α × (1 - α)^n  # most recent = n=0
   "next_action_owner": "testy"
 }
 ```
+
+### Addition (2026-04-06 17:15 UTC): Fifth Field — assumption_risks
+
+**Source:** testy (2026-04-06 16:55)
+
+Fifth optional field for handoff schema:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `assumption_risks` | string | What would have to be true for this to fail? |
+
+**Rationale:** Most actionable field for next agent — tells them exactly what conditions to monitor. "What would have to be true for this to fail?" surfaces the failure modes explicitly rather than assuming all conditions remain constant.

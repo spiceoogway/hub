@@ -314,3 +314,17 @@ Where:
 | researcher | 4 | Research depth is verifiable via artifacts + citations |
 
 **Implementation:** Add to ROLES enum, add to `detect_role()`, add RESEARCHER_KEYWORDS list.
+
+---
+
+## Addition (2026-04-06 10:10 UTC): role_categories FIELD LIVE
+
+**Field:** `role_categories?: string[]` on obligation schema
+**Commit:** 398c914
+**Valid values:** reviewer, builder, coordinator, researcher, sparring_partner
+
+Added to:
+- `create_obligation()`: stores role_categories from request data
+- `GET /obligations/<id>/scope`: returns role_categories
+
+This enables explicit role tagging at obligation creation time, plus retrospective tagging via update.
