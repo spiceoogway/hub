@@ -73,6 +73,13 @@ sock = Sock(app)
 # Maps agent_id -> list of active WebSocket connections
 _ws_connections: dict[str, list] = {}
 _ws_lock = __import__("threading").Lock()
+# Maps id(ws) -> set of message_ids already delivered on this connection.
+# Prevents _ws_deliver_unread() from re-sending messages on each heartbeat.
+_ws_delivered_ids: dict[int, set] = {}
+# Maps id(ws) -> per-connection send lock.
+# Serializes ws.send() calls between _ws_deliver_unread (ws_messages greenlet)
+# and _ws_push_message (send_message greenlet) to prevent concurrent frame writes.
+_ws_send_locks: dict[int, object] = {}
 
 @app.after_request
 def _track_errors(response):
@@ -3758,37 +3765,12 @@ def ws_messages(ws, agent_id):
     # Register this connection
     with _ws_lock:
         _ws_connections.setdefault(agent_id, []).append(ws)
+        _ws_delivered_ids[id(ws)] = set()
+        _ws_send_locks[id(ws)] = __import__("threading").Lock()
     _log_agent_event(agent_id, "ws_connect")
 
     try:
-        def _deliver_unread_once():
-            inbox = load_inbox(agent_id)
-            unread = [m for m in inbox if not m.get("read")]
-            if not unread:
-                return
-
-            delivered_at = datetime.utcnow().isoformat() + "Z"
-            delivered_by_sender = {}
-            for m in unread:
-                ws.send(json.dumps({
-                    "type": "message",
-                    "data": {
-                        "messageId": m.get("id", ""),
-                        "from": m.get("from", ""),
-                        "text": m.get("message", ""),
-                        "timestamp": m.get("timestamp", ""),
-                    }
-                }))
-                sender = m.get("from")
-                if sender:
-                    delivered_by_sender.setdefault(sender, []).append(m.get("id"))
-            for sender_id, msg_ids in delivered_by_sender.items():
-                try:
-                    _mark_sent_records_delivered(sender_id, agent_id, msg_ids, "websocket", delivered_at)
-                except Exception as e:
-                    print(f"[SENT] Failed to record WS delivery for {sender_id}: {e}")
-
-        _deliver_unread_once()
+        _ws_deliver_unread(ws, agent_id)
 
         # Keep connection alive. Some stacks/proxies don't surface ping frames reliably
         # through ws.receive(timeout=...), so also send a server-side heartbeat and
@@ -3800,11 +3782,11 @@ def ws_messages(ws, agent_id):
                     break
                 msg = json.loads(data)
                 if msg.get("type") == "ping":
-                    ws.send(json.dumps({"type": "pong"}))
+                    _send_on_ws(ws, json.dumps({"type": "pong"}))
             except TimeoutError:
                 try:
-                    ws.send(json.dumps({"type": "pong"}))
-                    _deliver_unread_once()
+                    _send_on_ws(ws, json.dumps({"type": "pong"}))
+                    _ws_deliver_unread(ws, agent_id)
                     continue
                 except Exception:
                     break
@@ -3815,7 +3797,81 @@ def ws_messages(ws, agent_id):
             conns = _ws_connections.get(agent_id, [])
             if ws in conns:
                 conns.remove(ws)
+            _ws_delivered_ids.pop(id(ws), None)
+            _ws_send_locks.pop(id(ws), None)
         _log_agent_event(agent_id, "ws_disconnect")
+
+
+def _send_on_ws(ws, data: str) -> None:
+    """Send data on a WebSocket, serialized with _ws_push_message via per-connection lock."""
+    lock = _ws_send_locks.get(id(ws))
+    if lock is not None:
+        with lock:
+            ws.send(data)
+    else:
+        ws.send(data)
+
+
+def _ws_deliver_unread(ws, agent_id: str) -> None:
+    """Deliver all unread inbox messages to a connected WebSocket client.
+
+    Skips messages already delivered on this connection (tracked in _ws_delivered_ids).
+    The entire snapshot → filter → send → mark-delivered cycle runs inside the
+    per-connection send_lock, making it atomic with respect to _ws_push_message.
+    This eliminates the TOCTOU window: _ws_push_message checks _ws_delivered_ids
+    before sending, so if we already sent a message here, it won't be re-pushed.
+    """
+    inbox = load_inbox(agent_id)
+
+    send_lock = _ws_send_locks.get(id(ws))
+    lock_ctx = send_lock if send_lock is not None else __import__("contextlib").nullcontext()
+
+    delivered_at = datetime.utcnow().isoformat() + "Z"
+    delivered_by_sender = {}
+
+    with lock_ctx:
+        # Snapshot and filter inside the lock so _ws_push_message sees consistent state.
+        with _ws_lock:
+            already_delivered = set(_ws_delivered_ids.get(id(ws), set()))
+        unread = [m for m in inbox if not m.get("read") and m.get("id") not in already_delivered]
+        if not unread:
+            return
+
+        newly_sent_ids = []
+        for m in unread:
+            try:
+                ws.send(json.dumps({
+                    "type": "message",
+                    "data": {
+                        "messageId": m.get("id", ""),
+                        "from": m.get("from", ""),
+                        "text": m.get("message", ""),
+                        "timestamp": m.get("timestamp", ""),
+                    }
+                }))
+            except Exception:
+                break
+            msg_id = m.get("id")
+            if msg_id:  # guard: don't let None/empty poison the dedup set
+                newly_sent_ids.append(msg_id)
+            # Note: messages with id=None/empty ARE sent but cannot be deduplicated.
+            # They will be resent on every heartbeat until the client marks them read.
+            # In practice send_message() always assigns an id via secrets.token_hex(8).
+            sender = m.get("from")
+            if sender:
+                delivered_by_sender.setdefault(sender, []).append(msg_id)
+
+        # Update delivered set inside the lock so _ws_push_message's pre-send check
+        # sees these IDs immediately after we release the lock.
+        if newly_sent_ids:
+            with _ws_lock:
+                _ws_delivered_ids.setdefault(id(ws), set()).update(newly_sent_ids)
+
+    for sender_id, msg_ids in delivered_by_sender.items():
+        try:
+            _mark_sent_records_delivered(sender_id, agent_id, msg_ids, "websocket", delivered_at)
+        except Exception as e:
+            print(f"[SENT] Failed to record WS delivery for {sender_id}: {e}")
 
 
 def _ws_push_message(agent_id: str, message: dict):
@@ -3830,18 +3886,38 @@ def _ws_push_message(agent_id: str, message: dict):
         }
     }
     payload = json.dumps(adapted)
+    msg_id = message.get("id", "")
     delivered = False
     with _ws_lock:
-        conns = _ws_connections.get(agent_id, [])
-        dead = []
-        for ws_conn in conns:
+        conns = list(_ws_connections.get(agent_id, []))  # snapshot; release lock before sends
+    dead = []
+    for ws_conn in conns:
+        send_lock = _ws_send_locks.get(id(ws_conn))
+        if send_lock is None:
+            # Connection cleaned up between snapshot and now
+            dead.append(ws_conn)
+            continue
+        with send_lock:
+            # Pre-send check: if _ws_deliver_unread already sent this message on this
+            # connection (inside its own send_lock), skip to avoid the TOCTOU duplicate.
+            with _ws_lock:
+                if msg_id and msg_id in _ws_delivered_ids.get(id(ws_conn), set()):
+                    delivered = True  # Already on the wire — count as delivered
+                    continue
             try:
                 ws_conn.send(payload)
                 delivered = True
+                if msg_id:
+                    with _ws_lock:
+                        _ws_delivered_ids.setdefault(id(ws_conn), set()).add(msg_id)
             except Exception:
                 dead.append(ws_conn)
-        for d in dead:
-            conns.remove(d)
+    if dead:
+        with _ws_lock:
+            conns_list = _ws_connections.get(agent_id, [])
+            for d in dead:
+                if d in conns_list:
+                    conns_list.remove(d)
     return delivered
 
 
