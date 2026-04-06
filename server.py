@@ -13711,6 +13711,27 @@ def list_obligations():
     return jsonify({"obligations": obls, "count": len(obls)})
 
 
+
+def _detect_role_from_text(text: str) -> list[str]:
+    """Detect role categories from obligation commitment text.
+    
+    Runs all role keyword sets and returns all matches (an obligation can have multiple roles).
+    """
+    REVIEWER_KW = ["review", "audit", "assess", "evaluate", "check", "verify", "code-review", "security-audit"]
+    BUILDER_KW = ["build", "implement", "write", "create", "develop", "ship", "code", "coding", "swe", "spec", "deliver"]
+    COORDINATOR_KW = ["coordinate", "delegate", "manage", "orchestrate", "oversee", "delegate", "route", "assign", "distribute", "workflow"]
+    RESEARCHER_KW = ["research", "investigate", "analyze", "study", "survey", "explore", "map", "discover", "synthesize", "measure", "analysis"]
+    SPARRING_KW = ["disagree", "challenge", "pressure-test", "red-team", "critique", "counter", "alternative", "hypothesis-pressure", "debate"]
+    
+    t = text.lower()
+    roles = []
+    if any(kw in t for kw in REVIEWER_KW): roles.append("reviewer")
+    if any(kw in t for kw in BUILDER_KW): roles.append("builder")
+    if any(kw in t for kw in COORDINATOR_KW): roles.append("coordinator")
+    if any(kw in t for kw in RESEARCHER_KW): roles.append("researcher")
+    if any(kw in t for kw in SPARRING_KW): roles.append("sparring_partner")
+    return roles
+
 @app.route("/obligations", methods=["POST"])
 def create_obligation():
     """Create a new obligation. Requires authenticated agent (from + secret)."""
@@ -13792,7 +13813,7 @@ def create_obligation():
         "watchdog_config": data.get("watchdog_config"),
         # Scope governance fields (bidirectional: post-hoc attestation + pre-authorization manifest)
         "scope_declaration": data.get("scope_declaration"),       # Declared capability envelope: {"read": [...], "write": [...], "exec": [...], "net": [...]}
-        "role_categories": data.get("role_categories", []),       # Role tags: ["reviewer", "builder", "coordinator", "researcher", "sparring_partner"]
+        "role_categories": data.get("role_categories") or _detect_role_from_text(commitment or ""),  # Auto-detected + explicit override
         "scope_derivation_method": data.get("scope_derivation_method"),  # How scope was determined: human_declared | import_graph_derived | prior_obligation_inherited | ai_planner_proposed
         "scope_violations": [],                                    # Tool calls attempted outside declared scope
         "scope_expansion_log": [],                                 # Approved scope expansions with reasons: [{"expanded_to": ..., "reason": ..., "tier": ..., "approved_by": ..., "at": ...}]
