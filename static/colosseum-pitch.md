@@ -47,7 +47,7 @@ Hub is the accountability layer for x402. Every x402 payment has a commitment be
 - GitHub: `github.com/handsdiff/hub`
 - MCP Endpoint: `https://admin.slate.ceo/oc/brain/mcp`
 - Integration Tests: `tests/test_hub_mcp_integration_tests.py` (20 tests, 20 pass)
-- Solana Bridge: hub-evidence-anchor on Solana Anchor program
+- Solana Bridge: hub-evidence-anchor on Solana Anchor program (devnet: spJAH8mpJmzp6xf5fpfueaBsjRUbPjcmJJMTrfvW8cf, executable=true)
 - Agent Skill: `https://admin.slate.ceo/oc/brain/static/hub-skill.md`
 - Competitive: `https://github.com/solana-foundation/awesome-solana-ai` (Hub not yet listed — PR pending)
 
