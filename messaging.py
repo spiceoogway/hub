@@ -954,7 +954,133 @@ def register_agent():
     return jsonify(response)
 
 
-# ── Send message ─────────────────────────────────────────────────────
+# ── Core delivery ────────────────────────────────────────────────────
+
+def deliver_message(from_agent, to_agent, message, *, topic=None, reply_to=None, extra=None):
+    """Single entry point for all message delivery. No flask.request dependency.
+
+    Called by: HTTP send_message route, WebSocket send handler, _deliver_internal_dm.
+    Handles: store to inbox, sent record, counter updates, transport delivery
+    (WS push + callback), hook firing.
+
+    Args:
+        from_agent: sender agent_id
+        to_agent: recipient agent_id
+        message: message text
+        topic: optional topic tag for threading
+        reply_to: optional message_id being replied to
+        extra: optional dict of extra fields merged into the message (e.g. type, is_broadcast)
+
+    Returns:
+        dict with ok, message_id, delivery_state, callback_status, etc.
+        On failure, dict with ok=False and error.
+    """
+    agents = load_agents()
+    if to_agent not in agents:
+        return {"ok": False, "error": f"Agent '{to_agent}' not found"}
+
+    msg = {
+        "id": secrets.token_hex(8),
+        "from": from_agent,
+        "message": message,
+        "timestamp": datetime.utcnow().isoformat(),
+        "read": False,
+    }
+    if topic:
+        msg["topic"] = topic[:100]
+    if reply_to:
+        msg["reply_to"] = reply_to
+    if extra:
+        msg.update(extra)
+
+    with agents_lock() as mutable_agents:
+        agent_info = mutable_agents.get(to_agent, {})
+        callback_url = agent_info.get("callback_url")
+        callback_verified = bool(callback_url) and bool(agent_info.get("callback_verified"))
+
+    sent_record = {
+        "message_id": msg["id"],
+        "to": to_agent,
+        "message_preview": message[:100] + ("..." if len(message) > 100 else ""),
+        "timestamp": msg["timestamp"],
+        "delivery_state": "inbox_queued",
+        "delivered_channels": [],
+        "delivered_at": None,
+        "callback_status": None,
+        "callback_url_configured": bool(callback_url),
+        "callback_verified": callback_verified,
+        "callback_error": None,
+        "read": False,
+        "read_at": None,
+    }
+    if topic:
+        sent_record["topic"] = msg.get("topic")
+    if reply_to:
+        sent_record["reply_to"] = reply_to
+    if extra:
+        for key, value in extra.items():
+            if key not in {"id", "message", "from", "to", "read", "timestamp"}:
+                sent_record[key] = value
+
+    try:
+        _append_sent_record(from_agent, to_agent, sent_record)
+    except Exception as e:
+        print(f"[SENT] Failed to persist sent record for {from_agent}->{to_agent}: {e}")
+        return {"ok": False, "error": "Failed to persist sender delivery record"}
+
+    try:
+        append_message_to_conversation(to_agent, from_agent, msg)
+    except Exception:
+        try:
+            _delete_sent_record(from_agent, to_agent, msg["id"])
+        except Exception as cleanup_error:
+            print(f"[SENT] Failed to cleanup sent record for {from_agent}->{to_agent}: {cleanup_error}")
+        return {"ok": False, "error": "Failed to store message"}
+
+    try:
+        with agents_lock() as mutable_agents:
+            if to_agent in mutable_agents:
+                mutable_agents[to_agent]["messages_received"] = mutable_agents[to_agent].get("messages_received", 0) + 1
+                mutable_agents[to_agent]["last_message_received_at"] = datetime.utcnow().isoformat()
+            if from_agent in mutable_agents:
+                mutable_agents[from_agent]["last_message_sent_at"] = datetime.utcnow().isoformat()
+    except Exception as e:
+        print(f"[MSG] Counter update failed for {from_agent}->{to_agent} (message delivered): {e}")
+
+    print(f"[MSG] {from_agent} -> {to_agent}: {message[:50]}...")
+
+    # Transport delivery (WebSocket + callback)
+    delivered_channels, delivered_at, callback_status, callback_error = _attempt_transport_delivery(
+        to_agent, msg, callback_url=callback_url,
+        callback_failure_meta={"from": from_agent},
+    )
+
+    delivery_state = _derive_delivery_state(delivered_channels, callback_status)
+    try:
+        _finalize_sent_record_delivery(
+            from_agent, to_agent, msg["id"],
+            delivered_channels,
+            delivered_at=delivered_at,
+            callback_status=callback_status,
+            callback_error=callback_error,
+        )
+    except Exception as e:
+        print(f"[SENT] Failed to update sent record for {from_agent}->{to_agent}: {e}")
+
+    on_message_sent.fire(from_agent, to_agent, msg)
+
+    return {
+        "ok": True,
+        "message_id": msg["id"],
+        "delivered_to_inbox": True,
+        "callback_status": callback_status,
+        "callback_url_configured": bool(callback_url),
+        "callback_error": callback_error,
+        "delivery_state": delivery_state,
+    }
+
+
+# ── Send message (HTTP route) ───────────────────────────────────────
 
 @messaging_bp.route("/agents/<agent_id>/message", methods=["POST"])
 def send_message(agent_id):
@@ -976,7 +1102,6 @@ def send_message(agent_id):
             "register_recipient": f"POST /agents/register with {{\"agent_id\": \"{agent_id}\"}} to create this agent",
             "register_yourself": "POST /agents/register with {\"agent_id\": \"your-name\"} \u2192 secret"
         }
-        # Let subscribers enrich the 404 (e.g. trust context, ecosystem snapshot)
         for extra in on_send_recipient_not_found.fire(from_agent, agent_id):
             if isinstance(extra, dict):
                 resp.update(extra)
@@ -994,123 +1119,16 @@ def send_message(agent_id):
         if agents[from_agent].get("secret") != sender_secret:
             return jsonify({"ok": False, "error": "Invalid secret. You cannot send messages as this agent."}), 403
 
-    topic = data.get("topic")
-    reply_to = data.get("reply_to")
+    result = deliver_message(
+        from_agent, agent_id, message,
+        topic=data.get("topic"),
+        reply_to=data.get("reply_to"),
+    )
 
-    msg = {
-        "id": secrets.token_hex(8),
-        "from": from_agent,
-        "message": message,
-        "timestamp": datetime.utcnow().isoformat(),
-        "read": False,
-    }
-    if topic:
-        msg["topic"] = topic[:100]
-    if reply_to:
-        msg["reply_to"] = reply_to
+    if not result.get("ok"):
+        return jsonify(result), 500
 
-    with agents_lock() as mutable_agents:
-        callback_url = mutable_agents[agent_id].get("callback_url")
-        callback_verified = bool(callback_url) and bool(mutable_agents[agent_id].get("callback_verified"))
-
-    sent_record = {
-        "message_id": msg["id"],
-        "to": agent_id,
-        "message_preview": message[:100] + ("..." if len(message) > 100 else ""),
-        "timestamp": msg["timestamp"],
-        "delivery_state": "inbox_queued",
-        "delivered_channels": [],
-        "delivered_at": None,
-        "callback_status": None,
-        "callback_url_configured": bool(callback_url),
-        "callback_verified": callback_verified,
-        "callback_error": None,
-        "read": False,
-        "read_at": None,
-    }
-    if topic:
-        sent_record["topic"] = msg["topic"]
-    if reply_to:
-        sent_record["reply_to"] = reply_to
-
-    try:
-        _append_sent_record(from_agent, agent_id, sent_record)
-    except Exception as e:
-        print(f"[SENT] Failed to persist sent record for {from_agent}->{agent_id}: {e}")
-        return jsonify({"ok": False, "error": "Failed to persist sender delivery record"}), 500
-
-    try:
-        append_message_to_conversation(agent_id, from_agent, msg)
-    except Exception:
-        try:
-            _delete_sent_record(from_agent, agent_id, msg["id"])
-        except Exception as cleanup_error:
-            print(f"[SENT] Failed to cleanup precreated sent record for {from_agent}->{agent_id}: {cleanup_error}")
-        raise
-
-    with agents_lock() as mutable_agents:
-        mutable_agents[agent_id]["messages_received"] = mutable_agents[agent_id].get("messages_received", 0) + 1
-        mutable_agents[agent_id]["last_message_received_at"] = datetime.utcnow().isoformat()
-        if from_agent in mutable_agents:
-            mutable_agents[from_agent]["last_message_sent_at"] = datetime.utcnow().isoformat()
-
-    print(f"[MSG] {from_agent} -> {agent_id}: {message[:50]}...")
-
-    # WebSocket push
-    ws_delivered = _ws_push_message(agent_id, msg)
-    delivered_channels = ["websocket"] if ws_delivered else []
-    delivered_at = datetime.utcnow().isoformat() + "Z" if ws_delivered else None
-
-    # Callback delivery
-    callback_status = None
-    callback_error = None
-    if callback_url:
-        cb_safe, cb_err = _validate_callback_url(callback_url)
-        if not cb_safe:
-            callback_status = "blocked"
-            callback_error = f"SSRF blocked: {cb_err}"
-            _log_agent_event_internal(agent_id, "callback_blocked", {"url": callback_url, "reason": cb_err})
-        else:
-            try:
-                import requests
-                r = requests.post(callback_url, json=msg, timeout=5, allow_redirects=False)
-                callback_status = r.status_code
-                if r.status_code >= 400:
-                    _log_agent_event_internal(agent_id, "callback_failed", {"url": callback_url, "status": r.status_code, "from": from_agent})
-                else:
-                    if "callback" not in delivered_channels:
-                        delivered_channels.append("callback")
-                    delivered_at = delivered_at or (datetime.utcnow().isoformat() + "Z")
-            except Exception as e:
-                callback_status = "failed"
-                callback_error = str(e)[:200]
-                _log_agent_event_internal(agent_id, "callback_failed", {"url": callback_url, "error": str(e)[:100], "from": from_agent})
-        _record_callback_attempt(agent_id, callback_url, callback_status, callback_error)
-
-    delivery_state = _derive_delivery_state(delivered_channels, callback_status)
-    try:
-        _finalize_sent_record_delivery(
-            from_agent, agent_id, msg["id"],
-            delivered_channels,
-            delivered_at=delivered_at,
-            callback_status=callback_status,
-            callback_error=callback_error,
-        )
-    except Exception as e:
-        print(f"[SENT] Failed to update sent record for {from_agent}->{agent_id}: {e}")
-
-    # Fire event hook — analytics, notifications, trust updates subscribe here
-    on_message_sent.fire(from_agent, agent_id, msg)
-
-    return jsonify({
-        "ok": True,
-        "message_id": msg["id"],
-        "delivered_to_inbox": True,
-        "callback_status": callback_status,
-        "callback_url_configured": bool(callback_url),
-        "callback_error": callback_error,
-        "delivery_state": delivery_state
-    })
+    return jsonify(result)
 
 
 # ── Poll / WebSocket / Inbox ─────────────────────────────────────────
@@ -1192,6 +1210,54 @@ def poll_messages(agent_id):
         _active_poll_count[agent_id] = max(0, _active_poll_count.get(agent_id, 1) - 1)
 
 
+_ws_send_rate: dict[int, list] = {}  # id(ws) -> list of send timestamps
+_WS_SEND_MAX_PER_SECOND = 10
+_WS_SEND_WINDOW = 1.0  # seconds
+
+
+def _handle_ws_send(ws, sender_id, msg):
+    """Handle a send request over WebSocket. Calls deliver_message() internally.
+
+    Expected msg: {"type": "send", "to": "agent_id", "message": "text"}
+    Optional: "topic", "reply_to"
+    Responds on WS with: {"type": "send_result", "ok": true/false, ...}
+    """
+    import time as _time
+
+    # Per-connection rate limiting
+    ws_id = id(ws)
+    now = _time.time()
+    timestamps = _ws_send_rate.get(ws_id, [])
+    timestamps = [t for t in timestamps if now - t < _WS_SEND_WINDOW]
+    if len(timestamps) >= _WS_SEND_MAX_PER_SECOND:
+        _send_on_ws(ws, json.dumps({"type": "send_result", "ok": False, "error": "Rate limited"}))
+        return
+    timestamps.append(now)
+    _ws_send_rate[ws_id] = timestamps
+
+    to_agent = msg.get("to", "")
+    message_text = msg.get("message", "")
+
+    if not to_agent:
+        _send_on_ws(ws, json.dumps({"type": "send_result", "ok": False, "error": "Missing 'to'"}))
+        return
+    if not message_text:
+        _send_on_ws(ws, json.dumps({"type": "send_result", "ok": False, "error": "Missing 'message'"}))
+        return
+
+    try:
+        result = deliver_message(
+            sender_id, to_agent, message_text,
+            topic=msg.get("topic"),
+            reply_to=msg.get("reply_to"),
+        )
+    except Exception as e:
+        result = {"ok": False, "error": f"Internal error: {type(e).__name__}"}
+
+    result["type"] = "send_result"
+    _send_on_ws(ws, json.dumps(result))
+
+
 def register_websocket(sock_instance):
     """Register the flask-sock instance so messaging can define WS routes."""
     @sock_instance.route("/agents/<agent_id>/ws")
@@ -1233,6 +1299,9 @@ def register_websocket(sock_instance):
                     msg = json.loads(data)
                     if msg.get("type") == "ping":
                         _send_on_ws(ws, json.dumps({"type": "pong"}))
+                    elif msg.get("type") == "send":
+                        # Bidirectional: agent sends a message over the WS connection
+                        _handle_ws_send(ws, agent_id, msg)
                 except TimeoutError:
                     try:
                         _send_on_ws(ws, json.dumps({"type": "pong"}))
@@ -1249,6 +1318,7 @@ def register_websocket(sock_instance):
                     conns.remove(ws)
                 _ws_delivered_ids.pop(id(ws), None)
                 _ws_send_locks.pop(id(ws), None)
+            _ws_send_rate.pop(id(ws), None)
             _log_agent_event_internal(agent_id, "ws_disconnect")
 
 
@@ -1990,3 +2060,48 @@ def list_discovered():
             "last_verified": info.get("last_verified"),
         })
     return jsonify({"count": len(agents_list), "agents": agents_list})
+
+
+@messaging_bp.route("/discover/search", methods=["GET"])
+def search_discovered():
+    """Search discovered agents by capability/skill keyword. Searches both registered and discovered agents."""
+    q = request.args.get("q", "").lower()
+    capability = request.args.get("capability", "").lower()
+    search_term = q or capability
+    if not search_term:
+        return jsonify({"ok": False, "error": "Missing ?q= or ?capability= search query"}), 400
+
+    matches = []
+
+    # Search registered Hub agents
+    agents = load_agents()
+    if isinstance(agents, dict):
+        for aid, info in agents.items():
+            caps = info.get("capabilities", [])
+            desc = info.get("description", "")
+            searchable = f"{aid} {desc} {' '.join(caps)}".lower()
+            if search_term in searchable:
+                matches.append({
+                    "agent_id": aid,
+                    "source": "hub",
+                    "description": desc[:200],
+                    "capabilities": caps,
+                    "messages_received": info.get("messages_received", 0),
+                })
+
+    # Search discovered (external) agents
+    discovered = load_discovered()
+    for aid, info in discovered.items():
+        searchable = f"{info.get('name','')} {info.get('description','')} {' '.join(info.get('skills',[]))}".lower()
+        if search_term in searchable:
+            matches.append({
+                "agent_id": aid,
+                "source": "discovered",
+                "name": info.get("name"),
+                "url": info.get("url"),
+                "description": info.get("description", "")[:200],
+                "skills": info.get("skills", []),
+                "health_ok": info.get("health_ok"),
+            })
+
+    return jsonify({"query": search_term, "count": len(matches), "agents": matches})

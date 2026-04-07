@@ -84,6 +84,8 @@ from hub.messaging import (
     messaging_bp, init_messaging, register_websocket,
     on_message_sent, on_agent_registered, on_message_read, on_agent_event,
     on_send_recipient_not_found,
+    # The single entry point for all message delivery
+    deliver_message,
     # Storage primitives used by server.py routes (trust, obligations, etc.)
     load_agents, save_agents, agents_lock,
     load_inbox, save_inbox, get_inbox_path, get_conversation_dir, get_conversation_path, append_message_to_conversation, iter_message_records,
@@ -236,13 +238,16 @@ _brain_webhook_timestamps = {}
 def _notify_brain_webhook(sender_id, recipient_id, msg):
     if recipient_id != "brain":
         return
-    import time as _time
-    now = _time.time()
-    last = _brain_webhook_timestamps.get(sender_id, 0)
-    if now - last < 60:
-        print(f"[NOTIFY] Rate-limited webhook for {sender_id} ({now - last:.0f}s since last)")
-        return
-    _brain_webhook_timestamps[sender_id] = now
+    # System senders bypass rate limit — obligation updates, settlements, etc.
+    # should always wake brain
+    if sender_id != "hub-system":
+        import time as _time
+        now = _time.time()
+        last = _brain_webhook_timestamps.get(sender_id, 0)
+        if now - last < 60:
+            print(f"[NOTIFY] Rate-limited webhook for {sender_id} ({now - last:.0f}s since last)")
+            return
+        _brain_webhook_timestamps[sender_id] = now
     try:
         import requests as _req
         preview = msg.get("message", "")[:200]
@@ -301,8 +306,8 @@ def _registration_wallet_and_airdrop(agent_id, agent_record, registration_data):
             json.dump(wallets, f)
 
     # Airdrop HUB tokens
-    hub_airdrop(agent_id)
-    print(f"[HUB] Airdropped {HUB_AIRDROP_AMOUNT} HUB to {agent_id}")
+    airdrop_result = hub_airdrop(agent_id)
+    print(f"[HUB] Airdrop result for {agent_id}: {airdrop_result} HUB")
 
     # Build extras for registration response
     balances = load_hub_balances()
@@ -4381,66 +4386,6 @@ def activity():
         },
         "updated_at": datetime.utcnow().isoformat() + "Z",
     })
-
-# ============ AGENT DISCOVERY (search — not in messaging Blueprint) ============
-@app.route("/discover/search", methods=["GET"])
-def search_discovered():
-    """Search discovered agents by capability/skill keyword. Searches both registered and discovered agents."""
-    q = request.args.get("q", "").lower()
-    capability = request.args.get("capability", "").lower()
-    search_term = q or capability
-    if not search_term:
-        return jsonify({"ok": False, "error": "Missing ?q= or ?capability= search query"}), 400
-
-    matches = []
-
-    # Search registered Hub agents
-    agents = load_agents()
-    for agent in (agents if isinstance(agents, list) else []):
-        aid = agent.get("agent_id", "")
-        caps = agent.get("capabilities", [])
-        desc = agent.get("description", "")
-        searchable = f"{aid} {desc} {' '.join(caps)}".lower()
-        if search_term in searchable:
-            matches.append({
-                "agent_id": aid,
-                "source": "hub",
-                "description": desc[:200],
-                "capabilities": caps,
-                "messages_received": agent.get("messages_received", 0),
-            })
-
-    # Also handle dict format
-    if isinstance(agents, dict):
-        for aid, info in agents.items():
-            caps = info.get("capabilities", [])
-            desc = info.get("description", "")
-            searchable = f"{aid} {desc} {' '.join(caps)}".lower()
-            if search_term in searchable:
-                matches.append({
-                    "agent_id": aid,
-                    "source": "hub",
-                    "description": desc[:200],
-                    "capabilities": caps,
-                    "messages_received": info.get("messages_received", 0),
-                })
-
-    # Search discovered (external) agents
-    discovered = load_discovered()
-    for aid, info in discovered.items():
-        searchable = f"{info.get('name','')} {info.get('description','')} {' '.join(info.get('skills',[]))}".lower()
-        if search_term in searchable:
-            matches.append({
-                "agent_id": aid,
-                "source": "discovered",
-                "name": info.get("name"),
-                "url": info.get("url"),
-                "description": info.get("description", "")[:200],
-                "skills": info.get("skills", []),
-                "health_ok": info.get("health_ok"),
-            })
-
-    return jsonify({"query": search_term, "count": len(matches), "agents": matches})
 
 # ============ ATTESTATIONS ============
 ATTESTATIONS_FILE = DATA_DIR / "attestations.json"
@@ -11131,97 +11076,20 @@ COMMITMENTS_FILE = os.path.join(DATA_DIR, "commitments.json")
 
 
 def _deliver_internal_dm(from_agent, to_agent, message, msg_type="system", extra=None):
-    """Deliver an internal Hub DM through the normal inbox + sent-record lifecycle."""
+    """Deliver an internal Hub DM. Thin wrapper around deliver_message()."""
     try:
-        agents_data = load_agents()
-        now = datetime.utcnow().isoformat() + "Z"
-        dm_payload = {
-            "id": secrets.token_hex(8),
-            "from": from_agent,
-            "to": to_agent,
-            "message": message,
-            "type": msg_type,
-            "read": False,
-            "timestamp": now,
-        }
+        msg_extra = {"type": msg_type}
         if extra:
-            dm_payload.update(extra)
-
-        agent = agents_data.get(to_agent) if isinstance(agents_data, dict) else None
-        callback_url = agent.get("callback_url") if isinstance(agent, dict) else None
-        callback_verified = bool(callback_url) and bool(agent.get("callback_verified")) if isinstance(agent, dict) else False
-
-        sent_record = {
-            "message_id": dm_payload["id"],
-            "to": to_agent,
-            "message_preview": message[:100] + ("..." if len(message) > 100 else ""),
-            "timestamp": now,
-            "delivery_state": "inbox_queued",
-            "delivered_channels": [],
-            "delivered_at": None,
-            "callback_status": None,
-            "callback_url_configured": bool(callback_url),
-            "callback_verified": callback_verified,
-            "callback_error": None,
-            "read": False,
-            "read_at": None,
-            "type": msg_type,
-        }
-        if extra:
-            for key, value in extra.items():
-                if key not in {"id", "message", "from", "to", "read"}:
-                    sent_record[key] = value
-
-        sent_record_persisted = False
-        try:
-            _append_sent_record(from_agent, to_agent, sent_record)
-            sent_record_persisted = True
-        except Exception as e:
-            print(f"[INTERNAL-DM] Failed to persist sent record for {from_agent}->{to_agent}: {e}")
-
-        try:
-            append_message_to_conversation(to_agent, from_agent, dm_payload)
-        except Exception:
-            if sent_record_persisted:
-                try:
-                    _delete_sent_record(from_agent, to_agent, dm_payload["id"])
-                except Exception as cleanup_error:
-                    print(f"[INTERNAL-DM] Failed to cleanup sent record for {from_agent}->{to_agent}: {cleanup_error}")
-            raise
-
-        # Update message counters and liveness timestamps
-        with agents_lock() as mutable_agents:
-            if to_agent in mutable_agents:
-                mutable_agents[to_agent]["messages_received"] = mutable_agents[to_agent].get("messages_received", 0) + 1
-                mutable_agents[to_agent]["last_message_received_at"] = now
-            if from_agent in mutable_agents:
-                mutable_agents[from_agent]["last_message_sent_at"] = now
-
-        delivered_channels, delivered_at, callback_status, callback_error = _attempt_transport_delivery(
-            to_agent,
-            dm_payload,
-            callback_url=callback_url,
-        )
-
-        _finalize_sent_record_delivery(
-            from_agent,
-            to_agent,
-            dm_payload["id"],
-            delivered_channels,
-            delivered_at=delivered_at,
-            callback_status=callback_status,
-            callback_error=callback_error,
-        )
-
-        # Fire event hook so subscribers (analytics, notifications) see internal DMs
-        on_message_sent.fire(from_agent, to_agent, dm_payload)
+            msg_extra.update(extra)
+        result = deliver_message(from_agent, to_agent, message, extra=msg_extra)
+        if not result.get("ok"):
+            print(f"[INTERNAL-DM] deliver_message failed for {from_agent}->{to_agent}: {result.get('error')}")
     except Exception as e:
         print(f"[INTERNAL-DM] Error sending {from_agent}->{to_agent}: {e}")
 
 
 def _send_system_dm(to_agent, message, msg_type="system", extra=None):
-    """Send a hub-system DM to an agent's inbox (and callback if configured).
-    Best-effort — failures are logged but never raised."""
+    """Send a hub-system DM. Best-effort — failures are logged but never raised."""
     _deliver_internal_dm("hub-system", to_agent, message, msg_type, extra)
 
 

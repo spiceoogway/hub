@@ -485,5 +485,271 @@ class TestEventHookIntegration:
         assert len(on_message_sent) == 0
 
 
+# ══════════════════════════════════════════════════════════════════════
+#  deliver_message() Tests
+# ══════════════════════════════════════════════════════════════════════
+
+class TestDeliverMessage:
+    def _register(self, client, agent_id):
+        return client.post("/agents/register", json={"agent_id": agent_id}).get_json()["secret"]
+
+    def test_deliver_message_directly(self, msg_app):
+        """deliver_message() works without flask.request context."""
+        app, _ = msg_app
+        from hub.messaging import deliver_message
+
+        with app.test_client() as c:
+            self._register(c, "dm-sender")
+            self._register(c, "dm-receiver")
+
+        # Call deliver_message outside of any HTTP request
+        with app.app_context():
+            result = deliver_message("dm-sender", "dm-receiver", "direct delivery test")
+
+        assert result["ok"] is True
+        assert "message_id" in result
+        assert result["delivered_to_inbox"] is True
+
+    def test_deliver_message_fires_hook(self, msg_app):
+        app, _ = msg_app
+        from hub.messaging import deliver_message, on_message_sent
+        hook_log = []
+        on_message_sent.subscribe(lambda s, r, m: hook_log.append((s, r)))
+
+        with app.test_client() as c:
+            self._register(c, "hook-s")
+            self._register(c, "hook-r")
+
+        with app.app_context():
+            deliver_message("hook-s", "hook-r", "hook test")
+
+        assert hook_log == [("hook-s", "hook-r")]
+
+    def test_deliver_message_updates_counters(self, msg_app):
+        app, _ = msg_app
+        from hub.messaging import deliver_message, load_agents
+
+        with app.test_client() as c:
+            self._register(c, "cnt-s")
+            self._register(c, "cnt-r")
+
+        with app.app_context():
+            deliver_message("cnt-s", "cnt-r", "counter test")
+            agents = load_agents()
+
+        assert agents["cnt-r"]["messages_received"] >= 1
+        assert "last_message_received_at" in agents["cnt-r"]
+        assert "last_message_sent_at" in agents["cnt-s"]
+
+    def test_deliver_message_to_nonexistent(self, msg_app):
+        app, _ = msg_app
+        from hub.messaging import deliver_message
+
+        with app.test_client() as c:
+            self._register(c, "orphan-s")
+
+        with app.app_context():
+            result = deliver_message("orphan-s", "ghost", "hello ghost")
+
+        assert result["ok"] is False
+        assert "not found" in result["error"]
+
+    def test_deliver_message_with_extra(self, msg_app):
+        app, _ = msg_app
+        from hub.messaging import deliver_message, load_inbox
+
+        with app.test_client() as c:
+            s2 = self._register(c, "extra-s")
+            self._register(c, "extra-r")
+
+        with app.app_context():
+            result = deliver_message(
+                "extra-s", "extra-r", "typed message",
+                extra={"type": "obligation_update", "obl_id": "obl-123"}
+            )
+
+        assert result["ok"] is True
+
+        with app.test_client() as c:
+            inbox = c.get(f"/agents/extra-r/messages?secret={self._register(c, 'extra-r') if False else ''}").get_json()
+
+        # Verify via deliver_message result
+        with app.app_context():
+            inbox_msgs = load_inbox("extra-r")
+            typed = [m for m in inbox_msgs if m.get("type") == "obligation_update"]
+            assert len(typed) == 1
+            assert typed[0]["obl_id"] == "obl-123"
+
+    def test_http_route_uses_deliver_message(self, msg_app):
+        """HTTP POST /agents/{id}/message produces same result structure."""
+        app, _ = msg_app
+        with app.test_client() as c:
+            s1 = self._register(c, "http-s")
+            self._register(c, "http-r")
+            resp = c.post("/agents/http-r/message", json={
+                "from": "http-s", "secret": s1, "message": "via http"
+            })
+            data = resp.get_json()
+            assert data["ok"] is True
+            assert "message_id" in data
+            assert "delivery_state" in data
+            assert data["delivered_to_inbox"] is True
+
+    def test_deliver_with_topic_and_reply_to(self, msg_app):
+        app, _ = msg_app
+        from hub.messaging import deliver_message, load_inbox
+
+        with app.test_client() as c:
+            self._register(c, "thread-s")
+            self._register(c, "thread-r")
+
+        with app.app_context():
+            result = deliver_message(
+                "thread-s", "thread-r", "threaded",
+                topic="project-x", reply_to="msg-000"
+            )
+            assert result["ok"] is True
+
+            inbox = load_inbox("thread-r")
+            threaded = [m for m in inbox if m.get("topic") == "project-x"]
+            assert len(threaded) == 1
+            assert threaded[0]["reply_to"] == "msg-000"
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Bidirectional WebSocket Tests
+# ══════════════════════════════════════════════════════════════════════
+
+class TestWebSocketSend:
+    """Test sending messages over WebSocket (bidirectional)."""
+
+    def _register(self, client, agent_id):
+        return client.post("/agents/register", json={"agent_id": agent_id}).get_json()["secret"]
+
+    def test_ws_send_message(self, msg_app):
+        """Agent sends a message over WS via {"type": "send", "to": ..., "message": ...}"""
+        app, _ = msg_app
+        with app.test_client() as c:
+            s1 = self._register(c, "ws-sender")
+            s2 = self._register(c, "ws-target")
+
+        # We can't easily test real WebSocket with Flask test client,
+        # so test the handler function directly
+        from hub.messaging import _handle_ws_send, load_inbox
+
+        class FakeWS:
+            def __init__(self):
+                self.sent = []
+            def send(self, data):
+                self.sent.append(json.loads(data))
+
+        ws = FakeWS()
+        with app.app_context():
+            _handle_ws_send(ws, "ws-sender", {
+                "type": "send",
+                "to": "ws-target",
+                "message": "hello from websocket"
+            })
+
+        # Check WS got a send_result
+        assert len(ws.sent) == 1
+        assert ws.sent[0]["type"] == "send_result"
+        assert ws.sent[0]["ok"] is True
+        assert "message_id" in ws.sent[0]
+
+        # Check message arrived in target inbox
+        with app.app_context():
+            inbox = load_inbox("ws-target")
+            ws_msgs = [m for m in inbox if m.get("from") == "ws-sender"]
+            assert len(ws_msgs) == 1
+            assert ws_msgs[0]["message"] == "hello from websocket"
+
+    def test_ws_send_missing_to(self, msg_app):
+        app, _ = msg_app
+        from hub.messaging import _handle_ws_send
+
+        class FakeWS:
+            def __init__(self):
+                self.sent = []
+            def send(self, data):
+                self.sent.append(json.loads(data))
+
+        ws = FakeWS()
+        with app.app_context():
+            _handle_ws_send(ws, "anyone", {"type": "send", "message": "no target"})
+
+        assert ws.sent[0]["ok"] is False
+        assert "Missing 'to'" in ws.sent[0]["error"]
+
+    def test_ws_send_missing_message(self, msg_app):
+        app, _ = msg_app
+        from hub.messaging import _handle_ws_send
+
+        class FakeWS:
+            def __init__(self):
+                self.sent = []
+            def send(self, data):
+                self.sent.append(json.loads(data))
+
+        ws = FakeWS()
+        with app.app_context():
+            _handle_ws_send(ws, "anyone", {"type": "send", "to": "target"})
+
+        assert ws.sent[0]["ok"] is False
+        assert "Missing 'message'" in ws.sent[0]["error"]
+
+    def test_ws_send_to_nonexistent(self, msg_app):
+        app, _ = msg_app
+        from hub.messaging import _handle_ws_send
+
+        class FakeWS:
+            def __init__(self):
+                self.sent = []
+            def send(self, data):
+                self.sent.append(json.loads(data))
+
+        ws = FakeWS()
+        with app.app_context():
+            _handle_ws_send(ws, "sender", {
+                "type": "send", "to": "nobody", "message": "hello"
+            })
+
+        assert ws.sent[0]["type"] == "send_result"
+        assert ws.sent[0]["ok"] is False
+        assert "not found" in ws.sent[0]["error"]
+
+    def test_ws_send_with_topic(self, msg_app):
+        app, _ = msg_app
+        from hub.messaging import _handle_ws_send, load_inbox
+
+        with app.test_client() as c:
+            self._register(c, "topic-ws-s")
+            self._register(c, "topic-ws-r")
+
+        class FakeWS:
+            def __init__(self):
+                self.sent = []
+            def send(self, data):
+                self.sent.append(json.loads(data))
+
+        ws = FakeWS()
+        with app.app_context():
+            _handle_ws_send(ws, "topic-ws-s", {
+                "type": "send",
+                "to": "topic-ws-r",
+                "message": "threaded ws msg",
+                "topic": "ws-thread",
+                "reply_to": "prev-msg"
+            })
+
+        assert ws.sent[0]["ok"] is True
+
+        with app.app_context():
+            inbox = load_inbox("topic-ws-r")
+            threaded = [m for m in inbox if m.get("topic") == "ws-thread"]
+            assert len(threaded) == 1
+            assert threaded[0]["reply_to"] == "prev-msg"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
