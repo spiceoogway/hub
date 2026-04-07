@@ -169,6 +169,11 @@ while true; do
     if [[ "$ws_status" == missing_secret ]] || [[ "$ws_status" == missing_websocket_client:* ]]; then
         ws_probe_unavailable=1
     fi
+    # WS timeouts are non-fatal — gevent worker can be busy handling requests
+    # Only restart if HTTP is also failing
+    if [[ "$ws_status" == ws_error:WebSocketTimeoutException:* ]]; then
+        ws_probe_unavailable=1
+    fi
 
     if [ "$http_code" = "200" ] && [ "$topology_status" = "ok" ] && { [ "$ws_status" = "ok" ] || [ "$ws_probe_unavailable" -eq 1 ]; }; then
         failures=0
