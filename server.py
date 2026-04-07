@@ -13001,6 +13001,37 @@ def _suggest_obligation_action(obl, agent_id, pending_cps, gap_risk):
     return {"action": "monitor", "message": f"Status: {status}. No immediate action for you."}
 
 
+def _archive_obligation_on_accept(obl, agent_id, now):
+    """Archive obligation state snapshot at acceptance for counterparty_accepts obligations.
+    
+    Called when a counterparty transitions an obligation from 'proposed' to 'accepted'.
+    The archive captures the agreed-upon terms as of acceptance — commitment, scope, success 
+    criteria, parties, roles, and deadline. This establishes an immutable baseline even if 
+    the obligation scope is later re-articulated or updated.
+    
+    For counterparty_accepts obligations, acceptance IS the closure event. The archive 
+    preserves the 'as-agreed' snapshot so the record reflects what was actually committed 
+    to, independent of any post-acceptance modifications.
+    """
+    obl["evidence_archive"] = {
+        "archived_at": now,
+        "archived_by": agent_id,
+        "protocol": "acceptance_snapshot",
+        "commitment": obl.get("commitment"),
+        "binding_scope_text": obl.get("binding_scope_text"),
+        "success_condition": obl.get("success_condition"),
+        "closure_policy_at_accept": obl.get("closure_policy"),
+        "declared_closure_policy": obl.get("closure_policy"),
+        "parties": obl.get("parties", []),
+        "role_bindings": obl.get("role_bindings", []),
+        "deadline_utc": obl.get("deadline_utc"),
+        "role_categories": obl.get("role_categories", []),
+        "timeout_policy": obl.get("timeout_policy"),
+        "note": "Archived at acceptance (counterparty_accepts closure_policy). "
+                "This is the agreed-upon baseline. Post-acceptance scope changes do not alter this record.",
+    }
+
+
 @app.route("/obligations/<obl_id>/advance", methods=["POST"])
 def advance_obligation(obl_id):
     """Advance obligation status. Enforces reducer rules and closure policy."""
@@ -13133,6 +13164,14 @@ def advance_obligation(obl_id):
     # Enforce: cannot resolve without evidence (fail-closed) — check AFTER evidence is appended
     if new_status == "resolved" and not obl.get("evidence_refs"):
         return jsonify({"error": "cannot resolve without evidence_refs"}), 409
+
+    # Archive obligation state at acceptance for counterparty_accepts obligations.
+    # Acceptance is the closure event for this policy — archive the agreed baseline now,
+    # before any post-acceptance scope changes. Idempotent: skips if already archived.
+    if new_status == "accepted" and obl.get("closure_policy") == "counterparty_accepts":
+        if not obl.get("evidence_archive"):
+            _archive_obligation_on_accept(obl, agent_id, now)
+
 
     save_obligations(obls)
 
@@ -13504,6 +13543,85 @@ def add_obligation_evidence(obl_id):
     })
     save_obligations(obls)
     return jsonify({"obligation": obl})
+
+
+@app.route("/obligations/<obl_id>/successor", methods=["POST"])
+def transfer_obligation_to_successor(obl_id):
+    """Transfer obligation counterparty role to a successor agent.
+    
+    Enables ghost-counterparty handoff: the current counterparty designates
+    a successor who inherits the obligation and can resolve it.
+    
+    The successor becomes the counterparty of record and can advance the
+    obligation (including resolve) using their own credentials.
+    
+    Only the current counterparty can initiate a successor transfer.
+    Transfer is one-way; the original counterparty cannot reclaim the role.
+    """
+    data = request.get_json(silent=True) or {}
+    agent_id = data.get("from")
+    secret = data.get("secret")
+    successor_id = data.get("successor")
+
+    if not agent_id or not secret or not successor_id:
+        return jsonify({"error": "from, secret, and successor required"}), 400
+
+    agents = load_agents()
+    if agent_id not in agents or agents[agent_id].get("secret") != secret:
+        return jsonify({"error": "invalid credentials"}), 401
+
+    if successor_id not in agents:
+        return jsonify({"error": f"successor '{successor_id}' not found in agent registry"}), 404
+
+    obls = load_obligations()
+    obl = next((o for o in obls if o["obligation_id"] == obl_id), None)
+    if not obl:
+        return jsonify({"error": "not found"}), 404
+
+    now = datetime.utcnow().isoformat() + "Z"
+
+    # Only the current counterparty can transfer
+    _, counterparty, _ = _obl_roles(obl)
+    if agent_id != counterparty:
+        return jsonify({"error": f"only the counterparty ({counterparty}) can initiate successor transfer"}), 403
+
+    # Cannot transfer from terminal states
+    if obl["status"] in ("resolved", "rejected", "withdrawn", "failed", "timed_out"):
+        return jsonify({"error": f"obligation is terminal ({obl['status']}), cannot transfer"}), 409
+
+    # Record the transfer
+    old_counterparty = counterparty
+    obl["counterparty"] = successor_id
+    obl["parties"].append({"agent_id": successor_id, "role": "successor", "inherited_at": now})
+    
+    # Update role_bindings: replace counterparty entry
+    new_bindings = []
+    for rb in obl.get("role_bindings", []):
+        if rb.get("role") == "counterparty":
+            new_bindings.append({"role": "counterparty", "agent_id": successor_id})
+        else:
+            new_bindings.append(rb)
+    # If no counterparty binding existed, add successor one
+    if not any(b.get("role") == "counterparty" for b in new_bindings):
+        new_bindings.append({"role": "counterparty", "agent_id": successor_id})
+    obl["role_bindings"] = new_bindings
+
+    # Add history entry
+    obl["history"].append({
+        "event": "successor_transfer",
+        "at": now,
+        "by": agent_id,
+        "from": old_counterparty,
+        "to": successor_id,
+    })
+
+    save_obligations(obls)
+
+    return jsonify({
+        "obligation": obl,
+        "note": f"Counterparty transferred from '{old_counterparty}' to '{successor_id}'. "
+                f"Successor can now advance/resolve using their own credentials."
+    })
 
 
 # ──────────────────────────────────────────────────────────────────
