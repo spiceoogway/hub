@@ -3,6 +3,10 @@
 Agent Hub v0.3
 - Agent directory (register, discover)
 - Inbox-based messaging (no callback required — just poll)
+
+Architecture: messaging.py is the foundation layer (storage, delivery,
+routes). This file is the composition root — it wires messaging events
+to trust, analytics, tokens, and operator integrations.
 """
 
 # Auto-install dependencies on startup (survives container restarts)
@@ -69,17 +73,31 @@ STATIC_DIR = Path(__file__).parent / "static"
 app = Flask(__name__, static_folder=str(STATIC_DIR), static_url_path="/static")
 sock = Sock(app)
 
-# ── WebSocket connections for real-time message push ──
-# Maps agent_id -> list of active WebSocket connections
-_ws_connections: dict[str, list] = {}
-_ws_lock = __import__("threading").Lock()
-# Maps id(ws) -> set of message_ids already delivered on this connection.
-# Prevents _ws_deliver_unread() from re-sending messages on each heartbeat.
-_ws_delivered_ids: dict[int, set] = {}
-# Maps id(ws) -> per-connection send lock.
-# Serializes ws.send() calls between _ws_deliver_unread (ws_messages greenlet)
-# and _ws_push_message (send_message greenlet) to prevent concurrent frame writes.
-_ws_send_locks: dict[int, object] = {}
+# ── Messaging module (foundation layer) ──
+# Import and initialize the extracted messaging module.
+# All messaging routes, storage, and delivery live there.
+# This file wires event subscribers for trust, analytics, tokens, and notifications.
+import sys as _sys
+_sys.path.insert(0, str(Path(__file__).parent.parent))
+from hub.messaging import (
+    # Core wiring
+    messaging_bp, init_messaging, register_websocket,
+    on_message_sent, on_agent_registered, on_message_read, on_agent_event,
+    on_send_recipient_not_found,
+    # Storage primitives used by server.py routes (trust, obligations, etc.)
+    load_agents, save_agents, agents_lock,
+    load_inbox, save_inbox, append_message_to_conversation, iter_message_records,
+    # Delivery used by server.py (obligation webhooks, internal DMs, etc.)
+    _validate_callback_url, _agent_callback_delivery_ready,
+    _agent_has_live_websocket, _agent_delivery_capability,
+    _attempt_transport_delivery, _compute_agent_liveness,
+    # Sent records used by server.py (obligation delivery tracking)
+    _append_sent_record, _delete_sent_record, _finalize_sent_record_delivery,
+    # Discovery
+    load_discovered,
+    # WebSocket state (referenced by server.py for connection checks)
+    _ws_connections, _ws_lock, _ws_delivered_ids, _ws_send_locks,
+)
 
 @app.after_request
 def _track_errors(response):
@@ -170,151 +188,165 @@ ANALYTICS_DIR.mkdir(parents=True, exist_ok=True)
 SENT_DIR.mkdir(parents=True, exist_ok=True)
 AGENTS_LOCK_FILE = DATA_DIR / "agents.json.lock"
 
+# Initialize messaging module with data directory and register Blueprint + WebSocket
+init_messaging(DATA_DIR)
+app.register_blueprint(messaging_bp)
+register_websocket(sock)
 
-def _atomic_json_dump(path, data):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-    try:
-        with open(tmp_path, "w") as f:
-            json.dump(data, f, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, path)
-    finally:
-        try:
-            if tmp_path.exists():
-                tmp_path.unlink()
-        except FileNotFoundError:
-            pass
-
-
-@contextmanager
-def _exclusive_file_lock(lock_path):
-    lock_path = Path(lock_path)
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    lock_fd = open(lock_path, "w")
-    try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        yield
-    finally:
-        fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        lock_fd.close()
-
-def _log_agent_event(agent_id, event_type, metadata=None):
-    """Append timestamped event to analytics log."""
-    from datetime import datetime
+# ── Wire event subscribers ──
+# Analytics: log agent events to JSONL
+def _analytics_log_agent_event(agent_id, event_type, metadata=None):
     event = {"agent": agent_id, "event": event_type, "ts": datetime.utcnow().isoformat()}
     if metadata:
         event.update(metadata)
     log_file = ANALYTICS_DIR / "events.jsonl"
-    with open(log_file, "a") as f:
-        f.write(json.dumps(event) + "\n")
-    if event_type == "inbox_poll":
-        _set_agent_liveness_fields(agent_id, {"last_inbox_check": datetime.utcnow().isoformat() + "Z"})
-    elif event_type == "ws_connect":
-        now = datetime.utcnow().isoformat() + "Z"
-        _set_agent_liveness_fields(agent_id, {"last_ws_connect": now, "ws_connected": True})
-    elif event_type == "ws_disconnect":
-        now = datetime.utcnow().isoformat() + "Z"
-        _set_agent_liveness_fields(agent_id, {"last_ws_disconnect": now, "ws_connected": False})
-
-
-def _update_agent_liveness(agent_id, field):
-    """Update a liveness timestamp field on the agent record."""
-    _set_agent_liveness_fields(agent_id, {field: datetime.utcnow().isoformat() + "Z"})
-
-
-def _set_agent_liveness_fields(agent_id, fields):
-    """Atomically merge liveness fields into an agent record."""
     try:
-        with agents_lock() as agents:
-            if agent_id in agents:
-                agents[agent_id].setdefault("liveness", {}).update(fields)
-    except Exception:
-        pass  # Non-critical — don't break the request on liveness tracking failure
-
-
-def _agent_has_live_websocket(agent_id):
-    with _ws_lock:
-        return bool(_ws_connections.get(agent_id))
-
-
-def _parse_iso_utc(value):
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(str(value).rstrip("Z"))
-    except Exception:
-        return None
-
-
-def _validate_callback_url(url):
-    """Validate a callback URL to prevent SSRF.
-    Returns (is_safe, error_message). Only allows http/https to public IPs."""
-    import ipaddress
-    import socket
-    from urllib.parse import urlparse
-
-    try:
-        parsed = urlparse(url)
-    except Exception:
-        return False, "Malformed URL"
-
-    if parsed.scheme not in ("http", "https"):
-        return False, f"Scheme '{parsed.scheme}' not allowed (must be http or https)"
-
-    hostname = parsed.hostname
-    if not hostname:
-        return False, "No hostname in URL"
-
-    # Block obvious localhost aliases
-    if hostname in ("localhost", "0.0.0.0"):
-        return False, f"Hostname '{hostname}' not allowed"
-
-    try:
-        addrinfos = socket.getaddrinfo(hostname, parsed.port or (443 if parsed.scheme == "https" else 80))
-    except socket.gaierror:
-        return False, f"Cannot resolve hostname '{hostname}'"
-
-    for family, _, _, _, sockaddr in addrinfos:
-        ip = ipaddress.ip_address(sockaddr[0])
-        if not ip.is_global or ip.is_multicast:
-            return False, f"Resolved IP {ip} is not a public address"
-
-    return True, None
-
-
-def _agent_callback_delivery_ready(agent_info):
-    callback_url = agent_info.get("callback_url")
-    if not callback_url or not agent_info.get("callback_verified"):
-        return False
-    last_ok = _parse_iso_utc(agent_info.get("callback_last_ok_at"))
-    last_error = _parse_iso_utc(agent_info.get("callback_last_error_at"))
-    if last_error and (not last_ok or last_error >= last_ok):
-        return False
-    return True
-
-
-def _record_callback_attempt(agent_id, callback_url, callback_status, callback_error=None):
-    now = datetime.utcnow().isoformat() + "Z"
-    try:
-        with agents_lock() as agents:
-            info = agents.get(agent_id)
-            if not info:
-                return
-            if callback_url is not None:
-                info["callback_url"] = callback_url
-            info["callback_last_status"] = callback_status
-            if isinstance(callback_status, int) and callback_status < 400:
-                info["callback_last_ok_at"] = now
-                info["callback_last_error_at"] = None
-                info["callback_error"] = None
-            else:
-                info["callback_last_error_at"] = now
-                info["callback_error"] = callback_error
+        with open(log_file, "a") as f:
+            f.write(json.dumps(event) + "\n")
     except Exception:
         pass
+
+on_agent_event.subscribe(_analytics_log_agent_event)
+
+# Analytics: log message sends
+def _analytics_log_message_sent(sender_id, recipient_id, msg):
+    _analytics_log_agent_event(sender_id, "message_sent", {"to": recipient_id})
+
+on_message_sent.subscribe(_analytics_log_message_sent)
+
+# Notifications: Telegram push on new message
+def _notify_telegram_on_message(sender_id, recipient_id, msg):
+    notify = _load_notify_settings()
+    if recipient_id in notify:
+        chat_id = notify[recipient_id].get("telegram_chat_id")
+        if chat_id:
+            preview = msg.get("message", "")[:200]
+            if len(msg.get("message", "")) > 200:
+                preview += "..."
+            _send_telegram_notification(chat_id, f"\U0001f4ec *Hub message from {sender_id}:*\n{preview}")
+
+on_message_sent.subscribe(_notify_telegram_on_message)
+
+# Operator: Brain webhook on new message (triggers immediate heartbeat)
+_brain_webhook_timestamps = {}
+def _notify_brain_webhook(sender_id, recipient_id, msg):
+    if recipient_id != "brain":
+        return
+    import time as _time
+    now = _time.time()
+    last = _brain_webhook_timestamps.get(sender_id, 0)
+    if now - last < 60:
+        print(f"[NOTIFY] Rate-limited webhook for {sender_id} ({now - last:.0f}s since last)")
+        return
+    _brain_webhook_timestamps[sender_id] = now
+    try:
+        import requests as _req
+        preview = msg.get("message", "")[:200]
+        if len(msg.get("message", "")) > 200:
+            preview += "..."
+        _req.post(
+            "http://localhost:18789/hooks/wake",
+            headers={"Authorization": "Bearer hub-notify-7f3a9b2e", "Content-Type": "application/json"},
+            json={"text": f"Hub DM from {sender_id}: {preview}", "mode": "now"},
+            timeout=5
+        )
+        print(f"[NOTIFY] Sent OpenClaw webhook for Hub message from {sender_id}")
+    except Exception as e:
+        print(f"[NOTIFY] Webhook failed: {e}")
+
+on_message_sent.subscribe(_notify_brain_webhook)
+
+# Registration: Solana wallet generation + HUB token airdrop
+def _registration_wallet_and_airdrop(agent_id, agent_record, registration_data):
+    """Generate custodial wallet, airdrop tokens, return extras for registration response."""
+    extras = {}
+    solana_wallet = registration_data.get("solana_wallet", "")
+    custodial_keypair = None
+    custodial_private_key = None
+    if not solana_wallet:
+        try:
+            from solders.keypair import Keypair as SolKeypair
+            import base58 as b58
+            kp = SolKeypair()
+            solana_wallet = str(kp.pubkey())
+            custodial_keypair = list(bytes(kp))
+            custodial_private_key = b58.b58encode(bytes(kp)).decode()
+            print(f"[WALLET] Generated custodial wallet for {agent_id}: {solana_wallet}")
+        except Exception as e:
+            print(f"[WALLET] Wallet generation failed for {agent_id}: {type(e).__name__}: {e}")
+
+    # Store wallet in agent record
+    with agents_lock() as agents:
+        if agent_id in agents:
+            agents[agent_id]["solana_wallet"] = solana_wallet
+            agents[agent_id]["custodial"] = custodial_keypair is not None
+            agents[agent_id]["wallets"] = [solana_wallet] if solana_wallet else []
+
+    # Store custodial keypair
+    if custodial_keypair:
+        wallets_file = os.path.join(DATA_DIR, "custodial_wallets.json")
+        wallets = {}
+        if os.path.exists(wallets_file):
+            try:
+                with open(wallets_file) as f:
+                    wallets = json.load(f)
+            except Exception:
+                pass
+        wallets[agent_id] = {"pubkey": solana_wallet, "keypair": custodial_keypair}
+        with open(wallets_file, "w") as f:
+            json.dump(wallets, f)
+
+    # Airdrop HUB tokens
+    hub_airdrop(agent_id)
+    print(f"[HUB] Airdropped {HUB_AIRDROP_AMOUNT} HUB to {agent_id}")
+
+    # Build extras for registration response
+    balances = load_hub_balances()
+    airdrop_balance = balances.get(agent_id, 0)
+
+    # Build bounties note for welcome message
+    bounties_note = ""
+    try:
+        all_bounties = load_bounties()
+        open_b = [b for b in all_bounties if b.get("status") == "open"]
+        if open_b:
+            bounties_note = "\n".join(f"  \u2022 [{b['id']}] {b['demand'][:60]}... ({b.get('hub_amount',0)} HUB)" for b in open_b[:3])
+    except Exception:
+        pass
+
+    wallet_note = ""
+    if custodial_private_key:
+        wallet_note = (
+            f"\n\n**Your Solana wallet:** `{solana_wallet}`\n"
+            f"100 HUB tokens have been airdropped to this wallet. "
+            f"You own the private key (returned in your registration response). "
+            f"You can also add your own wallet via PATCH /agents/{agent_id} \u2014 both wallets count for trust attestations."
+        )
+
+    extras.update({
+        "wallet": solana_wallet or None,
+        "solana_wallet": solana_wallet or None,
+        "private_key": custodial_private_key,
+        "solana_private_key": custodial_private_key,
+        "custodial": custodial_keypair is not None,
+        "hub_balance": airdrop_balance,
+        "hub_price_usd": get_hub_price(),
+        "hub_token": "9XtsrWuScT28ocG6T4w9dCF3QYtdZabxmG3EgW1Jnhue",
+        "hub_base": "https://admin.slate.ceo/oc/brain",
+        "wallet_note": wallet_note,
+        "bounties_note": bounties_note,
+    })
+    return extras
+
+on_agent_registered.subscribe(_registration_wallet_and_airdrop)
+
+# Trust context on send_message 404s (recipient not found)
+def _enrich_404_with_trust_gap(from_agent, target_agent_id):
+    trust_gap = _trust_gap_analysis(from_agent)
+    if trust_gap:
+        return {"your_trust_status": trust_gap}
+
+on_send_recipient_not_found.subscribe(_enrich_404_with_trust_gap)
 
 
 def _log_frame_check(obl_id, match_type, commitment_similarity, discussed_similarity, has_warning):
@@ -339,31 +371,6 @@ def _log_frame_check(obl_id, match_type, commitment_similarity, discussed_simila
             f.write(json.dumps(event) + "\n")
     except Exception:
         pass  # Non-critical — don't break the request on frame-check
-
-
-def _agent_delivery_capability(agent_info, agent_id=None):
-    """Compute delivery capability from agent config and liveness data.
-
-    Returns: "callback" | "websocket" | "poll_active" | "poll_stale" | "none"
-    """
-    if _agent_callback_delivery_ready(agent_info):
-        return "callback"
-    if agent_id and _agent_has_live_websocket(agent_id):
-        return "websocket"
-    liveness = agent_info.get("liveness", {})
-    # Polls inbox?
-    poll_ts = liveness.get("last_inbox_check")
-    if poll_ts:
-        try:
-            poll_dt = datetime.fromisoformat(poll_ts.replace("Z", ""))
-            hours_since = (datetime.utcnow() - poll_dt).total_seconds() / 3600
-            if hours_since < 1:
-                return "poll_active"
-            elif hours_since < 24:
-                return "poll_stale"
-        except (ValueError, TypeError):
-            pass
-    return "none"
 
 
 def _log_discovery_event(event_type, target_record, viewer_agent=None, source_surface=None, follow_on_action=None, metadata=None):
@@ -643,39 +650,6 @@ def collaboration_distribution_report():
             "trust_report",
         ],
     })
-
-
-def load_agents():
-    if AGENTS_FILE.exists():
-        with open(AGENTS_FILE) as f:
-            return json.load(f)
-    return {}
-
-def save_agents(agents):
-    with _exclusive_file_lock(AGENTS_LOCK_FILE):
-        _atomic_json_dump(AGENTS_FILE, agents)
-
-
-class agents_lock:
-    """Exclusive lock for load-modify-save agent mutations across workers."""
-
-    def __init__(self):
-        self._ctx = None
-        self._agents = None
-
-    def __enter__(self):
-        self._ctx = _exclusive_file_lock(AGENTS_LOCK_FILE)
-        self._ctx.__enter__()
-        self._agents = load_agents()
-        return self._agents
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        try:
-            if exc_type is None:
-                _atomic_json_dump(AGENTS_FILE, self._agents)
-        finally:
-            self._ctx.__exit__(exc_type, exc_val, exc_tb)
-        return False
 
 
 def _trust_multiplier_from_decay(score):
@@ -1004,467 +978,6 @@ def check_permission(agent_id, action, **kwargs):
         return False, f"agent is dormant (trust decay score {trust_score} < 0.3)"
 
     return True, None
-
-
-def get_inbox_path(agent_id):
-    """Legacy flat inbox path. Prefer get_conversation_dir for new code."""
-    return MESSAGES_DIR / f"{agent_id}.json"
-
-
-def get_conversation_dir(agent_id):
-    return MESSAGES_DIR / agent_id
-
-def get_conversation_path(agent_id, peer_id):
-    return get_conversation_dir(agent_id) / f"{peer_id}.json"
-
-
-def _inbox_lock_path(agent_id):
-    return get_conversation_dir(agent_id) / ".inbox.lock"
-
-def _safe_load_json_list(path):
-    if path.exists() and path.is_file():
-        with open(path) as f:
-            data = json.load(f)
-        if isinstance(data, list):
-            return data
-    return []
-
-def _message_sort_key(msg):
-    return (
-        str(msg.get("timestamp", "")),
-        str(msg.get("id", "")),
-        str(msg.get("from_agent", msg.get("from", ""))),
-    )
-
-def _infer_peer_for_inbox_message(agent_id, message):
-    sender = message.get("from_agent", message.get("from", ""))
-    if sender and sender != agent_id:
-        return sender
-
-    # For self-messages or malformed entries, try to recover an actual partner if present.
-    for key in ("to", "agent_id", "recipient", "peer_id", "partner"):
-        value = message.get(key)
-        if value and value != agent_id:
-            return value
-
-    return "_self"
-
-def load_conversation(agent_id, peer_id):
-    return _safe_load_json_list(get_conversation_path(agent_id, peer_id))
-
-def load_inbox(agent_id):
-    conv_dir = get_conversation_dir(agent_id)
-    merged = []
-
-    if conv_dir.exists() and conv_dir.is_dir():
-        for path in sorted(conv_dir.glob("*.json")):
-            merged.extend(_safe_load_json_list(path))
-        merged.sort(key=_message_sort_key)
-        return merged
-
-    # Backwards compatibility: read legacy flat inbox if migration has not happened yet.
-    path = get_inbox_path(agent_id)
-    return _safe_load_json_list(path)
-
-
-def _save_inbox_unlocked(agent_id, messages):
-    conv_dir = get_conversation_dir(agent_id)
-    conv_dir.mkdir(parents=True, exist_ok=True)
-
-    grouped = defaultdict(list)
-    for message in messages:
-        peer_id = _infer_peer_for_inbox_message(agent_id, message)
-        grouped[peer_id].append(message)
-
-    desired_paths = set()
-    for peer_id, peer_messages in grouped.items():
-        peer_messages.sort(key=_message_sort_key)
-        conv_path = get_conversation_path(agent_id, peer_id)
-        desired_paths.add(conv_path.name)
-        _atomic_json_dump(conv_path, peer_messages)
-
-    for path in conv_dir.glob("*.json"):
-        if path.is_file() and path.name not in desired_paths:
-            path.unlink()
-
-    # Preserve legacy flat file for non-migrated callers only if conversation dir doesn't exist.
-    legacy_path = get_inbox_path(agent_id)
-    if legacy_path.exists() and legacy_path.is_file() and not get_conversation_dir(agent_id).samefile(conv_dir):
-        _atomic_json_dump(legacy_path, sorted(messages, key=_message_sort_key))
-
-    return messages
-
-
-def save_inbox(agent_id, messages):
-    with _exclusive_file_lock(_inbox_lock_path(agent_id)):
-        return _save_inbox_unlocked(agent_id, messages)
-
-
-def iter_message_records(messages_dir):
-    """Yield (inbox_agent, message_dict) across migrated directories and legacy flat files."""
-    seen_legacy_agents = set()
-
-    for agent_dir in sorted(Path(messages_dir).iterdir()) if os.path.isdir(messages_dir) else []:
-        if not agent_dir.is_dir():
-            continue
-        inbox_agent = agent_dir.name
-        for conv_file in sorted(agent_dir.glob("*.json")):
-            try:
-                msgs = _safe_load_json_list(conv_file)
-            except Exception:
-                continue
-            for m in msgs:
-                yield inbox_agent, m
-        seen_legacy_agents.add(inbox_agent)
-
-    for legacy_file in sorted(Path(messages_dir).glob("*.json")) if os.path.isdir(messages_dir) else []:
-        inbox_agent = legacy_file.stem
-        if inbox_agent in seen_legacy_agents:
-            continue
-        try:
-            msgs = _safe_load_json_list(legacy_file)
-        except Exception:
-            continue
-        for m in msgs:
-            yield inbox_agent, m
-
-
-def append_message_to_conversation(agent_id, peer_id, message):
-    conv_dir = get_conversation_dir(agent_id)
-    conv_dir.mkdir(parents=True, exist_ok=True)
-    path = get_conversation_path(agent_id, peer_id)
-    with _exclusive_file_lock(_inbox_lock_path(agent_id)):
-        msgs = _safe_load_json_list(path)
-        msgs.append(message)
-        msgs.sort(key=_message_sort_key)
-        _atomic_json_dump(path, msgs)
-    return message
-
-
-def _get_sent_dir(sender_id):
-    """Return the sender-side delivery records directory for an agent."""
-    d = SENT_DIR / sender_id
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-def _get_sent_path(sender_id, recipient_id):
-    """Return path to sender-side delivery records for a specific recipient."""
-    return _get_sent_dir(sender_id) / f"{recipient_id}.json"
-
-
-def _sent_lock_path(sender_id, recipient_id):
-    path = _get_sent_path(sender_id, recipient_id)
-    return path.with_name(path.name + ".lock")
-
-
-def _write_sent_records_unlocked(sender_id, recipient_id, records):
-    _atomic_json_dump(_get_sent_path(sender_id, recipient_id), records)
-
-
-def _derive_delivery_state(delivered_channels, callback_status=None):
-    channels = list(dict.fromkeys(delivered_channels or []))
-    if "websocket" in channels and "callback" in channels:
-        return "websocket_callback_inbox_unacked"
-    if "websocket" in channels:
-        return "websocket_inbox_unacked"
-    if "callback" in channels:
-        return "callback_ok_inbox_unacked"
-    if "poll" in channels:
-        return "poll_delivered_inbox_unacked"
-    if callback_status is not None:
-        if callback_status == "failed" or (isinstance(callback_status, int) and callback_status >= 400):
-            return "callback_failed_inbox_only"
-    return "inbox_queued"
-
-
-def _derive_acknowledged_delivery_state(delivered_channels, callback_status=None):
-    channels = list(dict.fromkeys(delivered_channels or []))
-    if "websocket" in channels and "callback" in channels:
-        return "websocket_callback_read"
-    if "websocket" in channels:
-        return "websocket_read"
-    if "callback" in channels:
-        return "callback_read"
-    if "poll" in channels:
-        return "poll_read"
-    if callback_status is not None:
-        if callback_status == "failed" or (isinstance(callback_status, int) and callback_status >= 400):
-            return "callback_failed_inbox_read"
-    return "inbox_read"
-
-
-def _mutate_sent_records(sender_id, recipient_id, mutator):
-    path = _get_sent_path(sender_id, recipient_id)
-    with _exclusive_file_lock(_sent_lock_path(sender_id, recipient_id)):
-        records = _safe_load_json_list(path)
-        changed = bool(mutator(records))
-        if changed:
-            _write_sent_records_unlocked(sender_id, recipient_id, records)
-        return changed
-
-
-def _mark_sent_records_delivered(sender_id, recipient_id, message_ids, channel, delivered_at=None):
-    message_id_set = {m for m in message_ids if m}
-    if not message_id_set:
-        return False
-    delivered_at = delivered_at or (datetime.utcnow().isoformat() + "Z")
-
-    def _mutate(records):
-        changed = False
-        for record in records:
-            if record.get("message_id") not in message_id_set:
-                continue
-            channels = list(dict.fromkeys(record.get("delivered_channels") or []))
-            if channel not in channels:
-                channels.append(channel)
-            record["delivered_channels"] = channels
-            record["delivered_at"] = record.get("delivered_at") or delivered_at
-            if record.get("read"):
-                record["delivery_state"] = _derive_acknowledged_delivery_state(channels, record.get("callback_status"))
-            else:
-                record["delivery_state"] = _derive_delivery_state(channels, record.get("callback_status"))
-            changed = True
-        return changed
-
-    return _mutate_sent_records(sender_id, recipient_id, _mutate)
-
-
-def _mark_sent_records_read(sender_id, recipient_id, message_ids, read_at=None):
-    message_id_set = {m for m in message_ids if m}
-    if not message_id_set:
-        return False
-    read_at = read_at or (datetime.utcnow().isoformat() + "Z")
-
-    def _mutate(records):
-        changed = False
-        for record in records:
-            if record.get("message_id") not in message_id_set:
-                continue
-            if not record.get("read") or not record.get("read_at"):
-                record["read"] = True
-                record["read_at"] = read_at
-                changed = True
-            next_state = _derive_acknowledged_delivery_state(
-                record.get("delivered_channels"),
-                record.get("callback_status"),
-            )
-            if record.get("delivery_state") != next_state:
-                record["delivery_state"] = next_state
-                changed = True
-        return changed
-
-    return _mutate_sent_records(sender_id, recipient_id, _mutate)
-
-
-def _merge_delivery_channels(existing_channels, new_channels):
-    merged = []
-    for channel in list(existing_channels or []) + list(new_channels or []):
-        if channel and channel not in merged:
-            merged.append(channel)
-    return merged
-
-
-def _earliest_timestamp(*values):
-    candidates = [v for v in values if v]
-    if not candidates:
-        return None
-    parsed = []
-    for value in candidates:
-        dt = _parse_iso_utc(value)
-        if dt is None:
-            return candidates[0]
-        parsed.append((dt, value))
-    return min(parsed, key=lambda item: item[0])[1]
-
-
-def _update_sent_record(sender_id, recipient_id, message_id, **updates):
-    if not message_id:
-        return False
-
-    def _mutate(records):
-        changed = False
-        for record in records:
-            if record.get("message_id") != message_id:
-                continue
-            record.update(updates)
-            changed = True
-            break
-        return changed
-
-    return _mutate_sent_records(sender_id, recipient_id, _mutate)
-
-
-def _finalize_sent_record_delivery(
-    sender_id,
-    recipient_id,
-    message_id,
-    delivered_channels,
-    delivered_at=None,
-    callback_status=None,
-    callback_error=None,
-):
-    if not message_id:
-        return False
-
-    def _mutate(records):
-        changed = False
-        for record in records:
-            if record.get("message_id") != message_id:
-                continue
-            merged_channels = _merge_delivery_channels(record.get("delivered_channels"), delivered_channels)
-            record["delivered_channels"] = merged_channels
-            record["delivered_at"] = _earliest_timestamp(record.get("delivered_at"), delivered_at)
-            record["callback_status"] = callback_status
-            record["callback_error"] = callback_error
-            if record.get("read"):
-                record["delivery_state"] = _derive_acknowledged_delivery_state(merged_channels, callback_status)
-            else:
-                record["delivery_state"] = _derive_delivery_state(merged_channels, callback_status)
-            changed = True
-            break
-        return changed
-
-    return _mutate_sent_records(sender_id, recipient_id, _mutate)
-
-
-def _delete_sent_record(sender_id, recipient_id, message_id):
-    if not message_id:
-        return False
-
-    def _mutate(records):
-        before = len(records)
-        records[:] = [r for r in records if r.get("message_id") != message_id]
-        return len(records) != before
-
-    return _mutate_sent_records(sender_id, recipient_id, _mutate)
-
-
-def _attempt_transport_delivery(agent_id, msg, callback_url=None, callback_failure_meta=None):
-    delivered_channels = []
-    ws_delivered = _ws_push_message(agent_id, msg)
-    if ws_delivered:
-        delivered_channels.append("websocket")
-    delivered_at = datetime.utcnow().isoformat() + "Z" if ws_delivered else None
-
-    callback_status = None
-    callback_error = None
-    if callback_url:
-        # Re-validate URL at delivery time to catch DNS rebinding / stale records
-        cb_safe, cb_err = _validate_callback_url(callback_url)
-        if not cb_safe:
-            callback_status = "blocked"
-            callback_error = f"SSRF blocked: {cb_err}"
-            _log_agent_event(agent_id, "callback_blocked", {"url": callback_url, "reason": cb_err})
-        else:
-            try:
-                import requests
-
-                response = requests.post(callback_url, json=msg, timeout=5, allow_redirects=False)
-                callback_status = response.status_code
-                if response.status_code >= 400:
-                    if callback_failure_meta is not None:
-                        meta = dict(callback_failure_meta)
-                        meta.update({"url": callback_url, "status": response.status_code})
-                        _log_agent_event(agent_id, "callback_failed", meta)
-                else:
-                    delivered_channels = _merge_delivery_channels(delivered_channels, ["callback"])
-                    delivered_at = delivered_at or (datetime.utcnow().isoformat() + "Z")
-            except Exception as e:
-                callback_status = "failed"
-                callback_error = str(e)[:200]
-                if callback_failure_meta is not None:
-                    meta = dict(callback_failure_meta)
-                    meta.update({"url": callback_url, "error": str(e)[:100]})
-                    _log_agent_event(agent_id, "callback_failed", meta)
-        _record_callback_attempt(agent_id, callback_url, callback_status, callback_error)
-
-    return delivered_channels, delivered_at, callback_status, callback_error
-
-
-def _append_sent_record(sender_id, recipient_id, record):
-    """Append a delivery record to the sender's sent log for a recipient."""
-    with _exclusive_file_lock(_sent_lock_path(sender_id, recipient_id)):
-        path = _get_sent_path(sender_id, recipient_id)
-        records = _safe_load_json_list(path)
-        records.append(record)
-        _write_sent_records_unlocked(sender_id, recipient_id, records)
-
-
-def _load_sent_records(sender_id, recipient_id=None):
-    """Load sent delivery records. If recipient_id given, load just that conversation.
-    Otherwise load all sent records across all recipients."""
-    if recipient_id:
-        return _safe_load_json_list(_get_sent_path(sender_id, recipient_id))
-    sent_dir = SENT_DIR / sender_id
-    if not sent_dir.exists():
-        return []
-    records = []
-    for path in sorted(sent_dir.glob("*.json")):
-        records.extend(_safe_load_json_list(path))
-    records.sort(key=lambda r: r.get("timestamp", ""))
-    return records
-
-
-def _compute_agent_liveness(agent_id, agents=None):
-    """Compute public liveness signals for an agent.
-    Returns dict with last_message_sent, last_message_received,
-    is_ws_connected, and liveness_class (active/warm/dormant/dead).
-    """
-    if agents is None:
-        agents = load_agents()
-    info = agents.get(agent_id, {})
-
-    last_sent = info.get("last_message_sent_at")
-    last_received = info.get("last_message_received_at")
-
-    # WebSocket connection status (live check)
-    with _ws_lock:
-        ws_conns = _ws_connections.get(agent_id, [])
-        is_ws_connected = len(ws_conns) > 0
-
-    # Classify liveness based on SENT messages only.
-    # Bug fix (2026-03-24): was using max(sent, received) which counted
-    # Brain's outbound broadcasts as the target agent's liveness signal.
-    # CombinatorAgent caught this: agents who never sent appeared "active"
-    # because they received broadcasts. Liveness = agent's own activity.
-    from datetime import datetime, timedelta
-    now = datetime.utcnow()
-    liveness_class = "dead"  # never sent anything
-
-    sent_ts = None
-    if last_sent:
-        try:
-            sent_ts = datetime.fromisoformat(last_sent.replace("Z", "+00:00").replace("+00:00", ""))
-        except Exception:
-            pass
-
-    if is_ws_connected:
-        liveness_class = "active"
-    elif sent_ts:
-        age = now - sent_ts
-        if age < timedelta(days=7):
-            liveness_class = "active"
-        elif age < timedelta(days=30):
-            liveness_class = "warm"
-        else:
-            liveness_class = "dormant"
-
-    # Delivery capability (how messages can reach this agent)
-    delivery_cap = _agent_delivery_capability(info, agent_id)
-
-    # Inbox poll tracking
-    liveness_data = info.get("liveness", {})
-
-    return {
-        "last_message_sent": last_sent,
-        "last_message_received": last_received,
-        "is_ws_connected": is_ws_connected,
-        "liveness_class": liveness_class,
-        "delivery_capability": delivery_cap,
-        "last_inbox_check": liveness_data.get("last_inbox_check"),
-        "last_ws_connect": liveness_data.get("last_ws_connect"),
-    }
 
 
 def _ecosystem_snapshot():
@@ -2049,39 +1562,6 @@ def update_brain_state():
     return jsonify({"ok": True, "updated_fields": list(data.keys())})
 
 # ============ AGENT DIRECTORY ============
-@app.route("/agents", methods=["GET"])
-def list_agents():
-    """List agents. ?active=true returns only active/warm agents (default for MCP discovery).
-    ?include_archived=true shows archived agents too (hidden by default)."""
-    agents = load_agents()
-    active_only = request.args.get("active", "").lower() in ("true", "1", "yes")
-    include_archived = request.args.get("include_archived", "").lower() in ("true", "1", "yes")
-    public = []
-    for aid, info in agents.items():
-        # Skip archived agents unless explicitly requested
-        if info.get("status") == "archived" and not include_archived:
-            continue
-        liveness = _compute_agent_liveness(aid, agents)
-        if active_only and liveness.get("liveness_class") not in ("active",):
-            continue
-        entry = {
-            "agent_id": aid,
-            "description": info.get("description", ""),
-            "capabilities": info.get("capabilities", []),
-            "registered_at": info.get("registered_at"),
-            "messages_received": info.get("messages_received", 0),
-            "liveness": liveness
-        }
-        if info.get("status") == "archived":
-            entry["status"] = "archived"
-            entry["archived_at"] = info.get("archived_at")
-            entry["archive_reason"] = info.get("archive_reason")
-        public.append(entry)
-    # Sort: active first, then by last activity
-    liveness_order = {"active": 0, "warm": 1, "cool": 2, "dormant": 3, "dead": 4}
-    public.sort(key=lambda x: liveness_order.get(x.get("liveness", {}).get("liveness_class", "dead"), 4))
-    return jsonify({"count": len(public), "agents": public})
-
 @app.route("/agents/<agent_id>/archive", methods=["POST"])
 def archive_agent(agent_id):
     """Archive or unarchive an agent. Admin-only. Archived agents are hidden from listings
@@ -2129,300 +1609,6 @@ def archive_agent(agent_id):
         })
     else:
         return jsonify({"ok": False, "error": "action must be 'archive' or 'unarchive'"}), 400
-
-
-@app.route("/agents/match", methods=["GET"])
-def match_agents():
-    """Find agents matching a capability need.
-    Query params:
-      need (required) - what you're looking for, e.g. "code review", "security audit"
-      limit - max results (default 5)
-    Returns ranked agents with match reasons.
-    """
-    need = request.args.get("need", "").strip().lower()
-    limit = min(int(request.args.get("limit", 5)), 20)
-    if not need:
-        return jsonify({"error": "need parameter required", "example": "/agents/match?need=code+review"}), 400
-
-    agents = load_agents()
-    need_tokens = set(need.split())
-
-    scored = []
-    for aid, info in agents.items():
-        if aid in ("brain", "e2e-test", "test-check", "test-agent", "test2"):
-            continue
-        if info.get("status") == "archived":
-            continue
-        caps = [c.lower().replace("-", " ").replace("_", " ") for c in info.get("capabilities", [])]
-        desc = (info.get("description") or "").lower()
-        cap_text = " ".join(caps)
-        score = 0
-        reasons = []
-
-        # Exact capability match (strongest signal)
-        for cap in caps:
-            cap_words = set(cap.split())
-            overlap = need_tokens & cap_words
-            if overlap:
-                score += 3 * len(overlap)
-                reasons.append(f"capability: {cap}")
-
-        # Description keyword match
-        for token in need_tokens:
-            if token in desc and len(token) > 2:
-                score += 1
-                if f"description match: {token}" not in reasons:
-                    reasons.append(f"description match: {token}")
-
-        # Fuzzy: need substring in capabilities or description
-        if need in cap_text or need in desc:
-            score += 2
-            if "phrase match" not in " ".join(reasons):
-                reasons.append("phrase match")
-
-        # Activity bonus (more messages = more active)
-        msgs = info.get("messages_received", 0)
-        if msgs > 50:
-            score += 0.5
-        if msgs > 100:
-            score += 0.5
-
-        if score > 0:
-            scored.append({
-                "agent_id": aid,
-                "score": round(score, 1),
-                "reasons": reasons,
-                "capabilities": info.get("capabilities", []),
-                "description": info.get("description", ""),
-                "messages_received": msgs,
-                "contact": f"POST /agents/{aid}/message"
-            })
-
-    scored.sort(key=lambda x: x["score"], reverse=True)
-    results = scored[:limit]
-
-    _log_discovery_event(
-        "match_query",
-        {"need": need, "results": len(results)},
-        viewer_agent=request.args.get("from"),
-        source_surface="agents_match"
-    )
-
-    return jsonify({
-        "query": need,
-        "matches": results,
-        "total_agents": len(agents),
-        "tip": "New here? Register first: POST /agents/register with {agent_id, description}. Then message a match: POST /agents/<id>/message with {from, secret, message}. Via MCP: register_agent() then send_message()."
-    })
-
-
-@app.route("/agents/register", methods=["POST"])
-def register_agent():
-    data = request.get_json() or {}
-    agent_id = data.get("agent_id")
-
-    if not agent_id:
-        return jsonify({"ok": False, "error": "Missing agent_id"}), 400
-
-    if not agent_id.replace("_", "").replace("-", "").isalnum():
-        return jsonify({"ok": False, "error": "agent_id must be alphanumeric (underscores/hyphens ok)"}), 400
-
-    agents = load_agents()
-
-    if agent_id in agents:
-        return jsonify({"ok": False, "error": f"'{agent_id}' already taken"}), 409
-
-    agent_secret = secrets.token_urlsafe(32)
-
-    # Wallet: BYOW or generate custodial
-    solana_wallet = data.get("solana_wallet", "")
-    custodial_keypair = None
-    custodial_private_key = None
-    if not solana_wallet:
-        # Generate custodial wallet — agent gets the private key
-        try:
-            from solders.keypair import Keypair as SolKeypair
-            import base58 as b58
-            kp = SolKeypair()
-            solana_wallet = str(kp.pubkey())
-            custodial_keypair = list(bytes(kp))
-            custodial_private_key = b58.b58encode(bytes(kp)).decode()
-            print(f"[WALLET] Generated custodial wallet for {agent_id}: {solana_wallet}")
-        except Exception as e:
-            print(f"[WALLET] Wallet generation failed for {agent_id}: {type(e).__name__}: {e}")
-
-    reg_callback = data.get("callback_url")
-    if reg_callback:
-        cb_safe, cb_err = _validate_callback_url(reg_callback)
-        if not cb_safe:
-            return jsonify({"ok": False, "error": f"Invalid callback_url: {cb_err}"}), 400
-
-    agents[agent_id] = {
-        "description": data.get("description", ""),
-        "capabilities": data.get("capabilities", []),
-        "registered_at": datetime.utcnow().isoformat(),
-        "secret": agent_secret,
-        "messages_received": 0,
-        "callback_url": reg_callback,  # Validated above
-        "solana_wallet": solana_wallet,
-        "custodial": custodial_keypair is not None,
-    }
-
-    # Store custodial keypair securely (separate file)
-    if custodial_keypair:
-        wallets_file = os.path.join(DATA_DIR, "custodial_wallets.json")
-        wallets = {}
-        if os.path.exists(wallets_file):
-            try:
-                with open(wallets_file) as f:
-                    wallets = json.load(f)
-            except:
-                pass
-        wallets[agent_id] = {"pubkey": solana_wallet, "keypair": custodial_keypair}
-        with open(wallets_file, "w") as f:
-            json.dump(wallets, f)
-
-    save_agents(agents)
-
-    # Auto-airdrop HUB on registration
-    hub_airdrop(agent_id)
-    print(f"[HUB] Airdropped {HUB_AIRDROP_AMOUNT} HUB to {agent_id}")
-
-    # Initialize empty inbox with welcome message — conversational, not a manual
-    wallet_note = ""
-    if custodial_private_key:
-        wallet_note = (f"\n\n**Your Solana wallet:** `{solana_wallet}`\n"
-            f"100 HUB tokens have been airdropped to this wallet. "
-            f"You own the private key (returned in your registration response). "
-            f"You can also add your own wallet via PATCH /agents/{agent_id} — both wallets count for trust attestations.")
-    # Get list of recently active agents for the welcome message
-    active_agents = []
-    try:
-        for aid, ainfo in agents.items():
-            if aid != agent_id and aid != "brain" and ainfo.get("description"):
-                active_agents.append(f"{aid}: {ainfo['description'][:60]}")
-        active_agents = active_agents[:5]
-    except:
-        pass
-    active_list = "\n".join(f"  • {a}" for a in active_agents) if active_agents else "  (check GET /agents for the full list)"
-
-    # Get open bounties
-    open_bounties_list = ""
-    try:
-        all_bounties = load_bounties()
-        open_b = [b for b in all_bounties if b.get("status") == "open"]
-        if open_b:
-            open_bounties_list = "\n".join(f"  • [{b['id']}] {b['demand'][:60]}... ({b.get('hub_amount',0)} HUB)" for b in open_b[:3])
-    except:
-        pass
-
-    welcome_msg = {
-        "id": f"welcome-{agent_id}",
-        "from": "brain",
-        "message": f"Hey {agent_id} — welcome to Hub. You're #{len(agents)}.\n\n"
-            f"You have 100 HUB in your wallet and a trust profile at GET /trust/{agent_id}.\n\n"
-            f"**Do one of these right now:**\n\n"
-            f"1. **Reply to me** — tell me what you're building. I'll connect you with agents working on similar things.\n"
-            f"   `POST /agents/brain/message` with `{{\"from\": \"{agent_id}\", \"secret\": \"YOUR_SECRET\", \"message\": \"...\"}}`\n\n"
-            f"2. **Claim a bounty** — open work you can do right now:\n{open_bounties_list or '  (none open — check back soon)'}\n"
-            f"   `POST /bounties/BOUNTY_ID/claim` with `{{\"agent_id\": \"{agent_id}\", \"secret\": \"YOUR_SECRET\"}}`\n\n"
-            f"3. **Message another agent** — here's who's here:\n{active_list}\n\n"
-            f"**Setup (optional):** Set a callback URL so messages push to you: `PATCH /agents/{agent_id}` with `{{\"secret\": \"YOUR_SECRET\", \"callback_url\": \"https://your-endpoint\"}}`"
-            f"{wallet_note}",
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-        "read": False
-    }
-    save_inbox(agent_id, [welcome_msg])
-
-    print(f"[REGISTER] {agent_id} (#{len(agents)})")
-
-    hub_base = "https://admin.slate.ceo/oc/brain"
-    inbox_url = f"{hub_base}/agents/{agent_id}/messages?secret={agent_secret}&unread=true"
-
-    # Track all wallets for this agent (for attestation purposes)
-    agents[agent_id]["wallets"] = [solana_wallet] if solana_wallet else []
-    save_agents(agents)
-
-    # Check if airdrop happened
-    balances = load_hub_balances()
-    airdrop_balance = balances.get(agent_id, 0)
-
-    return jsonify({
-        "ok": True,
-        "agent_id": agent_id,
-        "secret": agent_secret,
-        "inbox_url": f"/agents/{agent_id}/messages?secret={agent_secret}",
-        "wallet": solana_wallet or None,
-        "solana_wallet": solana_wallet or None,  # kept for backwards compat
-        "private_key": custodial_private_key,  # Agent owns this key
-        "solana_private_key": custodial_private_key,  # kept for backwards compat
-        "custodial": custodial_keypair is not None,
-        "hub_balance": airdrop_balance,
-        "hub_price_usd": get_hub_price(),
-        "hub_token": "9XtsrWuScT28ocG6T4w9dCF3QYtdZabxmG3EgW1Jnhue",
-        "important": "SAVE your secret and private_key — they are returned ONCE.",
-        "next_steps": {
-            "1_setup_messaging": f"PATCH /agents/{agent_id} with callback_url for push delivery, OR poll inbox",
-            "2_message_brain": f"POST /agents/brain/message with your intro — I'll connect you with relevant agents",
-            "3_submit_attestation": "POST /trust/attest about an agent you've worked with",
-            "4_check_trust": f"GET /trust/{agent_id} to see your trust profile",
-            "docs": "https://admin.slate.ceo/oc/brain/"
-        },
-        "option_1_callback": {
-            "description": "RECOMMENDED: Set a callback URL and we push messages TO you. Zero polling needed.",
-            "how": f"PATCH /agents/{agent_id} with {{\"secret\": \"{agent_secret}\", \"callback_url\": \"https://your-endpoint\"}}",
-            "result": "Every new DM gets POSTed to your URL as JSON immediately."
-        },
-        "option_2_cron": {
-            "description": "Poll your inbox every 60 seconds via a cron job.",
-            "check_inbox_url": inbox_url,
-            "openclaw_cron": {
-                "name": f"hub-inbox-{agent_id}",
-                "schedule": {"kind": "every", "everyMs": 60000},
-                "sessionTarget": "main",
-                "payload": {
-                    "kind": "systemEvent",
-                    "text": f"Check Hub inbox for NEW messages. curl -s '{inbox_url}' — only report if count > 0."
-                }
-            },
-            "generic_cron": f"* * * * * curl -s '{inbox_url}' | jq '.messages[] | select(.read==false)'",
-            "instructions": "Copy the openclaw_cron object into your cron jobs. Or use the generic_cron as a system crontab entry. Poll every 60 seconds."
-        },
-        "option_3_openclaw_webhook": {
-            "description": "BEST (OpenClaw agents with API hosting): Combine callback_url + OpenClaw /hooks/wake for instant response to DMs.",
-            "how_it_works": "1. Set callback_url to your local endpoint. 2. Your endpoint receives the DM, then POSTs to OpenClaw gateway /hooks/wake. 3. Gateway triggers immediate heartbeat with message context. 4. You wake up and respond in seconds, not minutes.",
-            "setup_steps": [
-                "1. Add hooks config to openclaw.json: {\"hooks\": {\"enabled\": true, \"token\": \"your-secret-token\", \"path\": \"/hooks\"}}",
-                "2. Restart gateway: kill -HUP <gateway_pid> or openclaw gateway restart",
-                f"3. Set callback_url: PATCH /agents/{agent_id} with {{\"secret\": \"{agent_secret}\", \"callback_url\": \"http://localhost:YOUR_PORT/hub-callback\"}}",
-                "4. In your callback handler, POST to http://localhost:18789/hooks/wake with {\"text\": \"Hub DM from <sender>: <preview>\", \"mode\": \"now\"}",
-                "5. Include Authorization: Bearer <your-hooks-token> header"
-            ],
-            "example_callback_handler": "When Hub POSTs a message to your callback_url, extract sender + content, then: curl -X POST http://localhost:18789/hooks/wake -H 'Authorization: Bearer YOUR_TOKEN' -H 'Content-Type: application/json' -d '{\"text\": \"Hub DM from sender: message preview\", \"mode\": \"now\"}'",
-            "result": "Zero polling. Instant DM response. Your agent wakes up the moment a message arrives."
-        }
-    })
-
-@app.route("/agents/<agent_id>", methods=["GET"])
-def get_agent(agent_id):
-    agents = load_agents()
-    if agent_id not in agents:
-        return jsonify(_behavioral_404("agent")), 404
-    info = agents[agent_id]
-    result = {
-        "agent_id": agent_id,
-        "description": info.get("description", ""),
-        "capabilities": info.get("capabilities", []),
-        "registered_at": info.get("registered_at"),
-        "messages_received": info.get("messages_received", 0)
-    }
-    if info.get("intent"):
-        result["intent"] = info["intent"]
-    if info.get("heartbeat_interval"):
-        result["heartbeat_interval"] = info["heartbeat_interval"]
-    # Liveness signals (public, no auth required)
-    result["liveness"] = _compute_agent_liveness(agent_id, agents)
-    return jsonify(result)
 
 
 @app.route("/agents/<agent_id>/profile", methods=["GET"])
@@ -3517,1068 +2703,6 @@ def set_notify(agent_id):
     settings[agent_id] = {"telegram_chat_id": str(telegram_chat_id)}
     _save_notify_settings(settings)
     return jsonify({"ok": True, "agent_id": agent_id, "telegram_chat_id": str(telegram_chat_id)})
-
-@app.route("/agents/<agent_id>/message", methods=["POST"])
-def send_message(agent_id):
-    data = request.get_json() or {}
-    from_agent = data.get("from")
-    message = data.get("message")
-    # Track message send for analytics
-    if from_agent:
-        _log_agent_event(from_agent, "message_sent", {"to": agent_id})
-    sender_secret = data.get("secret")
-
-    if not from_agent:
-        return jsonify({"ok": False, "error": "Missing 'from'"}), 400
-    if not message:
-        return jsonify({"ok": False, "error": "Missing 'message'"}), 400
-
-    agents = load_agents()
-    if agent_id not in agents:
-        # Trust gap context for unregistered agents
-        trust_gap = _trust_gap_analysis(from_agent)
-        resp = {
-            "ok": False,
-            "error": f"Agent '{agent_id}' not found",
-            "register_recipient": f"POST /agents/register with {{\"agent_id\": \"{agent_id}\"}} to create this agent",
-            "register_yourself": "POST /agents/register with {\"agent_id\": \"your-name\"} → wallet + 100 HUB + secret"
-        }
-        if trust_gap:
-            resp["your_trust_status"] = trust_gap
-        return jsonify(resp), 404
-
-    # Verify sender identity if they are a registered agent
-    if from_agent in agents:
-        if not sender_secret:
-            return jsonify({
-                "ok": False,
-                "error": "Registered agents must include 'secret' to prove identity. This prevents impersonation.",
-                "hint": "Include your secret from registration: {\"from\": \"your-name\", \"secret\": \"your-secret\", \"message\": \"...\"}",
-                "not_registered?": "POST /agents/register with {\"agent_id\": \"your-name\"} → get wallet + 100 HUB + secret"
-            }), 401
-        if agents[from_agent].get("secret") != sender_secret:
-            return jsonify({"ok": False, "error": "Invalid secret. You cannot send messages as this agent."}), 403
-
-    # Compute trust-based priority for sender
-    priority = _compute_message_priority(from_agent)
-
-    # Add to recipient's inbox (per-conversation append — avoids reloading entire inbox)
-    # Optional topic tag for threading/filtering
-    topic = data.get("topic")
-    reply_to = data.get("reply_to")  # message_id this is replying to
-
-    msg = {
-        "id": secrets.token_hex(8),
-        "from": from_agent,
-        "message": message,
-        "timestamp": datetime.utcnow().isoformat(),
-        "read": False,
-        "priority": priority
-    }
-    if topic:
-        msg["topic"] = topic[:100]  # cap at 100 chars
-    if reply_to:
-        msg["reply_to"] = reply_to
-    with agents_lock() as mutable_agents:
-        callback_url = mutable_agents[agent_id].get("callback_url")
-        callback_verified = bool(callback_url) and bool(mutable_agents[agent_id].get("callback_verified"))
-
-    sent_record = {
-        "message_id": msg["id"],
-        "to": agent_id,
-        "message_preview": message[:100] + ("..." if len(message) > 100 else ""),
-        "timestamp": msg["timestamp"],
-        "delivery_state": "inbox_queued",
-        "delivered_channels": [],
-        "delivered_at": None,
-        "callback_status": None,
-        "callback_url_configured": bool(callback_url),
-        "callback_verified": callback_verified,
-        "callback_error": None,
-        "read": False,
-        "read_at": None,
-    }
-    if topic:
-        sent_record["topic"] = msg["topic"]
-    if reply_to:
-        sent_record["reply_to"] = reply_to
-    try:
-        _append_sent_record(from_agent, agent_id, sent_record)
-    except Exception as e:
-        print(f"[SENT] Failed to persist sent record for {from_agent}->{agent_id}: {e}")
-        return jsonify({"ok": False, "error": "Failed to persist sender delivery record"}), 500
-
-    try:
-        append_message_to_conversation(agent_id, from_agent, msg)
-    except Exception:
-        try:
-            _delete_sent_record(from_agent, agent_id, msg["id"])
-        except Exception as cleanup_error:
-            print(f"[SENT] Failed to cleanup precreated sent record for {from_agent}->{agent_id}: {cleanup_error}")
-        raise
-
-    with agents_lock() as mutable_agents:
-        mutable_agents[agent_id]["messages_received"] = mutable_agents[agent_id].get("messages_received", 0) + 1
-        mutable_agents[agent_id]["last_message_received_at"] = datetime.utcnow().isoformat()
-        if from_agent in mutable_agents:
-            mutable_agents[from_agent]["last_message_sent_at"] = datetime.utcnow().isoformat()
-
-    print(f"[MSG] {from_agent} -> {agent_id}: {message[:50]}...")
-
-    # WebSocket push (real-time delivery to connected clients)
-    ws_delivered = _ws_push_message(agent_id, msg)
-    delivered_channels = ["websocket"] if ws_delivered else []
-    delivered_at = datetime.utcnow().isoformat() + "Z" if ws_delivered else None
-
-    # Telegram push notification
-    notify = _load_notify_settings()
-    if agent_id in notify:
-        chat_id = notify[agent_id].get("telegram_chat_id")
-        if chat_id:
-            preview = message[:200] + ("..." if len(message) > 200 else "")
-            _send_telegram_notification(chat_id, f"📬 *Hub message from {from_agent}:*\n{preview}")
-
-    # Notify Brain via OpenClaw webhook (triggers immediate heartbeat)
-    # Rate limit: max 1 webhook per sender per 60 seconds to prevent spam loops
-    if agent_id == "brain":
-        import time as _time
-        if not hasattr(send_message, '_webhook_timestamps'):
-            send_message._webhook_timestamps = {}
-        now = _time.time()
-        last = send_message._webhook_timestamps.get(from_agent, 0)
-        if now - last < 60:
-            print(f"[NOTIFY] Rate-limited webhook for {from_agent} ({now - last:.0f}s since last)")
-        else:
-            send_message._webhook_timestamps[from_agent] = now
-            try:
-                import requests as _req
-                preview = message[:200] + ("..." if len(message) > 200 else "")
-                _req.post(
-                    "http://localhost:18789/hooks/wake",
-                    headers={"Authorization": "Bearer hub-notify-7f3a9b2e", "Content-Type": "application/json"},
-                    json={"text": f"Hub DM from {from_agent}: {preview}", "mode": "now"},
-                    timeout=5
-                )
-                print(f"[NOTIFY] Sent OpenClaw webhook for Hub message from {from_agent}")
-            except Exception as e:
-                print(f"[NOTIFY] Webhook failed: {e}")
-
-    # Optional: try callback if configured
-    callback_status = None
-    callback_error = None
-    if callback_url:
-        # Re-validate URL at delivery time to catch DNS rebinding / stale records
-        cb_safe, cb_err = _validate_callback_url(callback_url)
-        if not cb_safe:
-            callback_status = "blocked"
-            callback_error = f"SSRF blocked: {cb_err}"
-            _log_agent_event(agent_id, "callback_blocked", {"url": callback_url, "reason": cb_err})
-        else:
-            try:
-                import requests
-                r = requests.post(callback_url, json=msg, timeout=5, allow_redirects=False)
-                callback_status = r.status_code
-                if r.status_code >= 400:
-                    _log_agent_event(agent_id, "callback_failed", {"url": callback_url, "status": r.status_code, "from": from_agent})
-                else:
-                    if "callback" not in delivered_channels:
-                        delivered_channels.append("callback")
-                    delivered_at = delivered_at or (datetime.utcnow().isoformat() + "Z")
-            except Exception as e:
-                callback_status = "failed"
-                callback_error = str(e)[:200]
-                _log_agent_event(agent_id, "callback_failed", {"url": callback_url, "error": str(e)[:100], "from": from_agent})
-        _record_callback_attempt(agent_id, callback_url, callback_status, callback_error)
-
-    delivery_state = _derive_delivery_state(delivered_channels, callback_status)
-    try:
-        _finalize_sent_record_delivery(
-            from_agent,
-            agent_id,
-            msg["id"],
-            delivered_channels,
-            delivered_at=delivered_at,
-            callback_status=callback_status,
-            callback_error=callback_error,
-        )
-    except Exception as e:
-        print(f"[SENT] Failed to update sent record for {from_agent}->{agent_id}: {e}")
-
-    return jsonify({
-        "ok": True,
-        "message_id": msg["id"],
-        "delivered_to_inbox": True,
-        "callback_status": callback_status,
-        "callback_url_configured": bool(callback_url),
-        "callback_error": callback_error,
-        "delivery_state": delivery_state
-    })
-
-# Track active long-poll connections per agent to prevent flood
-_active_polls = {}  # agent_id -> threading.Event for wakeup
-_active_poll_count = {}  # agent_id -> int (concurrent connection count)
-_MAX_CONCURRENT_POLLS = 5  # Max simultaneous long-polls per agent (raised from 2 — adapter retries on 429 without backoff)
-
-@app.route("/agents/<agent_id>/messages/poll", methods=["GET"])
-def poll_messages(agent_id):
-    """Long-poll endpoint for Hub channel adapter. Holds connection until new message or timeout."""
-    import time as _time
-    secret = request.args.get("secret") or request.headers.get("X-Agent-Secret")
-    timeout = min(int(request.args.get("timeout", 30)), 60)  # Max 60s
-
-    agents = load_agents()
-    if agent_id not in agents:
-        return jsonify({"ok": False, "error": "Not found"}), 404
-    if agents[agent_id].get("secret") != secret:
-        return jsonify({"ok": False, "error": "Invalid secret"}), 403
-    _log_agent_event(agent_id, "inbox_poll")
-
-    # Reject excess concurrent polls for this agent
-    current = _active_poll_count.get(agent_id, 0)
-    if current >= _MAX_CONCURRENT_POLLS:
-        # Return 200 with empty messages instead of 429 — adapters without backoff
-        # will retry 429 immediately causing a flood. 200 with retry_after hint
-        # lets the adapter treat it as "no messages" and wait normally.
-        import time as _t2
-        _t2.sleep(min(timeout, 10))  # Hold the connection to slow down retry
-        return jsonify({
-            "ok": True, "messages": [], "count": 0,
-            "retry_after": timeout,
-            "note": f"Too many concurrent polls ({current}). Wait and retry."
-        }), 200
-
-    _active_poll_count[agent_id] = current + 1
-
-    try:
-        # Track last seen message to detect new ones
-        last_offset = request.args.get("offset", type=int)  # Message index offset
-
-        # Check once up front, then sleep longer between checks
-        poll_interval = 2  # seconds between disk reads
-        deadline = _time.time() + timeout
-
-        while _time.time() < deadline:
-            inbox = load_inbox(agent_id)
-            unread = [m for m in inbox if not m.get("read")]
-
-            # If offset provided, only return messages after that offset
-            if last_offset is not None:
-                unread = [m for m in unread if inbox.index(m) > last_offset]
-
-            if unread:
-                delivered_at = datetime.utcnow().isoformat() + "Z"
-                delivered_by_sender = {}
-                for m in unread:
-                    sender = m.get("from")
-                    if sender:
-                        delivered_by_sender.setdefault(sender, []).append(m.get("id"))
-                for sender_id, msg_ids in delivered_by_sender.items():
-                    try:
-                        _mark_sent_records_delivered(sender_id, agent_id, msg_ids, "poll", delivered_at)
-                    except Exception as e:
-                        print(f"[SENT] Failed to record poll delivery for {sender_id}: {e}")
-
-                # Map fields for channel adapter compatibility
-                adapted = []
-                for m in unread:
-                    adapted.append({
-                        "messageId": m.get("id", ""),
-                        "from": m.get("from", ""),
-                        "text": m.get("message", ""),
-                        "timestamp": m.get("timestamp", ""),
-                    })
-
-                return jsonify({
-                    "ok": True,
-                    "messages": adapted,
-                    "count": len(adapted),
-                    "next_offset": len(inbox) - 1,
-                })
-
-            _time.sleep(poll_interval)
-
-        # Timeout — no new messages
-        return jsonify({"ok": True, "messages": [], "count": 0})
-    finally:
-        _active_poll_count[agent_id] = max(0, _active_poll_count.get(agent_id, 1) - 1)
-
-@sock.route("/agents/<agent_id>/ws")
-def ws_messages(ws, agent_id):
-    """WebSocket endpoint for real-time message push.
-
-    Connect: ws://host/agents/{agent_id}/ws
-    Send auth immediately: {"secret": "your_secret"}
-    Receive: {"type": "message", "data": {...}} for each new message
-    """
-    import time as _time
-
-    # First message must be auth
-    try:
-        auth = json.loads(ws.receive(timeout=10))
-    except Exception:
-        ws.send(json.dumps({"ok": False, "error": "Auth timeout — send {\"secret\": \"...\"} within 10s"}))
-        return
-
-    secret = auth.get("secret", "")
-    probe = bool(auth.get("probe"))
-    agents = load_agents()
-    if agent_id not in agents or agents[agent_id].get("secret") != secret:
-        ws.send(json.dumps({"ok": False, "error": "Invalid agent_id or secret"}))
-        return
-
-    ws.send(json.dumps({"ok": True, "type": "auth", "agent_id": agent_id, "probe": probe}))
-    if probe:
-        return
-
-    # Register this connection
-    with _ws_lock:
-        _ws_connections.setdefault(agent_id, []).append(ws)
-        _ws_delivered_ids[id(ws)] = set()
-        _ws_send_locks[id(ws)] = __import__("threading").Lock()
-    _log_agent_event(agent_id, "ws_connect")
-
-    try:
-        _ws_deliver_unread(ws, agent_id)
-
-        # Keep connection alive. Some stacks/proxies don't surface ping frames reliably
-        # through ws.receive(timeout=...), so also send a server-side heartbeat and
-        # opportunistically drain unread messages every cycle.
-        while True:
-            try:
-                data = ws.receive(timeout=20)
-                if data is None:
-                    break
-                msg = json.loads(data)
-                if msg.get("type") == "ping":
-                    _send_on_ws(ws, json.dumps({"type": "pong"}))
-            except TimeoutError:
-                try:
-                    _send_on_ws(ws, json.dumps({"type": "pong"}))
-                    _ws_deliver_unread(ws, agent_id)
-                    continue
-                except Exception:
-                    break
-            except Exception:
-                break
-    finally:
-        with _ws_lock:
-            conns = _ws_connections.get(agent_id, [])
-            if ws in conns:
-                conns.remove(ws)
-            _ws_delivered_ids.pop(id(ws), None)
-            _ws_send_locks.pop(id(ws), None)
-        _log_agent_event(agent_id, "ws_disconnect")
-
-
-def _send_on_ws(ws, data: str) -> None:
-    """Send data on a WebSocket, serialized with _ws_push_message via per-connection lock."""
-    lock = _ws_send_locks.get(id(ws))
-    if lock is not None:
-        with lock:
-            ws.send(data)
-    else:
-        ws.send(data)
-
-
-def _ws_deliver_unread(ws, agent_id: str) -> None:
-    """Deliver all unread inbox messages to a connected WebSocket client.
-
-    Skips messages already delivered on this connection (tracked in _ws_delivered_ids).
-    The entire snapshot → filter → send → mark-delivered cycle runs inside the
-    per-connection send_lock, making it atomic with respect to _ws_push_message.
-    This eliminates the TOCTOU window: _ws_push_message checks _ws_delivered_ids
-    before sending, so if we already sent a message here, it won't be re-pushed.
-    """
-    inbox = load_inbox(agent_id)
-
-    send_lock = _ws_send_locks.get(id(ws))
-    lock_ctx = send_lock if send_lock is not None else __import__("contextlib").nullcontext()
-
-    delivered_at = datetime.utcnow().isoformat() + "Z"
-    delivered_by_sender = {}
-
-    with lock_ctx:
-        # Snapshot and filter inside the lock so _ws_push_message sees consistent state.
-        with _ws_lock:
-            already_delivered = set(_ws_delivered_ids.get(id(ws), set()))
-        unread = [m for m in inbox if not m.get("read") and m.get("id") not in already_delivered]
-        if not unread:
-            return
-
-        newly_sent_ids = []
-        for m in unread:
-            try:
-                ws.send(json.dumps({
-                    "type": "message",
-                    "data": {
-                        "messageId": m.get("id", ""),
-                        "from": m.get("from", ""),
-                        "text": m.get("message", ""),
-                        "timestamp": m.get("timestamp", ""),
-                    }
-                }))
-            except Exception:
-                break
-            msg_id = m.get("id")
-            if msg_id:  # guard: don't let None/empty poison the dedup set
-                newly_sent_ids.append(msg_id)
-            # Note: messages with id=None/empty ARE sent but cannot be deduplicated.
-            # They will be resent on every heartbeat until the client marks them read.
-            # In practice send_message() always assigns an id via secrets.token_hex(8).
-            sender = m.get("from")
-            if sender:
-                delivered_by_sender.setdefault(sender, []).append(msg_id)
-
-        # Update delivered set inside the lock so _ws_push_message's pre-send check
-        # sees these IDs immediately after we release the lock.
-        if newly_sent_ids:
-            with _ws_lock:
-                _ws_delivered_ids.setdefault(id(ws), set()).update(newly_sent_ids)
-
-    for sender_id, msg_ids in delivered_by_sender.items():
-        try:
-            _mark_sent_records_delivered(sender_id, agent_id, msg_ids, "websocket", delivered_at)
-        except Exception as e:
-            print(f"[SENT] Failed to record WS delivery for {sender_id}: {e}")
-
-
-def _ws_push_message(agent_id: str, message: dict):
-    """Push a message to all active WebSocket connections for an agent."""
-    adapted = {
-        "type": "message",
-        "data": {
-            "messageId": message.get("id", ""),
-            "from": message.get("from", ""),
-            "text": message.get("message", ""),
-            "timestamp": message.get("timestamp", ""),
-        }
-    }
-    payload = json.dumps(adapted)
-    msg_id = message.get("id", "")
-    delivered = False
-    with _ws_lock:
-        conns = list(_ws_connections.get(agent_id, []))  # snapshot; release lock before sends
-    dead = []
-    for ws_conn in conns:
-        send_lock = _ws_send_locks.get(id(ws_conn))
-        if send_lock is None:
-            # Connection cleaned up between snapshot and now
-            dead.append(ws_conn)
-            continue
-        with send_lock:
-            # Pre-send check: if _ws_deliver_unread already sent this message on this
-            # connection (inside its own send_lock), skip to avoid the TOCTOU duplicate.
-            with _ws_lock:
-                if msg_id and msg_id in _ws_delivered_ids.get(id(ws_conn), set()):
-                    delivered = True  # Already on the wire — count as delivered
-                    continue
-            try:
-                ws_conn.send(payload)
-                delivered = True
-                if msg_id:
-                    with _ws_lock:
-                        _ws_delivered_ids.setdefault(id(ws_conn), set()).add(msg_id)
-            except Exception:
-                dead.append(ws_conn)
-    if dead:
-        with _ws_lock:
-            conns_list = _ws_connections.get(agent_id, [])
-            for d in dead:
-                if d in conns_list:
-                    conns_list.remove(d)
-    return delivered
-
-
-@app.route("/agents/<agent_id>/messages", methods=["GET"])
-def get_messages(agent_id):
-    secret = request.args.get("secret") or request.headers.get("X-Agent-Secret")
-
-    agents = load_agents()
-    if agent_id not in agents:
-        return jsonify({"ok": False, "error": "Not found"}), 404
-
-    if agents[agent_id].get("secret") != secret:
-        return jsonify({"ok": False, "error": "Invalid secret"}), 403
-
-    # Track inbox poll for analytics
-    _log_agent_event(agent_id, "inbox_poll")
-
-    full_inbox = load_inbox(agent_id)
-
-    # Optional: only unread
-    unread_only = request.args.get("unread", "").lower() == "true"
-    messages = [m for m in full_inbox if not m.get("read")] if unread_only else list(full_inbox)
-
-    # Optional: filter by topic
-    topic_filter = request.args.get("topic")
-    if topic_filter:
-        messages = [m for m in messages if m.get("topic") == topic_filter]
-
-    # Optional: filter by sender
-    from_filter = request.args.get("from")
-    if from_filter:
-        messages = [m for m in messages if m.get("from") == from_filter]
-
-    # Optional: sort by priority (flag > normal > deprioritize > quarantine)
-    sort_priority = request.args.get("sort", "").lower() == "priority"
-    if sort_priority:
-        priority_order = {"flag": 0, "normal": 1, "deprioritize": 2, "quarantine": 3}
-        messages.sort(key=lambda m: priority_order.get(m.get("priority", {}).get("level", "normal"), 1))
-
-    # Mark as read behavior:
-    # - explicit mark_read=true -> mark returned messages as read
-    # - explicit mark_read=false -> never mark
-    # - default -> do not mark; explicit read acknowledgements should flow through
-    #   POST /agents/<id>/messages/<message_id>/read or mark_read=true.
-    mr = request.args.get("mark_read", "").lower()
-    if mr in ("true", "1", "yes"):
-        should_mark_read = True
-    elif mr in ("false", "0", "no"):
-        should_mark_read = False
-    else:
-        should_mark_read = False
-
-    if should_mark_read and messages:
-        message_ids = {m.get("id") for m in messages}
-        read_at = datetime.utcnow().isoformat() + "Z"
-        changed = False
-        read_receipts = {}
-        with _exclusive_file_lock(_inbox_lock_path(agent_id)):
-            full_inbox = load_inbox(agent_id)
-            for m in full_inbox:
-                if m.get("id") in message_ids:
-                    needs_propagation = False
-                    if not m.get("read"):
-                        m["read"] = True
-                        m["read_at"] = read_at
-                        needs_propagation = True
-                        changed = True
-                    elif not m.get("read_at"):
-                        m["read_at"] = read_at
-                        needs_propagation = True
-                        changed = True
-                    if needs_propagation:
-                        sender = m.get("from")
-                        if sender:
-                            read_receipts.setdefault(sender, []).append(m["id"])
-            if changed:
-                _save_inbox_unlocked(agent_id, full_inbox)
-        for sender_id, msg_ids in read_receipts.items():
-            try:
-                _mark_sent_records_read(sender_id, agent_id, msg_ids, read_at)
-            except Exception as e:
-                print(f"[SENT] Failed to propagate bulk read receipts to {sender_id}: {e}")
-
-        # Reflect read status in response payload as well
-        for m in messages:
-            m["read"] = True
-
-    return jsonify({
-        "agent_id": agent_id,
-        "count": len(messages),
-        "messages": messages
-    })
-
-@app.route("/agents/<agent_id>/messages/<message_id>/read", methods=["POST"])
-def mark_message_read(agent_id, message_id):
-    """Mark a specific message as read."""
-    secret = request.args.get("secret") or request.headers.get("X-Agent-Secret")
-    data = request.get_json(force=True, silent=True) or {}
-    secret = secret or data.get("secret", "")
-
-    agents = load_agents()
-    if agent_id not in agents:
-        return jsonify({"ok": False, "error": "Not found"}), 404
-    if agents[agent_id].get("secret") != secret:
-        return jsonify({"ok": False, "error": "Invalid secret"}), 403
-
-    read_at = datetime.utcnow().isoformat() + "Z"
-    found = False
-    sender_id = None
-    with _exclusive_file_lock(_inbox_lock_path(agent_id)):
-        inbox = load_inbox(agent_id)
-        for m in inbox:
-            if m.get("id") == message_id:
-                m["read"] = True
-                m["read_at"] = read_at
-                sender_id = m.get("from")
-                found = True
-                break
-        if found:
-            _save_inbox_unlocked(agent_id, inbox)
-    if not found:
-        return jsonify({"ok": False, "error": "Message not found"}), 404
-
-    # Propagate read receipt to sender's sent log
-    if sender_id:
-        try:
-            _mark_sent_records_read(sender_id, agent_id, [message_id], read_at)
-        except Exception as e:
-            print(f"[SENT] Failed to propagate read receipt for {message_id}: {e}")
-
-    return jsonify({"ok": True, "message_id": message_id, "read": True})
-
-
-@app.route("/agents/<agent_id>/messages/<message_id>", methods=["DELETE"])
-def delete_inbox_message(agent_id, message_id):
-    """Delete a message from your inbox.
-    Auth: agent's secret (query param, header, or body).
-    The message is removed from your inbox. If the message exists in the
-    per-conversation file, it's removed there too.
-    Does NOT delete the sender's sent record — that's theirs to manage.
-    """
-    secret = request.args.get("secret") or request.headers.get("X-Agent-Secret")
-    data = request.get_json(force=True, silent=True) or {}
-    secret = secret or data.get("secret", "")
-
-    agents = load_agents()
-    if agent_id not in agents:
-        return jsonify({"ok": False, "error": "Not found"}), 404
-    if agents[agent_id].get("secret") != secret:
-        return jsonify({"ok": False, "error": "Invalid secret"}), 403
-
-    found = False
-    with _exclusive_file_lock(_inbox_lock_path(agent_id)):
-        conv_dir = get_conversation_dir(agent_id)
-        if conv_dir.exists():
-            for conv_file in conv_dir.glob("*.json"):
-                msgs = _safe_load_json_list(conv_file)
-                before = len(msgs)
-                msgs = [m for m in msgs if m.get("id") != message_id]
-                if len(msgs) < before:
-                    found = True
-                    _atomic_json_dump(conv_file, msgs)
-                    break
-
-        # Also remove from flat inbox if it exists (legacy)
-        flat_path = MESSAGES_DIR / f"{agent_id}.json"
-        if flat_path.exists():
-            msgs = _safe_load_json_list(flat_path)
-            before = len(msgs)
-            msgs = [m for m in msgs if m.get("id") != message_id]
-            if len(msgs) < before:
-                found = True
-                _atomic_json_dump(flat_path, msgs)
-
-    if not found:
-        return jsonify({"ok": False, "error": "Message not found"}), 404
-
-    return jsonify({"ok": True, "deleted": message_id})
-
-
-@app.route("/agents/<agent_id>/messages/sent/<message_id>", methods=["DELETE"])
-def delete_sent_message(agent_id, message_id):
-    """Delete a message from your sent log.
-    Auth: agent's secret (query param, header, or body).
-    Removes your sent record only — does NOT delete from recipient's inbox.
-    """
-    secret = request.args.get("secret") or request.headers.get("X-Agent-Secret")
-    data = request.get_json(force=True, silent=True) or {}
-    secret = secret or data.get("secret", "")
-
-    agents = load_agents()
-    if agent_id not in agents:
-        return jsonify({"ok": False, "error": "Not found"}), 404
-    if agents[agent_id].get("secret") != secret:
-        return jsonify({"ok": False, "error": "Invalid secret"}), 403
-
-    # Search across all recipient sent files
-    sent_dir = SENT_DIR / agent_id
-    found = False
-    if sent_dir.exists():
-        for sent_file in sent_dir.glob("*.json"):
-            with _exclusive_file_lock(_sent_lock_path(agent_id, sent_file.stem)):
-                records = _safe_load_json_list(sent_file)
-                before = len(records)
-                records = [r for r in records if r.get("message_id") != message_id]
-                if len(records) < before:
-                    found = True
-                    _write_sent_records_unlocked(agent_id, sent_file.stem, records)
-                    break
-
-    if not found:
-        return jsonify({"ok": False, "error": "Sent record not found"}), 404
-
-    return jsonify({"ok": True, "deleted": message_id})
-
-
-@app.route("/agents/<agent_id>/messages/sent/bulk-delete", methods=["POST"])
-def bulk_delete_sent(agent_id):
-    """Bulk delete sent records.
-    Auth: agent's secret.
-    Body: {"message_ids": ["id1", "id2", ...]} or {"to": "recipient", "before": "ISO-timestamp"}
-    """
-    secret = request.args.get("secret") or request.headers.get("X-Agent-Secret")
-    data = request.get_json(force=True, silent=True) or {}
-    secret = secret or data.get("secret", "")
-
-    agents = load_agents()
-    if agent_id not in agents:
-        return jsonify({"ok": False, "error": "Not found"}), 404
-    if agents[agent_id].get("secret") != secret:
-        return jsonify({"ok": False, "error": "Invalid secret"}), 403
-
-    message_ids = data.get("message_ids", [])
-    to_filter = data.get("to")
-    before_filter = data.get("before")
-
-    sent_dir = SENT_DIR / agent_id
-    if not sent_dir.exists():
-        return jsonify({"ok": True, "deleted_count": 0})
-
-    deleted_count = 0
-    files = [sent_dir / f"{to_filter}.json"] if to_filter else list(sent_dir.glob("*.json"))
-
-    for sent_file in files:
-        if not sent_file.exists():
-            continue
-        recipient_id = sent_file.stem
-        with _exclusive_file_lock(_sent_lock_path(agent_id, recipient_id)):
-            records = _safe_load_json_list(sent_file)
-            before_len = len(records)
-
-            if message_ids:
-                id_set = set(message_ids)
-                records = [r for r in records if r.get("message_id") not in id_set]
-            elif before_filter:
-                records = [r for r in records if r.get("timestamp", "") >= before_filter]
-            else:
-                continue
-
-            deleted_count += before_len - len(records)
-            _write_sent_records_unlocked(agent_id, recipient_id, records)
-
-    return jsonify({"ok": True, "deleted_count": deleted_count})
-
-
-@app.route("/agents/<agent_id>/messages/sent", methods=["GET"])
-def get_sent_messages(agent_id):
-    """View delivery status of messages sent by this agent.
-    Auth: agent's secret (query param or X-Agent-Secret header).
-    Query params:
-        to: filter by recipient agent_id
-        delivery_status: filter by delivery_state (inbox_queued,
-                         websocket_inbox_unacked, callback_ok_inbox_unacked,
-                         websocket_callback_inbox_unacked, poll_delivered_inbox_unacked,
-                         callback_failed_inbox_only)
-        since: ISO timestamp — only messages after this time
-        limit: max results (default 50, max 200)
-    Returns: list of sent message records with delivery metadata.
-    """
-    secret = request.args.get("secret") or request.headers.get("X-Agent-Secret")
-    agents = load_agents()
-    if agent_id not in agents:
-        return jsonify({"ok": False, "error": "Agent not found"}), 404
-    if agents[agent_id].get("secret") != secret:
-        return jsonify({"ok": False, "error": "Invalid secret"}), 403
-
-    to_filter = request.args.get("to")
-    delivery_filter = request.args.get("delivery_status")
-    since_filter = request.args.get("since")
-    topic_filter = request.args.get("topic")
-    limit = min(int(request.args.get("limit", 50)), 200)
-
-    records = _load_sent_records(agent_id, recipient_id=to_filter)
-
-    # Apply filters
-    if delivery_filter:
-        records = [r for r in records if r.get("delivery_state") == delivery_filter]
-    if since_filter:
-        records = [r for r in records if r.get("timestamp", "") >= since_filter]
-    if topic_filter:
-        records = [r for r in records if r.get("topic") == topic_filter]
-
-    # Sort newest first, apply limit
-    records.sort(key=lambda r: r.get("timestamp", ""), reverse=True)
-    records = records[:limit]
-
-    # Enrich with recipient liveness and delivery capability
-    for r in records:
-        to_agent = r.get("to", "")
-        if to_agent in agents:
-            liveness = _compute_agent_liveness(to_agent, agents)
-            r["recipient_liveness"] = liveness.get("liveness_class", "unknown")
-            r["recipient_delivery_capability"] = _agent_delivery_capability(agents[to_agent], to_agent)
-
-    return jsonify({
-        "ok": True,
-        "agent_id": agent_id,
-        "count": len(records),
-        "messages": records
-    })
-
-@app.route("/agents/<agent_id>/messages", methods=["DELETE"])
-def clear_messages(agent_id):
-    secret = request.args.get("secret") or request.headers.get("X-Agent-Secret")
-
-    agents = load_agents()
-    if agent_id not in agents:
-        return jsonify({"ok": False, "error": "Not found"}), 404
-
-    if agents[agent_id].get("secret") != secret:
-        return jsonify({"ok": False, "error": "Invalid secret"}), 403
-
-    save_inbox(agent_id, [])
-    return jsonify({"ok": True, "message": "Inbox cleared"})
-
-# ============ BROADCAST ============
-@app.route("/broadcast", methods=["POST"])
-def broadcast():
-    """
-    Broadcast a message to all registered agents.
-    Sender must be registered and provide their secret.
-    """
-    data = request.get_json() or {}
-    from_agent = data.get("from")
-    secret = data.get("secret") or request.headers.get("X-Agent-Secret")
-    msg_type = data.get("type", "broadcast")
-    payload = data.get("payload", {})
-
-    if not from_agent:
-        return jsonify({"ok": False, "error": "Missing 'from'"}), 400
-
-    agents = load_agents()
-
-    # Verify sender
-    if from_agent not in agents:
-        resp = _behavioral_404("agent")
-        resp["error"] = f"Sender '{from_agent}' not registered"
-        return jsonify(resp), 404
-
-    if agents[from_agent].get("secret") != secret:
-        return jsonify({"ok": False, "error": "Invalid secret"}), 403
-
-    # Build broadcast message
-    broadcast_msg = {
-        "type": "broadcast",
-        "from": from_agent,
-        "msg_type": msg_type,
-        "payload": payload,
-        "ts": datetime.utcnow().isoformat()
-    }
-
-    # Deliver to all agents except sender
-    delivered = []
-    delivered_stats = []
-    for agent_id in list(agents.keys()):
-        if agent_id == from_agent:
-            continue
-        callback_url = agents.get(agent_id, {}).get("callback_url")
-        callback_verified = bool(callback_url) and bool(agents.get(agent_id, {}).get("callback_verified"))
-
-        msg = {
-            "id": secrets.token_hex(8),
-            "from": from_agent,
-            "message": json.dumps(broadcast_msg),
-            "timestamp": datetime.utcnow().isoformat(),
-            "read": False,
-            "is_broadcast": True
-        }
-        sent_record = {
-            "message_id": msg["id"],
-            "to": agent_id,
-            "message_preview": msg["message"][:100] + ("..." if len(msg["message"]) > 100 else ""),
-            "timestamp": msg["timestamp"],
-            "delivery_state": "inbox_queued",
-            "delivered_channels": [],
-            "delivered_at": None,
-            "callback_status": None,
-            "callback_url_configured": bool(agents.get(agent_id, {}).get("callback_url")),
-            "callback_verified": bool(agents.get(agent_id, {}).get("callback_verified")),
-            "callback_error": None,
-            "read": False,
-            "read_at": None,
-            "is_broadcast": True,
-            "broadcast_type": msg_type,
-        }
-        try:
-            _append_sent_record(from_agent, agent_id, sent_record)
-        except Exception as e:
-            print(f"[BROADCAST] Failed to persist sent record for {from_agent}->{agent_id}: {e}")
-            continue
-        try:
-            append_message_to_conversation(agent_id, from_agent, msg)
-        except Exception:
-            try:
-                _delete_sent_record(from_agent, agent_id, msg["id"])
-            except Exception as cleanup_error:
-                print(f"[BROADCAST] Failed to cleanup sent record for {from_agent}->{agent_id}: {cleanup_error}")
-            continue
-        delivered_channels, delivered_at, callback_status, callback_error = _attempt_transport_delivery(
-            agent_id,
-            msg,
-            callback_url=callback_url,
-            callback_failure_meta={"from": from_agent, "broadcast_type": msg_type},
-        )
-        try:
-            _finalize_sent_record_delivery(
-                from_agent,
-                agent_id,
-                msg["id"],
-                delivered_channels,
-                delivered_at=delivered_at,
-                callback_status=callback_status,
-                callback_error=callback_error,
-            )
-        except Exception as e:
-            print(f"[BROADCAST] Failed to update sent record for {from_agent}->{agent_id}: {e}")
-        delivered.append(agent_id)
-        delivered_stats.append(agent_id)
-
-    with agents_lock() as mutable_agents:
-        for delivered_agent_id in delivered_stats:
-            if delivered_agent_id in mutable_agents:
-                mutable_agents[delivered_agent_id]["messages_received"] = mutable_agents[delivered_agent_id].get("messages_received", 0) + 1
-                mutable_agents[delivered_agent_id]["last_message_received_at"] = datetime.utcnow().isoformat()
-        if from_agent in mutable_agents:
-            mutable_agents[from_agent]["last_message_sent_at"] = datetime.utcnow().isoformat()
-
-    print(f"[BROADCAST] {from_agent} -> {len(delivered)} agents: {msg_type}")
-
-    return jsonify({
-        "ok": True,
-        "broadcast_type": msg_type,
-        "delivered_to": delivered,
-        "count": len(delivered)
-    })
-
-# ============ ANNOUNCE (Distributed Verification) ============
-@app.route("/announce", methods=["POST"])
-def announce():
-    """
-    Announce an endpoint is live for distributed verification.
-    Triggers broadcast with structured payload for listeners to auto-verify.
-
-    Payload:
-    - from: announcing agent (required)
-    - secret: agent's secret (required)
-    - endpoint: URL to verify (required)
-    - expected_status: expected HTTP status code (default 200)
-    - description: optional description of what's being announced
-
-    Listeners can:
-    1. GET the endpoint
-    2. Check status matches expected_status
-    3. Post attestation back via /agents/{announcer}/message
-    """
-    data = request.get_json() or {}
-    from_agent = data.get("from")
-    secret = data.get("secret") or request.headers.get("X-Agent-Secret")
-    endpoint = data.get("endpoint")
-    expected_status = data.get("expected_status", 200)
-    description = data.get("description", "")
-
-    if not from_agent:
-        return jsonify({"ok": False, "error": "Missing 'from'"}), 400
-    if not endpoint:
-        return jsonify({"ok": False, "error": "Missing 'endpoint'"}), 400
-
-    agents = load_agents()
-
-    # Verify sender
-    if from_agent not in agents:
-        return jsonify({"ok": False, "error": f"Announcer '{from_agent}' not registered"}), 404
-
-    if agents[from_agent].get("secret") != secret:
-        return jsonify({"ok": False, "error": "Invalid secret"}), 403
-
-    # Build announcement payload
-    announcement = {
-        "type": "endpoint_announcement",
-        "from": from_agent,
-        "endpoint": endpoint,
-        "expected_status": expected_status,
-        "description": description,
-        "announced_at": datetime.utcnow().isoformat(),
-        "verify_by": (datetime.utcnow().replace(microsecond=0).__add__(
-            __import__('datetime').timedelta(minutes=5)
-        )).isoformat()  # 5 minute verification window
-    }
-
-    # Deliver to all agents except sender
-    delivered = []
-    delivered_stats = []
-    for agent_id in list(agents.keys()):
-        if agent_id == from_agent:
-            continue
-        callback_url = agents.get(agent_id, {}).get("callback_url")
-        callback_verified = bool(callback_url) and bool(agents.get(agent_id, {}).get("callback_verified"))
-
-        msg = {
-            "id": secrets.token_hex(8),
-            "from": from_agent,
-            "message": json.dumps(announcement),
-            "timestamp": datetime.utcnow().isoformat(),
-            "read": False,
-            "is_announcement": True
-        }
-        sent_record = {
-            "message_id": msg["id"],
-            "to": agent_id,
-            "message_preview": msg["message"][:100] + ("..." if len(msg["message"]) > 100 else ""),
-            "timestamp": msg["timestamp"],
-            "delivery_state": "inbox_queued",
-            "delivered_channels": [],
-            "delivered_at": None,
-            "callback_status": None,
-            "callback_url_configured": bool(agents.get(agent_id, {}).get("callback_url")),
-            "callback_verified": bool(agents.get(agent_id, {}).get("callback_verified")),
-            "callback_error": None,
-            "read": False,
-            "read_at": None,
-            "is_announcement": True,
-            "announcement_endpoint": endpoint,
-        }
-        try:
-            _append_sent_record(from_agent, agent_id, sent_record)
-        except Exception as e:
-            print(f"[ANNOUNCE] Failed to persist sent record for {from_agent}->{agent_id}: {e}")
-            continue
-        try:
-            append_message_to_conversation(agent_id, from_agent, msg)
-        except Exception:
-            try:
-                _delete_sent_record(from_agent, agent_id, msg["id"])
-            except Exception as cleanup_error:
-                print(f"[ANNOUNCE] Failed to cleanup sent record for {from_agent}->{agent_id}: {cleanup_error}")
-            continue
-        delivered_channels, delivered_at, callback_status, callback_error = _attempt_transport_delivery(
-            agent_id,
-            msg,
-            callback_url=callback_url,
-            callback_failure_meta={"from": from_agent, "announcement_endpoint": endpoint},
-        )
-        try:
-            _finalize_sent_record_delivery(
-                from_agent,
-                agent_id,
-                msg["id"],
-                delivered_channels,
-                delivered_at=delivered_at,
-                callback_status=callback_status,
-                callback_error=callback_error,
-            )
-        except Exception as e:
-            print(f"[ANNOUNCE] Failed to update sent record for {from_agent}->{agent_id}: {e}")
-        delivered.append(agent_id)
-        delivered_stats.append(agent_id)
-
-    with agents_lock() as mutable_agents:
-        for delivered_agent_id in delivered_stats:
-            if delivered_agent_id in mutable_agents:
-                mutable_agents[delivered_agent_id]["messages_received"] = mutable_agents[delivered_agent_id].get("messages_received", 0) + 1
-                mutable_agents[delivered_agent_id]["last_message_received_at"] = datetime.utcnow().isoformat()
-        if from_agent in mutable_agents:
-            mutable_agents[from_agent]["last_message_sent_at"] = datetime.utcnow().isoformat()
-
-    print(f"[ANNOUNCE] {from_agent} -> {endpoint} (delivered to {len(delivered)} agents)")
-
-    return jsonify({
-        "ok": True,
-        "announcement": announcement,
-        "delivered_to": delivered,
-        "count": len(delivered)
-    })
 
 # ============ EMAIL (OpenClaw) ============
 @app.route("/email", methods=["POST"])
@@ -6254,118 +4378,7 @@ def activity():
         "updated_at": datetime.utcnow().isoformat() + "Z",
     })
 
-# ============ AGENT DISCOVERY (URL-based registration) ============
-DISCOVERED_FILE = DATA_DIR / "discovered.json"
-
-def load_discovered():
-    if DISCOVERED_FILE.exists():
-        with open(DISCOVERED_FILE) as f:
-            return json.load(f)
-    return {}
-
-def save_discovered(discovered):
-    with open(DISCOVERED_FILE, "w") as f:
-        json.dump(discovered, f, indent=2)
-
-@app.route("/discover", methods=["POST"])
-def discover_agent():
-    """
-    Register an agent by URL. We fetch their /.well-known/agent.json,
-    verify endpoint is live, and add to directory.
-
-    POST /discover {"url": "https://a2a.example.com"}
-    """
-    data = request.get_json() or {}
-    url = data.get("url", "").rstrip("/")
-
-    if not url:
-        return jsonify({"ok": False, "error": "Missing 'url'"}), 400
-
-    if not url.startswith("https://"):
-        return jsonify({"ok": False, "error": "URL must be https"}), 400
-
-    url_safe, url_err = _validate_callback_url(url)
-    if not url_safe:
-        return jsonify({"ok": False, "error": f"Invalid URL: {url_err}"}), 400
-
-    # Fetch agent card
-    import requests as req
-    agent_card_url = f"{url}/.well-known/agent.json"
-    try:
-        r = req.get(agent_card_url, timeout=10, allow_redirects=False)
-        if r.status_code != 200:
-            return jsonify({"ok": False, "error": f"No agent card at {agent_card_url} (status {r.status_code})"}), 404
-        card = r.json()
-    except req.exceptions.Timeout:
-        return jsonify({"ok": False, "error": "Timeout fetching agent card"}), 504
-    except (ValueError, KeyError):
-        return jsonify({"ok": False, "error": f"Agent card at {agent_card_url} is not valid JSON"}), 422
-    except Exception as e:
-        return jsonify({"ok": False, "error": f"Failed to fetch agent card: {str(e)[:100]}"}), 502
-
-    # Verify health/liveness
-    health_url = f"{url}/health"
-    try:
-        import time
-        start = time.time()
-        hr = req.get(health_url, timeout=10, allow_redirects=False)
-        latency_ms = int((time.time() - start) * 1000)
-        health_ok = hr.status_code == 200
-    except:
-        latency_ms = None
-        health_ok = False
-
-    # Extract info from card
-    agent_name = card.get("name", url)
-    agent_id = agent_name.lower().replace(" ", "-").replace(".", "-")[:32]
-
-    # Store in discovered registry
-    discovered = load_discovered()
-    discovered[agent_id] = {
-        "url": url,
-        "name": agent_name,
-        "description": card.get("description", ""),
-        "skills": [s.get("name", s.get("id", "")) for s in card.get("skills", [])],
-        "capabilities": card.get("capabilities", {}),
-        "version": card.get("version"),
-        "health_ok": health_ok,
-        "latency_ms": latency_ms,
-        "discovered_at": datetime.utcnow().isoformat(),
-        "last_verified": datetime.utcnow().isoformat(),
-        "card": card
-    }
-    save_discovered(discovered)
-
-    print(f"[DISCOVER] {agent_name} at {url} (health: {'ok' if health_ok else 'fail'}, {latency_ms}ms)")
-
-    return jsonify({
-        "ok": True,
-        "agent_id": agent_id,
-        "name": agent_name,
-        "skills": discovered[agent_id]["skills"],
-        "health_ok": health_ok,
-        "latency_ms": latency_ms,
-        "note": "Agent discovered and indexed. They can also register on the Hub for messaging via POST /agents/register."
-    })
-
-@app.route("/discover", methods=["GET"])
-def list_discovered():
-    """List all discovered agents with their capabilities and health status."""
-    discovered = load_discovered()
-    agents_list = []
-    for aid, info in discovered.items():
-        agents_list.append({
-            "agent_id": aid,
-            "name": info.get("name"),
-            "url": info.get("url"),
-            "description": info.get("description", "")[:200],
-            "skills": info.get("skills", []),
-            "health_ok": info.get("health_ok"),
-            "latency_ms": info.get("latency_ms"),
-            "last_verified": info.get("last_verified"),
-        })
-    return jsonify({"count": len(agents_list), "agents": agents_list})
-
+# ============ AGENT DISCOVERY (search — not in messaging Blueprint) ============
 @app.route("/discover/search", methods=["GET"])
 def search_discovered():
     """Search discovered agents by capability/skill keyword. Searches both registered and discovered agents."""
@@ -13172,6 +11185,14 @@ def _deliver_internal_dm(from_agent, to_agent, message, msg_type="system", extra
                     print(f"[INTERNAL-DM] Failed to cleanup sent record for {from_agent}->{to_agent}: {cleanup_error}")
             raise
 
+        # Update message counters and liveness timestamps
+        with agents_lock() as mutable_agents:
+            if to_agent in mutable_agents:
+                mutable_agents[to_agent]["messages_received"] = mutable_agents[to_agent].get("messages_received", 0) + 1
+                mutable_agents[to_agent]["last_message_received_at"] = now
+            if from_agent in mutable_agents:
+                mutable_agents[from_agent]["last_message_sent_at"] = now
+
         delivered_channels, delivered_at, callback_status, callback_error = _attempt_transport_delivery(
             to_agent,
             dm_payload,
@@ -13187,6 +11208,9 @@ def _deliver_internal_dm(from_agent, to_agent, message, msg_type="system", extra
             callback_status=callback_status,
             callback_error=callback_error,
         )
+
+        # Fire event hook so subscribers (analytics, notifications) see internal DMs
+        on_message_sent.fire(from_agent, to_agent, dm_payload)
     except Exception as e:
         print(f"[INTERNAL-DM] Error sending {from_agent}->{to_agent}: {e}")
 
