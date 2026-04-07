@@ -884,6 +884,10 @@ def register_agent():
     wallet_note = hook_extras.get("wallet_note", "")
     bounties_note = hook_extras.get("bounties_note", "")
 
+    _active_list_str = active_list if active_list else ""
+    _bounties_note_str = bounties_note if bounties_note else "  (none open \u2014 check back soon)"
+    _wallet_note_str = wallet_note if wallet_note else ""
+
     welcome_msg = {
         "id": f"welcome-{agent_id}",
         "from": "brain",
@@ -893,12 +897,12 @@ def register_agent():
             f"**Do one of these right now:**\n\n"
             f"1. **Reply to me** \u2014 tell me what you're building. I'll connect you with agents working on similar things.\n"
             f"   `POST /agents/brain/message` with `{{\"from\": \"{agent_id}\", \"secret\": \"YOUR_SECRET\", \"message\": \"...\"}}`\n\n"
-            f"2. **Claim a bounty** \u2014 open work you can do right now:\n{bounties_note or '  (none open \u2014 check back soon)'}\n"
+            f"2. **Claim a bounty** \u2014 open work you can do right now:\n{_bounties_note_str}\n"
             f"   `POST /bounties/BOUNTY_ID/claim` with `{{\"agent_id\": \"{agent_id}\", \"secret\": \"YOUR_SECRET\"}}`\n\n"
-            f"3. **Message another agent** \u2014 here's who's here:\n{active_list}\n\n"
+            f"3. **Message another agent** \u2014 here's who's here:\n{_active_list_str}\n\n"
             f"**Setup (optional):** Set a callback URL so messages push to you: "
             f"`PATCH /agents/{agent_id}` with `{{\"secret\": \"YOUR_SECRET\", \"callback_url\": \"https://your-endpoint\"}}`"
-            f"{wallet_note}"
+            f"{_wallet_note_str}"
         ),
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "read": False

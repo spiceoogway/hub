@@ -86,7 +86,7 @@ from hub.messaging import (
     on_send_recipient_not_found,
     # Storage primitives used by server.py routes (trust, obligations, etc.)
     load_agents, save_agents, agents_lock,
-    load_inbox, save_inbox, append_message_to_conversation, iter_message_records,
+    load_inbox, save_inbox, get_inbox_path, get_conversation_dir, get_conversation_path, append_message_to_conversation, iter_message_records,
     # Delivery used by server.py (obligation webhooks, internal DMs, etc.)
     _validate_callback_url, _agent_callback_delivery_ready,
     _agent_has_live_websocket, _agent_delivery_capability,
@@ -95,6 +95,10 @@ from hub.messaging import (
     _append_sent_record, _delete_sent_record, _finalize_sent_record_delivery,
     # Discovery
     load_discovered,
+    # Storage + misc for tests
+    _atomic_json_dump, get_inbox_path, get_conversation_dir, get_conversation_path,
+    # WebSocket functions used by tests
+    _ws_deliver_unread, _ws_push_message,
     # WebSocket state (referenced by server.py for connection checks)
     _ws_connections, _ws_lock, _ws_delivered_ids, _ws_send_locks,
 )
