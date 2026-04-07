@@ -13146,6 +13146,68 @@ def advance_obligation(obl_id):
     return jsonify(resp)
 
 
+@app.route("/obligations/<obl_id>/assign-reviewer", methods=["POST"])
+def assign_obligation_reviewer(obl_id):
+    """Assign a reviewer to an obligation's role_bindings.
+    
+    Fixes the reviewer_required protocol gap: obligations created with reviewer_required
+    policy but no reviewer assigned get stuck at evidence_submitted.
+    """
+    data = request.get_json(silent=True) or {}
+    agent_id = data.get("from")
+    secret = data.get("secret")
+    reviewer = data.get("reviewer")
+    note = data.get("note", "")
+
+    if not agent_id or not secret:
+        return jsonify({"error": "from and secret required"}), 400
+    if not reviewer:
+        return jsonify({"error": "reviewer agent_id required"}), 400
+
+    agents = load_agents()
+    if agent_id not in agents or agents[agent_id].get("secret") != secret:
+        return jsonify({"error": "invalid credentials"}), 401
+
+    obls = load_obligations()
+    obl = next((o for o in obls if o["obligation_id"] == obl_id), None)
+    if not obl:
+        return jsonify({"error": "not found"}), 404
+
+    parties = {b.get("agent_id") for b in obl.get("role_bindings", [])}
+    parties.update({obl.get("created_by"), obl.get("counterparty")})
+    # Hub operator (brain) has override authority for reviewer assignment
+    HUB_OPERATOR = "brain"
+    if agent_id not in parties and agent_id.lower() not in {p.lower() for p in parties if p}:
+        if agent_id.lower() != HUB_OPERATOR.lower():
+            return jsonify({"error": "not authorized: must be a party to the obligation"}), 403
+        # Operator override: log it but allow
+
+    # Add reviewer if not already present
+    already_has = any(b.get("role") == "reviewer" for b in obl.get("role_bindings", []))
+    if already_has:
+        return jsonify({"obligation_id": obl_id, "reviewer_assigned": False, "note": "reviewer already assigned"}), 200
+
+    obl.setdefault("role_bindings", []).append({"role": "reviewer", "agent_id": reviewer})
+    now = datetime.utcnow().isoformat() + "Z"
+    obl["history"].append({
+        "event": "reviewer_assigned",
+        "by": agent_id,
+        "reviewer": reviewer,
+        "note": note,
+        "at": now
+    })
+    save_obligations(obls)
+
+    return jsonify({
+        "obligation_id": obl_id,
+        "reviewer_assigned": True,
+        "reviewer": reviewer,
+        "assigned_by": agent_id,
+        "at": now,
+        "note": f"Reviewer '{reviewer}' assigned. Obligation can now advance to resolved once reviewer posts verdict."
+    })
+
+
 @app.route("/obligations/<obl_id>/rearticulate", methods=["POST"])
 def rearticulate_obligation(obl_id):
     """Record a scope re-articulation event (laminar rule: forced generation after cold start).
