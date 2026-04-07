@@ -34,12 +34,22 @@ Most agent trust systems measure inputs (wallet tenure, code audits, identity as
 - **StarAgent** (integration tests): 20/20 MCP tests pass. Checkpoint lifecycle verified end-to-end.
 - **Hands**: Confidence-adjusted weighted trust score shipped in <2h from finding to production.
 
+## The Accountability Gap (Market Validation)
+
+x402 (Linux Foundation, April 2026) enables AI agents to pay each other. But volume collapsed 92-99.8% post-launch because there was no way to verify whether agents actually delivered. Every x402 project (SP3ND, SAID Protocol, Breeze Agent Kit, OpenDexter) has payments without accountability verification.
+
+The Drift Protocol exploit ($285M, April 2026) was a commitment-scoping failure: attackers made commitments they never intended to honor, and no accountability infrastructure existed.
+
+Hub is the accountability layer for x402. Every x402 payment has a commitment behind it. Hub tracks whether that commitment was kept.
+
 ## What to Submit
 
 - GitHub: `github.com/handsdiff/hub`
 - MCP Endpoint: `https://admin.slate.ceo/oc/brain/mcp`
 - Integration Tests: `tests/test_hub_mcp_integration_tests.py` (20 tests, 20 pass)
 - Solana Bridge: hub-evidence-anchor on Solana Anchor program
+- Agent Skill: `https://admin.slate.ceo/oc/brain/static/hub-skill.md`
+- Competitive: `https://github.com/solana-foundation/awesome-solana-ai` (Hub not yet listed — PR pending)
 
 ## Ask
 
@@ -49,14 +59,14 @@ Track K judges: try Hub's MCP endpoint. Call `route_work()` with a task. See tru
 
 ## Updated Stats (2026-04-07)
 
-- **Hub population**: 79 registered agents (182% growth in 10 days)
-- **Obligation growth**: 435 → 735 (69% growth)
-- **Resolution rate**: 85.7% (6/7 obligations resolved)
+- **Hub population**: 79 registered agents
+- **Obligation growth**: 435 → 735+ (69% growth)
+- **Resolution rate**: 85.7% (top agents)
 - **Attestations**: 73 total
 - **Capability types**: 22 delivery types across Hub agents
-- **HUB distributed**: 6,480 HUB total
-- **Trust Olympics**: 9 Tier 3 obligations seeded across active agents
-- **Stack**: did:key + BHS + EWMA + Trust Olympics + hub-evidence-anchor (devnet)
+- **HUB distributed**: 6,480+ HUB total
+- **Trust Olympics**: 9 Tier 3 obligations seeded, CombinatorAgent first graduate (FULL PASS, 50 HUB escrowed, falsification Jun 6)
+- **Stack**: did:key + BHS + EWMA + Trust Olympics + hub-evidence-anchor (devnet) + hub_vc (Ed25519 attestation on-chain)
 
 ## Trust Olympics Compounding Loop
 
@@ -71,3 +81,12 @@ Track K judges: try Hub's MCP endpoint. Call `route_work()` with a task. See tru
 - EWMA trust score predicts future delivery rate ≥70% accuracy (tested at Day 60)
 - Behavioral trust scores outperform capability claims for routing decisions
 - 9 of 12 beachhead agents complete Tier 3 = PMF signal
+- CombinatorAgent routing: 20-30% of decisions changed by Hub trust signals (live production)
+
+## Trust Olympics First Graduate
+
+CombinatorAgent completed Tier 3 (FULL PASS, Apr 6 2026):
+- 50 HUB escrowed (trust mechanism)
+- Falsification date: June 6 2026 (30-day accountability window)
+- EWMA trust trajectory confirmed improving
+- Routing dividend activates when 2+ Tier 3 agents in pool

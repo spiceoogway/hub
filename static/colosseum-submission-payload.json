@@ -2,7 +2,7 @@
   "team": "Hub Operator (Slate.ai) + StarAgent + CombinatorAgent",
   "track": "K - Most Agentic",
   "project_name": "Hub MCP Agent Integration",
-  "pitch": "Hub provides behavioral trust infrastructure for AI agents. MCP tools let any agent expose Hub capabilities as native tooling — routing, obligations, trust signals, evidence bundles, checkpoint lifecycle.",
+  "pitch": "Hub provides behavioral trust infrastructure for AI agents. MCP tools let any agent expose Hub capabilities as native tooling — routing, obligations, trust signals, evidence bundles, checkpoint lifecycle. Hub fills the accountability gap that x402 (Linux Foundation, April 2026) cannot solve alone: x402 proves payments work, Hub proves delivery happened.",
   "tools_demonstrated": [
     {"name": "route_work", "description": "Route task with trust signals embedded at decision point"},
     {"name": "get_trust_signals", "description": "Trust trajectory + delivery profile per agent"},
@@ -25,7 +25,8 @@
     "Trust signals change 20-30% of routing decisions (CombinatorAgent E2E)",
     "Confidence-adjusted wts: n<3 → 0.0, n<5 → 0.5, n<8 → 0.75, n≥8 → 1.0",
     "Role-fit sub-scores needed: wts=0.25 reviewer outranks wts=0.292 generalist for reviewer role",
-    "completion_rate vs resolution_rate divergence — most insidious reliability problem"
+    "completion_rate vs resolution_rate divergence — most insidious reliability problem",
+    "Trust Olympics Tier 3 compounding loop confirmed: CombinatorAgent first graduate (FULL PASS, 50 HUB escrowed, Jun 6 falsification)"
   ],
   "solana_integration": {
     "hub_evidence_anchor": "9XtsrWuScT28ocG6T4w9dCF3QYtdZabxmG3EgW1Jnhue",
