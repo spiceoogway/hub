@@ -12660,6 +12660,13 @@ def export_obligation(obl_id):
     return jsonify({"obligation": export})
 
 
+@app.route("/evidence/<obl_id>", methods=["GET"])
+def get_evidence(obl_id):
+    """Alias for GET /obligations/<obl_id>/bundle.
+    Provides a short URL for hub_vc.verification bundle references."""
+    return get_obligation_bundle(obl_id)
+
+
 @app.route("/obligations/<obl_id>/bundle", methods=["GET"])
 def get_obligation_bundle(obl_id):
     """Produce a signed, verifiable obligation bundle for anchoring on external systems.
@@ -13129,6 +13136,55 @@ def advance_obligation(obl_id):
 
     save_obligations(obls)
 
+    # ── Hub VerifiableCredential on resolution ─────────────────────────────────
+    # Produce a self-verifying hub_vc at resolution time.
+    # Third parties verify by fetching GET /obligations/{id}/bundle,
+    # computing SHA-256 of canonical bundle, and verifying Ed25519 signature.
+    hub_vc = None
+    if new_status == "resolved":
+        try:
+            import base64 as _b64, hashlib, copy as _copy
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+            from cryptography.hazmat.primitives import serialization
+            key_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "credentials", "hub_signing_key.pem")
+            if os.path.exists(key_path):
+                with open(key_path, "rb") as f:
+                    private_key = serialization.load_pem_private_key(f.read(), password=None)
+                pub = private_key.public_key()
+                pub_raw = pub.public_bytes(
+                    encoding=serialization.Encoding.Raw,
+                    format=serialization.PublicFormat.Raw
+                )
+                # Build canonical obligation bundle for SHA-256
+                sign_copy = _copy.deepcopy(dict(obl))
+                sign_copy.pop("_export_meta", None)
+                canonical_bundle = json.dumps(sign_copy, sort_keys=True, separators=(",", ":"))
+                evidence_hash = "sha256:" + hashlib.sha256(canonical_bundle.encode("utf-8")).hexdigest()
+                # Canonical VC payload (sign this)
+                vc_data = {
+                    "obligation_id": obl["obligation_id"],
+                    "resolution": new_status,
+                    "resolved_by": agent_id,
+                    "resolved_at": now,
+                    "evidence_refs": list(obl.get("evidence_refs", [])),
+                    "evidence_hash": evidence_hash,
+                }
+                canonical_vc = json.dumps(vc_data, sort_keys=True, separators=(",", ":"))
+                signature = private_key.sign(canonical_vc.encode("utf-8"))
+                hub_vc = {
+                    "algorithm": "Ed25519",
+                    "key_id": "hub-signing-key-001",
+                    "public_key": _b64.b64encode(pub_raw).decode(),
+                    "signed_at": now,
+                    "signed_fields": list(vc_data.keys()),
+                    "signature": _b64.b64encode(signature).decode(),
+                    "evidence_hash": evidence_hash,
+                    "verification": "Canonicalize vc_data (sort_keys), verify Ed25519 against public_key. Canonical bundle SHA-256 must match evidence_hash.",
+                    "bundle_url": f"/obligations/{obl_id}/bundle",
+                }
+        except Exception as e:
+            print(f"[HUB-VC] Failed to produce hub_vc for {obl_id}: {e}")
+
     # --- Phase 1 peer grant auto-creation on acceptance ---
     peer_grants_created = []
     if new_status == "accepted":
@@ -13174,6 +13230,8 @@ def advance_obligation(obl_id):
         _auto_generate_trust_signal(obl, resolved_by=agent_id)
 
     resp = {"obligation": obl}
+    if hub_vc:
+        resp["hub_vc"] = hub_vc
     if peer_grants_created:
         resp["peer_grants_created"] = peer_grants_created
     if rearticulation_warning:
