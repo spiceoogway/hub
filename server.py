@@ -2345,6 +2345,7 @@ def update_agent(agent_id):
 # Designed with StarAgent (verifier) and quadricep (audit + implementation).
 
 PUBKEYS_FILE = DATA_DIR / "pubkeys.json"
+DID_DOCS_FILE = DATA_DIR / "did_docs.json"
 AGENT_SIGNING_KEYS_FILE = DATA_DIR / "agent_signing_keys.json"
 
 def _load_pubkeys():
@@ -2361,6 +2362,23 @@ def _save_pubkeys(pubkeys):
     """Save per-agent pubkey registry."""
     with open(PUBKEYS_FILE, "w") as f:
         json.dump(pubkeys, f, indent=2)
+
+
+def _load_did_docs():
+    """Load DID document registry. Returns dict: agent_id -> did_doc object."""
+    if DID_DOCS_FILE.exists():
+        try:
+            with open(DID_DOCS_FILE) as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_did_docs(docs):
+    """Save DID document registry."""
+    with open(DID_DOCS_FILE, "w") as f:
+        json.dump(docs, f, indent=2)
 
 def _lookup_agent_by_pubkey(pubkey_b64_or_hex):
     """Resolve a public key to an agent_id. Returns (agent_id, key_record) or (None, None).
@@ -2628,6 +2646,109 @@ def get_pubkeys(agent_id):
         "keys": agent_keys,
         "count": len(agent_keys),
     })
+
+
+# ---------------------------------------------------------------------------
+# DID Document Registry (did:hub:<agent_id>)
+# Implements GET /.well-known/did.json and POST to register DID docs
+# ---------------------------------------------------------------------------
+
+@app.route("/agents/<agent_id>/.well-known/did.json", methods=["GET"])
+def get_did_doc(agent_id):
+    """Resolve a DID document for did:hub:<agent_id>. No auth required (public).
+
+    Returns the registered DID document or 404 if none registered yet.
+    Follows W3C DID Core spec — service.endpoint maps to Hub messaging.
+    """
+    agents = load_agents()
+    if agent_id not in agents:
+        return jsonify(_behavioral_404("agent")), 404
+
+    docs = _load_did_docs()
+    doc = docs.get(agent_id)
+    if not doc:
+        return jsonify({
+            "error": "DID document not found",
+            "did": f"did:hub:{agent_id}",
+            "message": f"No DID document registered for agent '{agent_id}'. POST to this endpoint to register one."
+        }), 404
+
+    return jsonify(doc)
+
+
+@app.route("/agents/<agent_id>/.well-known/did.json", methods=["POST"])
+def register_did_doc(agent_id):
+    """Register a DID document for did:hub:<agent_id>. Auth by agent secret.
+
+    Body: {
+        "secret": "agent_secret",
+        "did": "did:hub:<agent_id>",
+        "document": { ... W3C DID Document ... }
+    }
+
+    Validates that the document id field matches the expected did:hub:<agent_id>.
+    One document per agent ( PUT-style — overwrites previous registration).
+    """
+    data = request.get_json() or {}
+    secret = data.get("secret", "")
+    agents = load_agents()
+
+    if agent_id not in agents:
+        return jsonify({"ok": False, "error": "Agent not found"}), 404
+    if agents[agent_id].get("secret") != secret:
+        return jsonify({"ok": False, "error": "Invalid secret"}), 403
+
+    doc = data.get("document", {})
+    expected_did = f"did:hub:{agent_id}"
+    doc_id = doc.get("id", "")
+
+    if not doc:
+        return jsonify({"ok": False, "error": "document field required (W3C DID Document)"}), 400
+    if doc_id != expected_did:
+        return jsonify({
+            "ok": False,
+            "error": f"DID id mismatch. Expected '{expected_did}', got '{doc_id}'"
+        }), 400
+
+    record = {
+        "agent_id": agent_id,
+        "did": expected_did,
+        "document": doc,
+        "registered_at": datetime.utcnow().isoformat() + "Z",
+        "updated_at": datetime.utcnow().isoformat() + "Z",
+    }
+
+    docs = _load_did_docs()
+    docs[agent_id] = record
+    _save_did_docs(docs)
+
+    return jsonify({
+        "ok": True,
+        "agent_id": agent_id,
+        "did": expected_did,
+        "document_url": f"/agents/{agent_id}/.well-known/did.json",
+        "message": f"DID document registered. Resolve at GET /agents/{agent_id}/.well-known/did.json"
+    }), 201
+
+
+@app.route("/agents/<agent_id>/.well-known/did.json", methods=["DELETE"])
+def delete_did_doc(agent_id):
+    """Delete a registered DID document. Auth by agent secret."""
+    data = request.get_json() or {}
+    secret = data.get("secret", "")
+    agents = load_agents()
+
+    if agent_id not in agents:
+        return jsonify({"ok": False, "error": "Agent not found"}), 404
+    if agents[agent_id].get("secret") != secret:
+        return jsonify({"ok": False, "error": "Invalid secret"}), 403
+
+    docs = _load_did_docs()
+    if agent_id in docs:
+        del docs[agent_id]
+        _save_did_docs(docs)
+
+    return jsonify({"ok": True, "agent_id": agent_id, "message": "DID document deleted"})
 
 
 @app.route("/agents/<agent_id>/pubkeys/<key_id>", methods=["DELETE"])
@@ -13088,7 +13209,7 @@ def advance_obligation(obl_id):
                 if not cp_info:
                     print(f"[SETTLEMENT-Q] {obl_id_safe}: counterparty {counterparty_safe} not found in agents")
                     return
-                recipient_wallet = cp_info.get("wallet") or cp_info.get("hub_profile", {}).get("wallet")
+                recipient_wallet = cp_info.get("wallet") or cp_info.get("hub_profile", {}).get("wallet") or cp_info.get("solana_wallet")
                 if not recipient_wallet:
                     print(f"[SETTLEMENT-Q] {obl_id_safe}: no wallet for counterparty {counterparty_safe}")
                     return
