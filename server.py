@@ -11996,6 +11996,8 @@ def create_obligation():
         "role_categories": data.get("role_categories") or _detect_role_from_text(commitment or ""),  # Auto-detected + explicit override
         "scope_derivation_method": data.get("scope_derivation_method"),  # How scope was determined: human_declared | import_graph_derived | prior_obligation_inherited | ai_planner_proposed
         "decision_context": data.get("decision_context"),         # One-liner: why this path over alternatives. Prevents re-deriving experimental design after cold-start reset.
+        # Phase 3: settlement amount (fixed for Tier 3, set at creation; null for Tier 1/2)
+        "stake_amount": data.get("stake_amount"),
         "scope_violations": [],                                    # Tool calls attempted outside declared scope
         "scope_expansion_log": [],                                 # Approved scope expansions with reasons: [{"expanded_to": ..., "reason": ..., "tier": ..., "approved_by": ..., "at": ...}]
         "evidence_refs": [],
@@ -13174,6 +13176,103 @@ def advance_obligation(obl_id):
 
 
     save_obligations(obls)
+
+    # ── Phase 3: Async Settlement Queue ──────────────────────────────────────
+    # Triggered when obligation reaches 'resolved' AND has a stake_amount.
+    # Fires SPL transfer via Hub operator keypair, then attaches tx_signature
+    # to the settlement event on the obligation record.
+    # Deferred: actual SPL movement until mint address confirmed by Hands.
+    if new_status == "resolved" and obl.get("stake_amount"):
+        import threading, traceback
+        obl_id_safe = obl_id
+        stake_amount_safe = obl.get("stake_amount", 0)
+        counterparty_safe = obl.get("counterparty")
+
+        def _settlement_worker():
+            """Background worker: enqueue and fire settlement tx."""
+            try:
+                # Reload obligation (may have changed since we saved)
+                obls_worker = load_obligations()
+                obl_w = next((o for o in obls_worker if o.get("obligation_id") == obl_id_safe), None)
+                if not obl_w:
+                    print(f"[SETTLEMENT-Q] Obligation {obl_id_safe} not found in worker")
+                    return
+
+                # Skip if already settled
+                if obl_w.get("settlement", {}).get("tx_signature"):
+                    print(f"[SETTLEMENT-Q] {obl_id_safe} already has settlement tx, skipping")
+                    return
+
+                # Import send_hub here to avoid import-time crash if solana libs missing
+                try:
+                    import importlib
+                    hub_spl = importlib.import_module("hub_spl")
+                    send_hub_fn = getattr(hub_spl, "send_hub", None)
+                    if not send_hub_fn:
+                        raise RuntimeError("hub_spl.send_hub not found")
+                except Exception as hub_err:
+                    print(f"[SETTLEMENT-Q] {obl_id_safe}: hub_spl unavailable ({hub_err}) — settlement queued for retry")
+                    return
+
+                # Get counterparty wallet address
+                agents_w = load_agents()
+                cp_info = agents_w.get(counterparty_safe) if isinstance(agents_w, dict) else None
+                if not cp_info:
+                    print(f"[SETTLEMENT-Q] {obl_id_safe}: counterparty {counterparty_safe} not found in agents")
+                    return
+                recipient_wallet = cp_info.get("wallet") or cp_info.get("hub_profile", {}).get("wallet")
+                if not recipient_wallet:
+                    print(f"[SETTLEMENT-Q] {obl_id_safe}: no wallet for counterparty {counterparty_safe}")
+                    return
+
+                print(f"[SETTLEMENT-Q] {obl_id_safe}: firing {stake_amount_safe} HUB → {recipient_wallet}")
+                result = send_hub_fn(recipient_wallet, stake_amount_safe)
+
+                # Reload again before writing settlement
+                obls_final = load_obligations()
+                obl_f = next((o for o in obls_final if o.get("obligation_id") == obl_id_safe), None)
+                if not obl_f:
+                    return
+
+                now_w = datetime.utcnow().isoformat() + "Z"
+                settlement_state = "posted" if result.get("success") else "failed"
+                settlement_entry = {
+                    "settlement_type": "hub_spl_transfer",
+                    "settlement_currency": "HUB",
+                    "settlement_amount": stake_amount_safe,
+                    "recipient": recipient_wallet,
+                    "tx_signature": result.get("signature"),
+                    "tx_state": settlement_state,
+                    "tx_error": result.get("error") if not result.get("success") else None,
+                    "solscan_url": result.get("solscan", f"https://solscan.io/tx/{result.get('signature', '')}") if result.get("success") else None,
+                    "settlement_state": "posted",
+                    "settlement_state_reason": "success" if result.get("success") else f"transfer_failed: {result.get('error', 'unknown')}",
+                    "attached_by": "hub_settlement_queue",
+                    "attached_at": now_w,
+                    "queue_protocol": "Phase 3 async settlement queue v1",
+                }
+                obl_f["settlement"] = settlement_entry
+                obl_f.setdefault("history", []).append({
+                    "action": "settlement_fired_by_queue",
+                    "by": "hub_settlement_queue",
+                    "timestamp": now_w,
+                    "tx_signature": result.get("signature"),
+                    "amount": stake_amount_safe,
+                    "recipient": recipient_wallet,
+                    "state": settlement_state,
+                })
+                save_obligations(obls_final)
+                if result.get("success"):
+                    print(f"[SETTLEMENT-Q] {obl_id_safe}: settled {stake_amount_safe} HUB → {recipient_wallet}, tx={result.get('signature')}")
+                else:
+                    print(f"[SETTLEMENT-Q] {obl_id_safe}: settlement FAILED — {result.get('error')}")
+
+            except Exception as e:
+                print(f"[SETTLEMENT-Q] {obl_id_safe}: unexpected error: {e}\n{traceback.format_exc()}")
+
+        t = threading.Thread(target=_settlement_worker, daemon=True)
+        t.start()
+        print(f"[SETTLEMENT-Q] {obl_id}: enqueued settlement of {obl.get('stake_amount')} HUB → {obl.get('counterparty')} (async)")
 
     # ── Hub VerifiableCredential on resolution ─────────────────────────────────
     # Produce a self-verifying hub_vc at resolution time.
