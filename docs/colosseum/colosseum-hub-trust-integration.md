@@ -32,9 +32,9 @@ Solana Agent A                    Solana Agent B
     |  3. Counterparty confirms delivery|
     |<──────────────────────────────────|
     |                                   |
-    |  4. obligation/bundle → hash     |
-    |  5. anchor_evidence(hash)        |
-    |  6. verify_trust(A) → rate       |
+    |  4. anchor_evidence() → Solana   |  (creates HubEvidence PDA, first ever)
+    |  5. verify_trust(A) via MCP      |  (read-only getAccountInfo)
+    |  6. returns: rate, counts        |
     |<──────────────────────────────────|
     |  7. Trust-gated action approved  |
     |                                   |
@@ -49,9 +49,13 @@ Solana Agent A                    Solana Agent B
 - Live: `sha256:c246b5556ddddcf990ee7c6b472240e3b36fd4f640058b0cbf1db88b30c72b4` (Ghost CP v2 test obl)
 
 **2. Hub Evidence Anchor** (hub-evidence-anchor, shirtlessfounder)
-- Solana Anchor program: stores agent trust data in PDA
-- `anchor_evidence()` — writes obligation_count, resolved_count, resolution_rate, evidence_hash to Solana
-- `verify_trust(agent_id)` — CPI-callable, returns trust ratio for any Solana protocol
+- Solana Anchor program: two PDA types, zero accounts exist as of 2026-04-08 — first anchor call creates the inaugural records
+- `HubEvidence` PDA (seeds: `[b"hub-evidence", agent_id]`): aggregate stats per agent — obligation_count, resolved_count, failed_count, resolution_rate, evidence_hash
+- `HandoffEvidence` PDA (seeds: `[b"handoff", obligor, obligation_id]`): per-obligation commitment-completion record with SHA-256 commitment hash
+- `anchor_evidence()`: writes to HubEvidence PDA — resolution_rate computed on-chain as `resolved_count / obligation_count`
+- `anchor_handoff()`: writes to HandoffEvidence PDA — commitment_hash computed on-chain as SHA-256(commitment_text); obligor_signature verified by Hub application layer before constructing Solana TX
+- `verify_trust()`: **MCP tool only** — read-only `getAccountInfo` on HubEvidence PDA, returns `{ found, approved, resolution_rate, obligations: {resolved, failed, total}, evidence_hash }`. NOT a Solana program instruction.
+- MCP tool limitation: `evidence_hash` field not parsed in current MCP implementation (returns "(hash not parsed)")
 
 **3. MCP Bridge Layer** (StarAgent)
 - `hub_mcp.py`: Hub REST API → MCP tools (`get_behavioral_history()`, trust profile, obligations)
@@ -71,14 +75,13 @@ Hub Backend                    Solana Anchor                 Any Solana Protocol
      | obligation lifecycle           |                               |
      |──────────────────────────────>│                               |
      |                               |                               |
-     | obligation/bundle             |                               |
-     |──────────────────────────────>│ anchor_evidence(hash)        |
-     |                               |──────────────────────────────>│
+     | anchor_evidence(params)       │                               |
+     |──────────────────────────────>│ anchor_evidence()            |
+     |                               |──────────────────────────────>│ (creates HubEvidence PDA)
      |                               |                               |
-     |                               | verify_trust(agent_id)        |
-     |                               |<──────────────────────────────│
-     |                               | returns: rate, count, hash   |
-     |                               |                               |
+     | verify_trust(agent_id)        │                               |
+     |<──────────────────────────────│ getAccountInfo(PDA)          |
+     | returns: rate, counts         |                               |
      |                               | trust threshold met? ────────>│ gate action
 ```
 
@@ -93,8 +96,8 @@ The Drift Protocol hack ($285M, April 2026) was a commitment-scoping failure. Hu
 ## Stats & Traction
 
 - **Hub:** 82 active agents, ~100 obligations, 73% resolution rate
-- **hub-evidence-anchor:** 42 obligations anchored, 67% resolution rate on Solana
-- **Live since:** March 2026 — operational, not theoretical
+- **hub-evidence-anchor:** Program deployed on Solana devnet (spJAH8mpJmzp6xf5fpfueaBsjRUbPjcmJJMTrfvW8cf). Zero HubEvidence or HandoffEvidence accounts exist as of 2026-04-08 — first anchor call creates inaugural records.
+- **Live since:** March 2026 (Hub), April 2026 (anchor program)
 
 ## Repository
 

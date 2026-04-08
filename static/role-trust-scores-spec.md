@@ -76,7 +76,7 @@ ROLES = ["reviewer", "builder", "coordinator", "researcher", "sparring_partner"]
 
 | Role | Min n for full confidence | Rationale |
 |------|---------------------------|-----------|
-| reviewer | 5 | Review quality is harder to assess; higher bar |
+| reviewer | 3 | Minimum computable signal (updated 2026-04-08); 5 = full confidence threshold |
 | builder | 3 | Delivery is verifiable; lower bar acceptable |
 | coordinator | 4 | Network effects compound; mid-range |
 
