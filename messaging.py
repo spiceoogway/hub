@@ -41,6 +41,9 @@ on_agent_registered = EventHook()
 # (agent_id, message_id, sender_id)
 on_message_read = EventHook()
 
+# (agent_id, message_id, sender_id, ack_type, runtime_id)
+on_message_acked = EventHook()
+
 # (agent_id, event_type, metadata_dict_or_None)
 on_agent_event = EventHook()
 
@@ -393,6 +396,39 @@ def _mark_sent_records_read(sender_id, recipient_id, message_ids, read_at=None):
             if record.get("delivery_state") != next_state:
                 record["delivery_state"] = next_state
                 changed = True
+        return changed
+
+    return _mutate_sent_records(sender_id, recipient_id, _mutate)
+
+
+def _mark_sent_records_session_loaded(sender_id, recipient_id, message_ids, loaded_at=None, runtime_id=None):
+    """Mark sent records as session_loaded (passive ack from recipient runtime).
+
+    Updates delivery_state to 'session_loaded' unless already at a higher state (read).
+    Parallel to _mark_sent_records_read but does NOT set read=True.
+    """
+    message_id_set = {m for m in message_ids if m}
+    if not message_id_set:
+        return False
+    loaded_at = loaded_at or (datetime.utcnow().isoformat() + "Z")
+
+    def _mutate(records):
+        changed = False
+        for record in records:
+            if record.get("message_id") not in message_id_set:
+                continue
+            # Don't downgrade: if already read, skip
+            if record.get("read"):
+                continue
+            # Don't re-ack: if already session_loaded, skip (idempotent)
+            if record.get("session_loaded"):
+                continue
+            record["session_loaded"] = True
+            record["session_loaded_at"] = loaded_at
+            if runtime_id:
+                record["session_runtime_id"] = runtime_id
+            record["delivery_state"] = "session_loaded"
+            changed = True
         return changed
 
     return _mutate_sent_records(sender_id, recipient_id, _mutate)
@@ -1440,6 +1476,76 @@ def mark_message_read(agent_id, message_id):
     return jsonify({"ok": True, "message_id": message_id, "read": True})
 
 
+@messaging_bp.route("/agents/<agent_id>/messages/<message_id>/ack", methods=["POST"])
+def ack_message(agent_id, message_id):
+    """Passive ACK: recipient runtime reports that a message was loaded into session.
+
+    This is the session_loaded signal — it tells the sender that the recipient's
+    runtime actually consumed the message from the inbox into an active session.
+    Fire-and-forget from the runtime's perspective.
+
+    Does NOT mark the message as read (read is a separate, explicit action).
+    Idempotent: calling ack twice returns the same result.
+    """
+    secret = request.args.get("secret") or request.headers.get("X-Agent-Secret")
+    data = request.get_json(force=True, silent=True) or {}
+    secret = secret or data.get("secret", "")
+
+    agents = load_agents()
+    if agent_id not in agents:
+        return jsonify({"ok": False, "error": "Agent not found"}), 404
+    if agents[agent_id].get("secret") != secret:
+        return jsonify({"ok": False, "error": "Invalid secret"}), 403
+
+    ack_type = data.get("ack_type", "session_loaded")
+    runtime_id = data.get("runtime_id")
+    loaded_at = datetime.utcnow().isoformat() + "Z"
+
+    # Find message in inbox and mark session_loaded
+    found = False
+    sender_id = None
+    already_acked = False
+    with _exclusive_file_lock(_inbox_lock_path(agent_id)):
+        inbox = load_inbox(agent_id)
+        for m in inbox:
+            if m.get("id") == message_id:
+                found = True
+                sender_id = m.get("from")
+                if m.get("session_loaded"):
+                    already_acked = True
+                else:
+                    m["session_loaded"] = True
+                    m["session_loaded_at"] = loaded_at
+                    if runtime_id:
+                        m["session_runtime_id"] = runtime_id
+                break
+        if found and not already_acked:
+            _save_inbox_unlocked(agent_id, inbox)
+
+    if not found:
+        return jsonify({"ok": False, "error": "Message not found"}), 404
+
+    # Propagate to sender's sent records (fire-and-forget)
+    if sender_id and not already_acked:
+        try:
+            _mark_sent_records_session_loaded(sender_id, agent_id, [message_id], loaded_at, runtime_id)
+        except Exception as e:
+            print(f"[PASSIVE-ACK] Failed to propagate session_loaded for {message_id}: {e}")
+
+    # Fire event hook
+    if not already_acked:
+        on_message_acked.fire(agent_id, message_id, sender_id, ack_type, runtime_id)
+
+    return jsonify({
+        "ok": True,
+        "message_id": message_id,
+        "ack_type": ack_type,
+        "acked_at": loaded_at,
+        "delivery_state": "session_loaded",
+        "already_acked": already_acked,
+    })
+
+
 @messaging_bp.route("/agents/<agent_id>/messages/<message_id>", methods=["DELETE"])
 def delete_inbox_message(agent_id, message_id):
     """Delete a message from your inbox."""
@@ -1567,6 +1673,7 @@ def get_sent_messages(agent_id):
 
     to_filter = request.args.get("to")
     delivery_filter = request.args.get("delivery_status")
+    session_loaded_filter = request.args.get("session_loaded")  # "true"/"false" — filter by passive ack status
     since_filter = request.args.get("since")
     topic_filter = request.args.get("topic")
     limit = min(int(request.args.get("limit", 50)), 200)
@@ -1575,6 +1682,9 @@ def get_sent_messages(agent_id):
 
     if delivery_filter:
         records = [r for r in records if r.get("delivery_state") == delivery_filter]
+    if session_loaded_filter is not None:
+        want_loaded = session_loaded_filter.lower() in ("true", "1", "yes")
+        records = [r for r in records if bool(r.get("session_loaded")) == want_loaded]
     if since_filter:
         records = [r for r in records if r.get("timestamp", "") >= since_filter]
     if topic_filter:
