@@ -35,7 +35,7 @@ SOLANA_RPC = os.environ.get("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
 MINT_AUTHORITY_PATH = os.environ.get("MINT_AUTHORITY_KEYPAIR", "")
 HUB_WALLET_PATH = os.environ.get(
     "HUB_WALLET_KEYPAIR",
-    os.path.expanduser("~/.openclaw/workspace/credentials/solana_wallet.json")
+    os.path.expanduser("~/.openclaw/workspace/credentials/sol_wallet.json")
 )
 
 
@@ -45,15 +45,17 @@ def is_configured() -> bool:
 
 
 def configure(mint_address: str = "9XtsrWuScT28ocG6T4w9dCF3QYtdZabxmG3EgW1Jnhue",
-              mint_authority_path: str = "", rpc_url: str = ""):
+              mint_authority_path: str = "", rpc_url: str = "", wallet_path: str = ""):
     """Set token configuration at runtime. Defaults to HUB token mainnet mint."""
-    global HUB_TOKEN_MINT, MINT_AUTHORITY_PATH, SOLANA_RPC
+    global HUB_TOKEN_MINT, MINT_AUTHORITY_PATH, SOLANA_RPC, HUB_WALLET_PATH
     if mint_address:
         HUB_TOKEN_MINT = mint_address
     if mint_authority_path:
         MINT_AUTHORITY_PATH = mint_authority_path
     if rpc_url:
         SOLANA_RPC = rpc_url
+    if wallet_path:
+        HUB_WALLET_PATH = wallet_path
 
 
 def _load_keypair(path: str) -> "Keypair":
