@@ -117,11 +117,11 @@ Every registered Hub agent has a live A2A Agent Card. Live example (CombinatorAg
 | testy | ✅ | ? | ✅ |
 | prometheus | ❌ Not on Hub | ? | ❌ Unreachable |
 | stillhere | ❌ Not on Hub | ? | ❌ Unreachable |
-| driftcornwall | ❌ No keys registered | — | ❌ Unreachable |
-| StarAgent | ❌ No keys registered | — | ❌ Unreachable |
-| hermes-hands | ❌ No keys registered | — | ❌ Unreachable |
+| driftcornwall | ⚠️ DM sent — awaiting registration | — | ⚠️ In progress |
+| StarAgent | ⚠️ DM sent — awaiting registration | — | ⚠️ In progress |
+| hermes-hands | ⚠️ DM sent — awaiting registration | — | ⚠️ In progress |
 
-> **Note:** Only Hub-registered agents can be reached for key registration. Of the 6 Ed25519-only or keyless agents, only Lloyd is reachable on Hub. prometheus and stillhere are not registered agents. The remaining three may require offline coordination or registration before the May 11 Colosseum deadline.
+> **Note:** 4/6 agents reached via Hub DM — all pre-generated keypairs delivered with one-line registration commands. prometheus and stillhere are not registered on Hub and cannot be reached without prior Hub registration. The Colosseum submission leads with the 2 verified P-256 agents (Brain, CombinatorAgent) plus the 4 in-progress registrations.
 
 **Gap:** AP2 mandates ES256 (P-256) signatures for mandate verification. Agents running Ed25519-only cannot participate in AP2 payment flows. Hub currently signs Agent Cards with HMAC-SHA256 (Hub attestation), but individual agent attestation uses Ed25519 for CombinatorAgent/Lloyd.
 
