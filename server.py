@@ -13462,6 +13462,12 @@ def advance_obligation(obl_id):
                 sign_copy.pop("_export_meta", None)
                 canonical_bundle = json.dumps(sign_copy, sort_keys=True, separators=(",", ":"))
                 evidence_hash = "sha256:" + hashlib.sha256(canonical_bundle.encode("utf-8")).hexdigest()
+                # commitment_hash: SHA-256 of decision_context (human-readable commitment anchor)
+                # Only present when obligation includes a handoff_schema decision_context field
+                commitment_hash = None
+                decision_context = obl.get("decision_context")
+                if decision_context:
+                    commitment_hash = "sha256:" + hashlib.sha256(decision_context.encode("utf-8")).hexdigest()
                 # Canonical VC payload (sign this)
                 vc_data = {
                     "obligation_id": obl["obligation_id"],
@@ -13471,6 +13477,8 @@ def advance_obligation(obl_id):
                     "evidence_refs": list(obl.get("evidence_refs", [])),
                     "evidence_hash": evidence_hash,
                 }
+                if commitment_hash:
+                    vc_data["commitment_hash"] = commitment_hash
                 canonical_vc = json.dumps(vc_data, sort_keys=True, separators=(",", ":"))
                 signature = private_key.sign(canonical_vc.encode("utf-8"))
                 hub_vc = {
@@ -13481,9 +13489,11 @@ def advance_obligation(obl_id):
                     "signed_fields": list(vc_data.keys()),
                     "signature": _b64.b64encode(signature).decode(),
                     "evidence_hash": evidence_hash,
-                    "verification": "Canonicalize vc_data (sort_keys), verify Ed25519 against public_key. Canonical bundle SHA-256 must match evidence_hash.",
+                    "verification": "Canonicalize vc_data (sort_keys), verify Ed25519 against public_key. Canonical bundle SHA-256 must match evidence_hash. commitment_hash (when present) is SHA-256 of decision_context text — verify against the decision_context field in the bundle.",
                     "bundle_url": f"/obligations/{obl_id}/bundle",
                 }
+                if commitment_hash:
+                    hub_vc["commitment_hash"] = commitment_hash
         except Exception as e:
             print(f"[HUB-VC] Failed to produce hub_vc for {obl_id}: {e}")
 
@@ -17136,8 +17146,27 @@ def route_work():
         recency = _recency_score(agent_id)
         completion = _completion_rate(agent_id)
 
-        # Weighted composite (from spec: 0.6 topic, 0.2 recency, 0.2 completion)
-        score = topic * 0.6 + recency * 0.2 + completion * 0.2
+        # Declared capability match — computed for ALL agents, not just those with trust profiles.
+        # Bug fix (CombinatorAgent routing audit, Apr 6 2026): ColonistOne excluded from
+        # cross-platform-research queries despite explicit declared_capabilities overlap.
+        # capability_match_count was surfaced but never weighted into context_score.
+        agents_reg = load_agents()
+        capability_match_count = 0
+        declared_capabilities = []
+        if agent_id in agents_reg:
+            declared = agents_reg[agent_id].get("capabilities", [])
+            if declared and work_keywords:
+                matched = [c for c in declared if any(c.lower() in kw or kw in c.lower() for kw in work_keywords)]
+                capability_match_count = len(matched)
+                declared_capabilities = declared
+
+        # Normalize capability bonus: 1+ matches = up to +0.1 boost, capped.
+        # Scales with explicit declared capabilities; 1 match = +0.1, 2+ = +0.1 (capped).
+        capability_bonus = min(capability_match_count / 10.0, 0.10)
+
+        # Weighted composite: 0.5 topic, 0.2 recency, 0.2 completion, 0.1 capability match.
+        # Adjusted from 0.6/0.2/0.2 — explicit declared capability now earns its own signal.
+        score = topic * 0.5 + recency * 0.2 + completion * 0.2 + capability_bonus
         # Routing dividend: Trust Olympics Tier 3 completion = +5% boost
         if _has_trust_olympics_tier3(agent_id):
             score = min(score * (1 + TRUST_OLYMPICS_BOOST), 1.0)  # cap at 1.0
@@ -17163,6 +17192,10 @@ def route_work():
                 "recency": round(recency, 3),
                 "hours_since_active": round((1.0 - recency) * 168, 1) if recency > 0 else None,
                 "completion_rate": round(completion, 3),  # resolved / accepted obligations
+                # Declared capability match — now included in context_score for ALL agents.
+                "declared_capabilities": declared_capabilities,
+                "capability_match_count": capability_match_count,
+                "capability_bonus": round(capability_bonus, 3),
             },
         }
 
@@ -17184,14 +17217,6 @@ def route_work():
             )
             if olympics_bonus:
                 candidate["signals"]["trust_olympics_tier3"] = True
-            # Declared capability match (from agent registry)
-            agents = load_agents()
-            if agent_id in agents:
-                declared = agents[agent_id].get("capabilities", [])
-                if declared and work_keywords:
-                    matched = [c for c in declared if any(c.lower() in kw or kw in c.lower() for kw in work_keywords)]
-                    candidate["signals"]["declared_capabilities"] = declared
-                    candidate["signals"]["capability_match_count"] = len(matched)
         candidates.append(candidate)
 
     # Sort by score descending
