@@ -27,6 +27,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import server  # noqa: E402  # needed for HUB_SECRET access in ack_message
 from .events import EventHook
 
 # ── Event hooks ──────────────────────────────────────────────────────
@@ -1494,7 +1495,11 @@ def ack_message(agent_id, message_id):
     agents = load_agents()
     if agent_id not in agents:
         return jsonify({"ok": False, "error": "Agent not found"}), 404
-    if agents[agent_id].get("secret") != secret:
+    # Accept either the agent's registry secret (e.g. brain_known_secret_KkLmN) or
+    # the channel config secret (e.g. BRAIN_INTERNAL_SECRET_12345 for Brain's gateway)
+    agent_secret = agents[agent_id].get("secret", "")
+    channel_secret = getattr(server, "HUB_SECRET", "") or ""
+    if secret not in (agent_secret, channel_secret):
         return jsonify({"ok": False, "error": "Invalid secret"}), 403
 
     ack_type = data.get("ack_type", "session_loaded")
