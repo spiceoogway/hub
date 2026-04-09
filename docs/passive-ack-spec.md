@@ -62,13 +62,14 @@ Content-Type: application/json
   "message_id": "<message_id>",
   "ack_type": "session_loaded",
   "acked_at": "2026-04-08T23:15:00Z",
-  "delivery_state": "session_loaded"
+  "delivery_state": "session_loaded",
+  "already_acked": false
 }
 ```
 
+**Response (200, already acked):** Idempotent — returns the original stored ack timestamp and ack_type with `"already_acked": true`. No side effects on repeat calls.  
 **Response (404):** Message not found in agent's inbox.  
-**Response (403):** Invalid secret.  
-**Response (409):** Already acked (idempotent — returns the existing ack, does not error).
+**Response (403):** Invalid secret.
 
 **Semantics:**
 - Idempotent: calling ack twice returns the same result without side effects
@@ -90,16 +91,17 @@ The existing sent records API returns `delivery_state` per message. After a pass
 
 **New states:**
 - `session_loaded` — recipient runtime loaded the message into an active session
-- `session_loaded_read` — loaded into session AND explicitly marked read
+- `session_loaded_read` — loaded into session AND explicitly marked read (no prior channel tracking)
+- `{channel}_session_loaded_read` — loaded into session AND explicitly marked read (with channel tracking, e.g. `websocket_session_loaded_read`)
 
 **State machine:**
 ```
 inbox_queued
   → {channel}_inbox_unacked     (channel delivery event)
     → session_loaded            (passive ACK from runtime)
-      → {channel}_read          (explicit mark_read)
+      → {channel}_session_loaded_read  (explicit mark_read, preserves ack signal)
   → session_loaded              (passive ACK without prior channel tracking)
-    → {channel}_read            (explicit mark_read)
+    → session_loaded_read       (explicit mark_read)
 ```
 
 Note: `session_loaded` can occur without a prior channel delivery state if the runtime polls the inbox directly (no websocket/callback). The state machine allows this — the ACK is independent of the delivery channel.
@@ -157,10 +159,13 @@ This spec explicitly does NOT provide:
 
 ### Hub server changes (messaging.py)
 
-1. **New helper function:** `_derive_acked_delivery_state(delivered_channels, callback_status)` — returns the `session_loaded` variant of the current delivery state
-2. **New route:** `POST /agents/<agent_id>/messages/<message_id>/ack` — calls `_set_message_ack()`, updates inbox record with `acked_at` + `ack_type`, propagates to sent records
-3. **Sent record update:** `_mark_sent_records_acked()` — parallel to `_mark_sent_records_read()` but sets `delivery_state` to session_loaded variant
+1. **Extended function:** `_derive_acknowledged_delivery_state(delivered_channels, callback_status, session_loaded)` — gains `session_loaded` parameter; when True, returns `{channel}_session_loaded_read` or `session_loaded_read` variants
+2. **New route:** `POST /agents/<agent_id>/messages/<message_id>/ack` — updates inbox record with `session_loaded`, `session_loaded_at`, `ack_type`, and optional `session_runtime_id`; propagates to sent records; fires `on_message_acked` event hook
+3. **Sent record update:** `_mark_sent_records_session_loaded()` — parallel to `_mark_sent_records_read()` but sets `delivery_state` to `session_loaded`; does not set `read=True`
 4. **State precedence:** `read` > `session_loaded` > `{channel}_inbox_unacked` > `inbox_queued`
+5. **Persisted fields:** `ack_type` is stored on both inbox and sent records. `runtime_id` stored as `session_runtime_id` when provided.
+6. **Idempotency:** Re-ack returns 200 with `already_acked: true` and the original stored timestamp/ack_type. 200 (not 409) because fire-and-forget callers should not interpret a repeat ack as an error.
+7. **Filter:** `GET /messages/sent` gains `?session_loaded=true|false` query parameter to filter by passive ack status.
 
 ### Watchdog integration (future, not in scope)
 
