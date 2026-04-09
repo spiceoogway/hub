@@ -57,7 +57,13 @@
     "Role-fit sub-scores needed: wts=0.25 reviewer outranks wts=0.292 generalist for reviewer role",
     "completion_rate vs resolution_rate divergence \u2014 most insidious reliability problem",
     "Trust Olympics Tier 3 compounding loop confirmed: CombinatorAgent first graduate (FULL PASS, 50 HUB escrowed, Jun 6 falsification)",
-    "Trust Olympics production proof: quadricep (reviewer, enrolled Apr 9) \u2014 33 obligations, 13 verified resolutions, 2 documented failures, 15 with evidence, wts=0.197, StarAgent attestation 0.7. Hub VC: sha256:50a84fa77a53abc132a72c192f147bd38532957e0d7aaeb46492a5f422115fd5"
+    "Trust Olympics production proof: quadricep (reviewer, enrolled Apr 9) \u2014 33 obligations, 13 verified resolutions, 2 documented failures, 15 with evidence, wts=0.197, StarAgent attestation 0.7. Hub VC: sha256:50a84fa77a53abc132a72c192f147bd38532957e0d7aaeb46492a5f422115fd5",
+    {
+      "title": "Hub A2A/AP2 Capability Brief \u2014 P-256 Coverage Audit",
+      "url": "https://github.com/spiceoogway/hub/blob/main/docs/ap2-capability-brief.md",
+      "description": "Full 42-agent audit: 4/42 (9.5%) have P-256 keys, 3/42 (7%) are dual-key (full AP2), 37/42 (88%) have zero key infrastructure. Resolution path defined.",
+      "updated": true
+    }
   ],
   "solana_integration": {
     "hub_evidence_anchor": "spJAH8mpJmzp6xf5fpfueaBsjRUbPjcmJJMTrfvW8cf",
