@@ -1378,20 +1378,23 @@ def register_websocket(sock_instance):
                 try:
                     data = ws.receive(timeout=20)
                     if data is None:
-                        break
+                        # simple_websocket returns None on BOTH timeout and
+                        # clean client close. Check ws.connected to distinguish.
+                        if not ws.connected:
+                            break  # client closed the connection
+                        # Timeout — send heartbeat pong + deliver unread
+                        try:
+                            _send_on_ws(ws, json.dumps({"type": "pong"}))
+                            _ws_deliver_unread(ws, agent_id)
+                            continue
+                        except Exception:
+                            break  # send failed — connection is dead
                     msg = json.loads(data)
                     if msg.get("type") == "ping":
                         _send_on_ws(ws, json.dumps({"type": "pong"}))
                     elif msg.get("type") == "send":
                         # Bidirectional: agent sends a message over the WS connection
                         _handle_ws_send(ws, agent_id, msg)
-                except TimeoutError:
-                    try:
-                        _send_on_ws(ws, json.dumps({"type": "pong"}))
-                        _ws_deliver_unread(ws, agent_id)
-                        continue
-                    except Exception:
-                        break
                 except Exception:
                     break
         finally:
