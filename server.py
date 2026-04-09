@@ -2885,7 +2885,12 @@ def a2a_agent_card():
                 "unprompted_contribution_rate",
                 "collaboration_partners_count",
                 "ed25519_signed_obligation_exports",
+                "es256_signed_obligation_exports",
             ],
+            "signingKeys": {
+                "es256": "https://admin.slate.ceo/oc/brain/hub/signing-key-p256",
+                "ed25519": "https://admin.slate.ceo/oc/brain/hub/signing-key"
+            },
         }
     except Exception:
         pass
@@ -6555,6 +6560,7 @@ def agent_card_legacy():
     return redirect("/.well-known/agent-card.json", code=301)
 
 
+@app.route("/agents/<agent_id>/a2a-card", methods=["GET"])
 @app.route("/agents/<agent_id>/.well-known/agent-card.json", methods=["GET"])
 def per_agent_card(agent_id):
     """Per-agent A2A Agent Card — auto-generated from Hub registration + behavioral data."""
@@ -6716,6 +6722,34 @@ def per_agent_card(agent_id):
 
     # Last active timestamp
     hub_profile["registeredAt"] = agent.get("registered_at")
+
+    # --- Inline pubkeys from Hub's key store (A2A outbound signing keys) ---
+    try:
+        pubkeys_store = _load_pubkeys()
+        agent_keys = pubkeys_store.get(agent_id, [])
+        active_agent_keys = [k for k in agent_keys if k.get("active", True)]
+        if active_agent_keys:
+            card_pubkeys = []
+            for k in active_agent_keys:
+                key_entry = {
+                    "keyId": k.get("key_id", ""),
+                    "algorithm": k.get("algorithm", ""),
+                    "label": k.get("label", ""),
+                    "active": k.get("active", True),
+                    "createdAt": k.get("created_at", ""),
+                    "publicKey": k.get("public_key", ""),
+                }
+                # Include JWS proof block for P-256 keys
+                if k.get("algorithm") in ("ES256", "ECDSA_P256", "P-256"):
+                    key_entry["proofType"] = "ES256 JWS"
+                    key_entry["proofNote"] = "Sign card with P-256 private key (ES256 JWS), verify against publicKey"
+                elif k.get("algorithm") in ("Ed25519", "EDDSA"):
+                    key_entry["proofType"] = "Ed25519"
+                    key_entry["proofNote"] = "Sign card_hash with Ed25519 private key, verify against publicKey"
+                card_pubkeys.append(key_entry)
+            card["pubkeys"] = card_pubkeys
+    except Exception:
+        pass  # Non-critical — don't break the card if pubkeys unavailable
 
     # --- Inline capability profile from collaboration/capabilities data ---
     try:
@@ -12428,47 +12462,96 @@ def check_obligation_frame(obl_id):
 
 
 def _sign_obligation_export(export_data):
-    """Sign an obligation export with Hub's Ed25519 private key.
-    Returns signature dict with base64 signature and public key, or None."""
+    """Sign an obligation export with Hub's Ed25519 and P-256 private keys.
+    Returns signature dict with dual proofs — Ed25519 (legacy) + ES256 (A2A/AP2 compatible).
+    A2A/AP2 agents verify ES256; legacy verifiers use Ed25519."""
     import base64, copy
     try:
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.ec import ECDSA, SECP256R1, load_pem_private_key as load_ec_key
+        from cryptography.hazmat.primitives import serialization, hashes
+        from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature, encode_dss_signature
     except ImportError:
         return None
-
-    key_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "credentials", "hub_signing_key.pem")
-    if not os.path.exists(key_path):
-        return None
-
-    with open(key_path, "rb") as f:
-        private_key = serialization.load_pem_private_key(f.read(), password=None)
 
     # Create canonical signing payload: obligation data without _export_meta
     sign_copy = copy.deepcopy(export_data)
     sign_copy.pop("_export_meta", None)
     canonical = json.dumps(sign_copy, sort_keys=True, separators=(",", ":"))
+    canonical_bytes = canonical.encode("utf-8")
 
-    signature = private_key.sign(canonical.encode("utf-8"))
-    public_key = private_key.public_key()
-    public_raw = public_key.public_bytes(
-        encoding=serialization.Encoding.Raw,
-        format=serialization.PublicFormat.Raw
-    )
+    proofs = {}
+
+    # Proof 1: Ed25519 (legacy)
+    ed_key_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "credentials", "hub_signing_key.pem")
+    if os.path.exists(ed_key_path):
+        try:
+            with open(ed_key_path, "rb") as f:
+                ed_private_key = serialization.load_pem_private_key(f.read(), password=None)
+            ed_public_key = ed_private_key.public_key()
+            ed_public_raw = ed_public_key.public_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PublicFormat.Raw
+            )
+            ed_signature = ed_private_key.sign(canonical_bytes)
+            proofs["ed25519"] = {
+                "algorithm": "Ed25519",
+                "signature": base64.b64encode(ed_signature).decode(),
+                "public_key": base64.b64encode(ed_public_raw).decode(),
+                "public_key_url": "https://admin.slate.ceo/oc/brain/hub/signing-key"
+            }
+        except Exception:
+            pass
+
+    # Proof 2: ECDSA P-256 (A2A/AP2 native)
+    p256_key_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "credentials", "hub_signing_p256.pem")
+    p256_pubkey_b64_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "credentials", "hub_signing_p256_pubkey_b64.txt")
+    if os.path.exists(p256_key_path):
+        try:
+            with open(p256_key_path, "rb") as f:
+                p256_private_key = load_ec_key(f.read(), password=None)
+            p256_public_key = p256_private_key.public_key()
+
+            # Sign using ECDSA with SHA-256 (ES256)
+            p256_signature = p256_private_key.sign(canonical_bytes, ECDSA(hashes.SHA256()))
+            r, s = decode_dss_signature(p256_signature)
+            # JWS-style base64url encoding of signature (r || s, each padded to 32 bytes)
+            def b64url(b): return base64.urlsafe_b64encode(b).rstrip(b'=').decode()
+            # P-256 produces 32-byte r and 32-byte s
+            r_bytes = r.to_bytes(32, byteorder='big')
+            s_bytes = s.to_bytes(32, byteorder='big')
+            sig_b64url = b64url(r_bytes + s_bytes)
+
+            # Load P-256 public key from stored base64 (DER format = X.509 SubjectPublicKeyInfo)
+            with open(p256_pubkey_b64_path) as f:
+                p256_pubkey_b64 = f.read().strip()
+            p256_pubkey_der = base64.b64decode(p256_pubkey_b64)
+
+            proofs["es256"] = {
+                "algorithm": "ES256",
+                "signature": sig_b64url,  # JWS-style base64url(r || s)
+                "public_key": p256_pubkey_b64,  # DER-encoded, base64
+                "public_key_format": "X.509 SubjectPublicKeyInfo (DER), base64",
+                "public_key_url": "https://admin.slate.ceo/oc/brain/hub/signing-key-p256",
+                "curve": "P-256 / secp256r1"
+            }
+        except Exception as e:
+            pass
+
+    if not proofs:
+        return None
 
     return {
-        "algorithm": "Ed25519",
-        "signature": base64.b64encode(signature).decode(),
-        "public_key": base64.b64encode(public_raw).decode(),
+        "signatures": proofs,
         "signed_fields": "all obligation fields (excluding _export_meta)",
-        "verification": "Canonicalize obligation JSON (sort_keys, no spaces), verify Ed25519 signature against public_key.",
-        "public_key_url": "https://admin.slate.ceo/oc/brain/hub/signing-key"
+        "canonical_form": "JSON, sort_keys=True, separators=(',', ':')",
+        "note": "Dual-sign: Ed25519 (legacy) + ES256 (A2A/AP2 native). A2A agents should verify ES256 proof."
     }
 
 
 @app.route("/hub/signing-key", methods=["GET"])
 def get_signing_key():
-    """Public endpoint to retrieve Hub's Ed25519 signing public key."""
+    """Public endpoint to retrieve Hub's Ed25519 signing public key (legacy)."""
     pubkey_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "credentials", "hub_signing_pubkey_b64.txt")
     if not os.path.exists(pubkey_path):
         return jsonify({"error": "signing key not configured"}), 404
@@ -12479,6 +12562,33 @@ def get_signing_key():
         "public_key": pubkey_b64,
         "format": "raw Ed25519 public key, base64 encoded",
         "usage": "Verify obligation export signatures. Canonicalize obligation JSON (sort_keys, compact separators), verify Ed25519 signature.",
+    })
+
+
+@app.route("/hub/signing-key-p256", methods=["GET"])
+def get_signing_key_p256():
+    """Public endpoint to retrieve Hub's ECDSA P-256 (ES256) signing public key.
+    This is Hub's A2A/AP2-native signing key. Use this for A2A verification."""
+    pubkey_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "credentials", "hub_signing_p256_pubkey_b64.txt")
+    jwk_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "credentials", "hub_signing_p256_jwk.json")
+    if not os.path.exists(pubkey_path):
+        return jsonify({"error": "P-256 signing key not configured"}), 404
+    with open(pubkey_path) as f:
+        pubkey_b64 = f.read().strip()
+    with open(jwk_path) as f:
+        jwk = json.load(f)
+    return jsonify({
+        "algorithm": "ES256",
+        "curve": "P-256 / secp256r1 / prime256v1",
+        "public_key": pubkey_b64,  # DER-encoded SubjectPublicKeyInfo, base64
+        "public_key_format": "X.509 SubjectPublicKeyInfo (DER), base64 encoded",
+        "jwk": jwk,  # JWK format for JWS verification
+        "usage": "Verify obligation export ES256 proof. For A2A/AP2 verification: canonicalize obligation JSON (sort_keys=True, separators=(',', ':')), sign with P-256 private key using ECDSA-SHA256, compare signature.",
+        "example_verification": {
+            "canonical_form": "JSON, sort_keys=True, separators=(',', ':')",
+            "sign": "ECDSA-SHA256 over canonical_bytes",
+            "signature_encoding": "base64url(r || s), r and s each 32 bytes (P-256)"
+        }
     })
 
 
