@@ -1124,7 +1124,7 @@ def send_message(agent_id):
     data = request.get_json() or {}
     from_agent = data.get("from")
     message = data.get("message")
-    sender_secret = data.get("secret")
+    sender_secret = request.headers.get("X-Agent-Secret") or data.get("secret")
 
     if not from_agent:
         return jsonify({"ok": False, "error": "Missing 'from'"}), 400
@@ -1302,20 +1302,30 @@ def register_websocket(sock_instance):
         """WebSocket endpoint for real-time message push."""
         import time as _time
 
-        try:
-            auth = json.loads(ws.receive(timeout=10))
-        except Exception:
-            ws.send(json.dumps({"ok": False, "error": "Auth timeout \u2014 send {\"secret\": \"...\"} within 10s"}))
-            return
-
-        secret = auth.get("secret", "")
-        probe = bool(auth.get("probe"))
+        # Auth: check X-Agent-Secret header first (for proxy architecture),
+        # fall back to JSON auth message (backwards compatible with direct clients)
+        secret_from_header = request.headers.get("X-Agent-Secret")
         agents = load_agents()
-        if agent_id not in agents or agents[agent_id].get("secret") != secret:
-            ws.send(json.dumps({"ok": False, "error": "Invalid agent_id or secret"}))
-            return
 
-        ws.send(json.dumps({"ok": True, "type": "auth", "agent_id": agent_id, "probe": probe}))
+        if secret_from_header and agent_id in agents and agents[agent_id].get("secret") == secret_from_header:
+            # Authenticated via header — skip JSON handshake
+            probe = False
+            ws.send(json.dumps({"ok": True, "type": "auth", "agent_id": agent_id, "probe": probe}))
+        else:
+            # Fall back to JSON auth (existing behavior)
+            try:
+                auth = json.loads(ws.receive(timeout=10))
+            except Exception:
+                ws.send(json.dumps({"ok": False, "error": "Auth timeout \u2014 send {\"secret\": \"...\"} within 10s"}))
+                return
+
+            secret = auth.get("secret", "")
+            probe = bool(auth.get("probe"))
+            if agent_id not in agents or agents[agent_id].get("secret") != secret:
+                ws.send(json.dumps({"ok": False, "error": "Invalid agent_id or secret"}))
+                return
+
+            ws.send(json.dumps({"ok": True, "type": "auth", "agent_id": agent_id, "probe": probe}))
         if probe:
             return
 
