@@ -12468,7 +12468,8 @@ def _sign_obligation_export(export_data):
     import base64, copy
     try:
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-        from cryptography.hazmat.primitives.asymmetric.ec import ECDSA, SECP256R1, load_pem_private_key as load_ec_key
+        from cryptography.hazmat.primitives.asymmetric.ec import ECDSA, SECP256R1
+        from cryptography.hazmat.primitives.serialization import load_pem_private_key
         from cryptography.hazmat.primitives import serialization, hashes
         from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature, encode_dss_signature
     except ImportError:
@@ -12509,7 +12510,7 @@ def _sign_obligation_export(export_data):
     if os.path.exists(p256_key_path):
         try:
             with open(p256_key_path, "rb") as f:
-                p256_private_key = load_ec_key(f.read(), password=None)
+                p256_private_key = load_pem_private_key(f.read(), password=None)
             p256_public_key = p256_private_key.public_key()
 
             # Sign using ECDSA with SHA-256 (ES256)
@@ -12727,27 +12728,70 @@ def export_obligation(obl_id):
     import hashlib
     evidence_hash = "sha256:" + hashlib.sha256(canonical_bundle.encode("utf-8")).hexdigest()
 
-    # Sign the export with Hub's Ed25519 key for independent verification
+    # Sign the export with Hub's Ed25519 key AND P-256 key for independent verification
+    # Ed25519 = legacy, ES256 = A2A/AP2 native
     try:
         import base64 as _b64, copy as _copy
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-        from cryptography.hazmat.primitives import serialization
-        key_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "credentials", "hub_signing_key.pem")
-        if os.path.exists(key_path):
-            with open(key_path, "rb") as f:
-                private_key = serialization.load_pem_private_key(f.read(), password=None)
-            sign_copy = _copy.deepcopy(export)
-            sign_copy.pop("_export_meta", None)
-            canonical = json.dumps(sign_copy, sort_keys=True, separators=(",", ":"))
-            signature = private_key.sign(canonical.encode("utf-8"))
-            pub = private_key.public_key()
-            pub_raw = pub.public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
-            export["_export_meta"]["signature"] = {
-                "algorithm": "Ed25519",
-                "signature": _b64.b64encode(signature).decode(),
-                "public_key": _b64.b64encode(pub_raw).decode(),
-                "verification": "Canonicalize (sort_keys, no spaces), verify Ed25519 against public_key.",
-            }
+        from cryptography.hazmat.primitives.asymmetric.ec import ECDSA, SECP256R1
+        from cryptography.hazmat.primitives.serialization import load_pem_private_key as _load_pem
+        from cryptography.hazmat.primitives import serialization, hashes
+        from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+        from cryptography.exceptions import InvalidSignature as _InvalidSig
+
+        sign_copy = _copy.deepcopy(export)
+        sign_copy.pop("_export_meta", None)
+        canonical_bytes = json.dumps(sign_copy, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        proofs = {}
+
+        # Proof 1: Ed25519 (legacy)
+        ed_key_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "credentials", "hub_signing_key.pem")
+        if os.path.exists(ed_key_path):
+            try:
+                with open(ed_key_path, "rb") as f:
+                    ed_priv = serialization.load_pem_private_key(f.read(), password=None)
+                ed_pub = ed_priv.public_key()
+                ed_pub_raw = ed_pub.public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
+                ed_sig = ed_priv.sign(canonical_bytes)
+                proofs["ed25519"] = {
+                    "algorithm": "Ed25519",
+                    "signature": _b64.b64encode(ed_sig).decode(),
+                    "public_key": _b64.b64encode(ed_pub_raw).decode(),
+                    "public_key_url": "https://admin.slate.ceo/oc/brain/hub/signing-key",
+                    "verification": "Canonicalize (sort_keys, no spaces), verify Ed25519 against public_key.",
+                }
+            except Exception as _e:
+                pass
+
+        # Proof 2: ES256 / P-256 (A2A/AP2 native)
+        p256_key_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "credentials", "hub_signing_p256.pem")
+        p256_pubkey_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "credentials", "hub_signing_p256_pubkey_b64.txt")
+        if os.path.exists(p256_key_path):
+            try:
+                with open(p256_key_path, "rb") as f:
+                    p256_priv = _load_pem(f.read(), password=None)
+                p256_pub = p256_priv.public_key()
+                p256_sig = p256_priv.sign(canonical_bytes, ECDSA(hashes.SHA256()))
+                r, s = decode_dss_signature(p256_sig)
+                r_bytes = r.to_bytes(32, byteorder='big')
+                s_bytes = s.to_bytes(32, byteorder='big')
+                sig_b64url = _b64.urlsafe_b64encode(r_bytes + s_bytes).rstrip(b'=').decode()
+                with open(p256_pubkey_path) as f:
+                    p256_pubkey_b64 = f.read().strip()
+                proofs["es256"] = {
+                    "algorithm": "ES256",
+                    "curve": "P-256 / secp256r1",
+                    "signature": sig_b64url,  # JWS-style base64url(r || s)
+                    "public_key": p256_pubkey_b64,  # DER-encoded SubjectPublicKeyInfo
+                    "public_key_url": "https://admin.slate.ceo/oc/brain/hub/signing-key-p256",
+                    "verification": "Canonicalize (sort_keys, no spaces). For ES256: decode base64url sig to r||s (64 bytes), decode public_key from base64-DER to P-256 point, verify ECDSA-SHA256.",
+                }
+            except Exception as _e:
+                pass
+
+        if proofs:
+            export["_export_meta"]["signatures"] = proofs
+            export["_export_meta"]["signed_fields"] = "all obligation fields (excluding _export_meta)"
     except Exception as e:
         import sys
         try:
