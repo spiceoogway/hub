@@ -6723,33 +6723,7 @@ def per_agent_card(agent_id):
     # Last active timestamp
     hub_profile["registeredAt"] = agent.get("registered_at")
 
-    # --- Inline pubkeys from Hub's key store (A2A outbound signing keys) ---
-    try:
-        pubkeys_store = _load_pubkeys()
-        agent_keys = pubkeys_store.get(agent_id, [])
-        active_agent_keys = [k for k in agent_keys if k.get("active", True)]
-        if active_agent_keys:
-            card_pubkeys = []
-            for k in active_agent_keys:
-                key_entry = {
-                    "keyId": k.get("key_id", ""),
-                    "algorithm": k.get("algorithm", ""),
-                    "label": k.get("label", ""),
-                    "active": k.get("active", True),
-                    "createdAt": k.get("created_at", ""),
-                    "publicKey": k.get("public_key", ""),
-                }
-                # Include JWS proof block for P-256 keys
-                if k.get("algorithm") in ("ES256", "ECDSA_P256", "P-256"):
-                    key_entry["proofType"] = "ES256 JWS"
-                    key_entry["proofNote"] = "Sign card with P-256 private key (ES256 JWS), verify against publicKey"
-                elif k.get("algorithm") in ("Ed25519", "EDDSA"):
-                    key_entry["proofType"] = "Ed25519"
-                    key_entry["proofNote"] = "Sign card_hash with Ed25519 private key, verify against publicKey"
-                card_pubkeys.append(key_entry)
-            card["pubkeys"] = card_pubkeys
-    except Exception:
-        pass  # Non-critical — don't break the card if pubkeys unavailable
+
 
     # --- Inline capability profile from collaboration/capabilities data ---
     try:
@@ -6902,6 +6876,42 @@ def per_agent_card(agent_id):
         }
     }
 
+    # --- Inline pubkeys array: top-level keys[] per A2A v1.0 spec ---
+    # Runs AFTER card={} is initialized so card_hash can be captured below.
+    # Proof cardHash/cardBytes fields are filled in by the signing section below.
+    try:
+        _pubkeys_store = _load_pubkeys()
+        _agent_keys = _pubkeys_store.get(agent_id, [])
+        _active_keys = [k for k in _agent_keys if k.get("active", True)]
+        if _active_keys:
+            _card_pubkeys = []
+            for k in _active_keys:
+                alg = k.get("algorithm", "")
+                entry = {
+                    "keyId": k.get("key_id", ""),
+                    "algorithm": alg,
+                    "label": k.get("label", ""),
+                    "active": k.get("active", True),
+                    "createdAt": k.get("created_at") or k.get("registered_at", ""),
+                    "publicKey": k.get("public_key", ""),
+                    "proof": {
+                        "type": "agent-attestation",
+                        "algorithm": alg if alg else "ES256",
+                        "cardHash": "{{cardHash}}",
+                        "note": (
+                            "Agent signature. Sign card_bytes with P-256 private key (ES256 JWS), "
+                            "verify against publicKey."
+                            if alg in ("ES256", "ECDSA_P256", "P-256")
+                            else "Agent signature. Sign card_hash with Ed25519 private key, "
+                                 "verify against publicKey."
+                        ),
+                    },
+                }
+                _card_pubkeys.append(entry)
+            card["pubkeys"] = _card_pubkeys
+    except Exception:
+        pass  # Non-critical
+
     # --- AgentCardSignature: dual-proof system ---
     # Signs the canonical card JSON (without the signature/proofs fields themselves).
     # Verifiers: recompute HMAC with Hub's secret, compare to hub.signature.
@@ -6916,6 +6926,14 @@ def per_agent_card(agent_id):
         card_bytes = json.dumps(card_for_signing, separators=(',', ':'), sort_keys=True).encode()
         card_hash = hashlib.sha256(card_bytes).hexdigest()
         signed_at = datetime.utcnow().isoformat() + "Z"
+
+        # Patch {{cardHash}} placeholders in top-level card["pubkeys"] with the real hash
+        if "pubkeys" in card:
+            for key_entry in card["pubkeys"]:
+                pf = key_entry.get("proof", {})
+                if pf.get("cardHash") == "{{cardHash}}":
+                    pf["cardHash"] = card_hash
+                    pf["signedAt"] = signed_at
 
         # Proof 1: Hub HMAC (tamper-evident, not cryptographic identity)
         sig_key = HUB_SECRET.encode() if HUB_SECRET else b"hub-signing-key"
@@ -13214,8 +13232,11 @@ def advance_obligation(obl_id):
     original_closure_policy = obl.get("closure_policy")
     if new_status == "resolved" and original_closure_policy == "counterparty_accepts":
         cp_liveness = obl.get("counterparty_liveness_class", "unknown")
-        ghost_states = ("ghost_nudged", "ghost_escalated", "ghost_defaulted")
-        if cp_liveness in ("ghost_confirmed", "dead", "dormant") or current in ghost_states:
+        # Ghost Counterparty Protocol v2: only upgrade for actual ghost watchdog tiers.
+        # "evidence_submitted" is a NORMAL workflow state (evidence provided, counterparty is present and acting).
+        # It must NOT trigger auto-upgrade — counterparty is present and acting.
+        ghost_tiers = ("ghost_nudged", "ghost_escalated", "ghost_defaulted")
+        if cp_liveness in ("ghost_confirmed", "dead", "dormant") or current in ghost_tiers:
             obl["closure_policy"] = "protocol_resolves"
 
     # Enforce closure policy: only authorized agent can resolve
