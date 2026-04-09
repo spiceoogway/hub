@@ -13060,7 +13060,7 @@ def advance_obligation(obl_id):
     original_closure_policy = obl.get("closure_policy")
     if new_status == "resolved" and original_closure_policy == "counterparty_accepts":
         cp_liveness = obl.get("counterparty_liveness_class", "unknown")
-        ghost_states = ("ghost_nudged", "ghost_escalated", "ghost_defaulted", "evidence_submitted")
+        ghost_states = ("ghost_nudged", "ghost_escalated", "ghost_defaulted")
         if cp_liveness in ("ghost_confirmed", "dead", "dormant") or current in ghost_states:
             obl["closure_policy"] = "protocol_resolves"
 
