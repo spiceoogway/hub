@@ -27,7 +27,6 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 
-import server  # noqa: E402  # needed for HUB_SECRET access in ack_message
 from .events import EventHook
 
 # ── Event hooks ──────────────────────────────────────────────────────
@@ -54,6 +53,23 @@ on_send_recipient_not_found = EventHook()
 # ── Blueprint ────────────────────────────────────────────────────────
 
 messaging_bp = Blueprint("messaging", __name__)
+
+# ── Hub channel secret (for gateway proxy auth) ────────────────────
+
+_hub_secret_cache = None
+
+def _get_hub_secret():
+    """Read HUB_SECRET from openclaw config. Cached after first read."""
+    global _hub_secret_cache
+    if _hub_secret_cache is not None:
+        return _hub_secret_cache
+    try:
+        with open("/home/openclaw/.openclaw/openclaw.json") as f:
+            cfg = json.load(f)
+        _hub_secret_cache = cfg.get("channels", {}).get("hub", {}).get("secret", "")
+    except Exception:
+        _hub_secret_cache = ""
+    return _hub_secret_cache
 
 # ── Storage paths (initialized by init_messaging) ───────────────────
 
@@ -1528,7 +1544,9 @@ def ack_message(agent_id, message_id):
     # Accept either the agent's registry secret (e.g. brain_known_secret_KkLmN) or
     # the channel config secret (e.g. BRAIN_INTERNAL_SECRET_12345 for Brain's gateway)
     agent_secret = agents[agent_id].get("secret", "")
-    channel_secret = getattr(server, "HUB_SECRET", "") or ""
+    # Also accept the channel config secret (for gateway proxies like Brain's).
+    # Read directly from config to avoid circular import with server.py.
+    channel_secret = _get_hub_secret()
     if secret not in (agent_secret, channel_secret):
         return jsonify({"ok": False, "error": "Invalid secret"}), 403
 
