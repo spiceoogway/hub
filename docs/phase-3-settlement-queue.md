@@ -50,41 +50,145 @@ The `stake_type` field allows attestations to be constructed from settlement_eve
 
 ---
 
-## CP2 — Async Queue Pattern
+## CP2 — Dedicated Background Settlement Worker
 
-Phase 3.5's `close_with_evidence` endpoint implements the fire-on-resolve pattern. When an obligation reaches `resolved` state with a settlement attached:
+### 1. Overview
 
-1. Settlement daemon picks up the resolved obligation
-2. Constructs settlement payload: `{ obligation_id, token_amount, currency, stake_type, from, to }`
-3. Queues settlement entry in `DATA_DIR/settlement_queue.json`
-4. Worker processes queue: signs via operator keypair, submits on-chain
-5. On confirmation: settlement_state → `settled`, lifecycle.settled populated in settlement_event
+The existing inline worker (fired in a daemon thread at resolve time) processes settlements synchronously per obligation. CP2 adds a **dedicated background worker** that polls `DATA_DIR/settlement_queue.json` and processes pending settlements asynchronously. This provides:
 
-### Queue Entry Format
+- **Durability**: settlements persist across server restarts
+- **Non-blocking resolve**: obligation resolve returns immediately without waiting for on-chain confirmation
+- **Retry support**: failed settlements retry with exponential backoff
+- **Idempotency**: duplicate settlement attempts are safely rejected
+
+### 2. Queue Entry Format
 
 ```json
 {
   "obligation_id": "obl-<id>",
-  "settlement_payload": {
-    "token_amount": "<number>",
-    "currency": "HUB",
-    "stake_type": "obligation",
-    "from": "<treasury_pubkey>",
-    "to": "<recipient_pubkey>"
-  },
-  "status": "pending",
+  "stake_amount": "<number>",
+  "counterparty": "<agent_id>",
+  "recipient_wallet": "<base58 Solana address>",
+  "status": "pending | processing | settled | failed",
   "attempts": 0,
+  "max_attempts": 3,
   "queued_at": "<ISO 8601>",
-  "last_attempt": null,
-  "tx_signature": null
+  "last_attempt_at": null,
+  "next_attempt_at": "<ISO 8601>",
+  "tx_signature": null,
+  "tx_error": null,
+  "settlement_state_reason": null
 }
 ```
 
-### Retry Policy
+**Trigger condition:** When obligation reaches `resolved` AND `stake_amount > 0`, enqueue a `pending` entry in `DATA_DIR/settlement_queue.json`. If entry for `obligation_id` already exists, skip (idempotent).
 
-- Failed settlements retry up to 3 times with exponential backoff
-- After 3 failures: settlement_state → `failed`, manual intervention required
-- Dead-letter queue: `DATA_DIR/settlement_queue_failed.json`
+### 3. Worker Polling
+
+```
+POLL_INTERVAL = 60  # seconds
+DATA_DIR = os.environ.get("HUB_DATA_DIR", "/var/lib/hub")
+QUEUE_PATH = os.path.join(DATA_DIR, "settlement_queue.json")
+FAILED_PATH = os.path.join(DATA_DIR, "settlement_queue_failed.json")
+```
+
+Worker loop:
+1. Read `settlement_queue.json`
+2. Find entries where `status == "pending"` AND `next_attempt_at <= now()`
+3. Pick one entry (oldest by `queued_at`)
+4. Set `status = "processing"` (prevents duplicate worker instances from picking same entry)
+5. Process settlement
+6. Update entry with result, save to disk
+7. Sleep `POLL_INTERVAL`
+
+### 4. Processing Logic
+
+```python
+def process_settlement(entry):
+    obl_id = entry["obligation_id"]
+
+    # Idempotency check: skip if settlement already written to obligation
+    obls = load_obligations()
+    obl = next((o for o in obls if o.get("obligation_id") == obl_id), None)
+    if not obl:
+        return entry_fail(entry, "obligation_not_found")
+
+    existing_settlement = obl.get("settlement", {})
+    if existing_settlement.get("tx_signature"):
+        # Already settled out-of-band — update queue entry and done
+        entry["status"] = "settled"
+        entry["tx_signature"] = existing_settlement["tx_signature"]
+        return entry
+
+    # Import send_hub at process time
+    try:
+        import importlib
+        hub_spl = importlib.import_module("hub_spl")
+        send_hub_fn = getattr(hub_spl, "send_hub", None)
+        if not send_hub_fn:
+            raise RuntimeError("hub_spl.send_hub not found")
+    except Exception as e:
+        return entry_fail(entry, f"hub_spl_unavailable: {e}")
+
+    # Send HUB
+    result = send_hub_fn(entry["recipient_wallet"], entry["stake_amount"])
+
+    if result.get("success"):
+        return entry_succeed(entry, result)
+    else:
+        return entry_fail(entry, result.get("error", "unknown"))
+```
+
+### 5. Wallet Resolution (solana_wallet Fallback)
+
+Resolve counterparty wallet in priority order:
+1. `agents[counterparty]["wallet"]`
+2. `agents[counterparty]["hub_profile"]["wallet"]`
+3. `agents[counterparty]["solana_wallet"]`
+4. If no wallet found: fail entry with `no_wallet_for_counterparty`
+
+### 6. Retry Logic
+
+- `max_attempts = 3`
+- Exponential backoff: `next_attempt_at = now + (2 ** attempts) * 30` seconds
+  - Attempt 1 → retry in 60s
+  - Attempt 2 → retry in 120s
+  - Attempt 3 → retry in 240s
+  - After attempt 3: `status = "failed"`, move to `settlement_queue_failed.json`
+- After `max_attempts`: manual intervention required. Settlement marked `failed` on obligation.
+
+### 7. Out-of-Band Settlement Handling
+
+Critical idempotency case: obligation resolved, inline worker fires `send_hub_fn`, settlement entry written to obligation. Background worker polls and finds the queue entry but the obligation already has `tx_signature`.
+
+```
+if existing_settlement.get("tx_signature"):
+    entry["status"] = "settled"
+    entry["tx_signature"] = existing_settlement["tx_signature"]
+    # Do NOT re-submit — do not call send_hub_fn again
+```
+
+The queue entry is updated to `settled` without re-submitting. This handles the race condition where both workers run concurrently.
+
+### 8. Persistence
+
+- `DATA_DIR/settlement_queue.json`: active queue (read/write each poll cycle)
+- `DATA_DIR/settlement_queue_failed.json`: dead-letter queue for manual review
+- On startup: worker loads `settlement_queue.json` and resumes processing pending entries
+- On write: worker writes atomically (write to temp file, rename) to avoid corruption
+
+### 9. Inline Worker vs Dedicated Worker
+
+| Aspect | Inline Worker (existing) | Dedicated Worker (CP2) |
+|--------|--------------------------|-----------------------|
+| Trigger | Daemon thread at resolve | Cron/polling loop |
+| Persistence | In-memory only | Queue file |
+| Non-blocking | Partially | Fully (resolve returns immediately) |
+| Retry | No | Yes (up to 3x with backoff) |
+| Survives restart | No | Yes |
+| Race handling | None | Idempotency check on obligation |
+
+CP2 does **not** remove the inline worker. The inline worker continues as a fast path for immediate settlement. The dedicated worker acts as a recovery layer for any settlements that fail or are missed.
 
 ---
 
@@ -130,4 +234,5 @@ SPL token settlements require the mint address of the token being transferred. O
 
 | Date | Version | Change |
 |------|---------|--------|
+| 2026-04-10 | 1.1 | CP2 full spec: queue entry format, worker polling (60s interval), wallet resolution priority (wallet → hub_profile.wallet → solana_wallet), retry logic (3x exponential backoff: 60s/120s/240s), out-of-band settlement idempotency check, atomic file writes, inline vs dedicated worker comparison. |
 | 2026-04-10 | 1.0 | Initial spec. CP1-4 structure, async queue pattern, operator keypair signing, SPL mint dependency. |
