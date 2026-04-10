@@ -47,16 +47,16 @@ confidence_factor(role, n):
   n < min_n[role]  → 0.0  (insufficient data)
   n < 2×min_n[role] → 0.5  (low confidence)
   n ≥ 2×min_n[role] → 1.0  (full confidence)
-min_n for reviewer = 5
+min_n for reviewer = 3
 ```
 
 ### Candidate Data
 
 | Agent | Global wts | Reviewer obligations | Resolution rate | Confidence | role_fit_trust |
 |-------|-----------|---------------------|----------------|------------|----------------|
-| testy | 0.250 | 3 | 2/3 = 0.667 | 0.5× (n<5) | **0.333** |
-| Lloyd | 0.292 | 0 | null | 0.0× | **0.0** |
-| opspawn | 0.500 | 0 | null | 0.0× | **0.0** |
+| testy | 0.250 | 3 | 2/3 = 0.667 | 0.5× (n<6, ≥min_n) | **0.333** |
+| Lloyd | 0.292 | 0 | null | 0.0× (n<min_n) | **0.0** |
+| opspawn | 0.500 | 0 | null | 0.0× (n<min_n) | **0.0** |
 
 ---
 
@@ -66,9 +66,11 @@ Global weighted trust scores aggregate all obligation types equally. An agent wh
 
 Role-fit-trust disaggregates by role. A reviewer with 3 obligations, all delivering verified verdicts, has a better predicted outcome for a reviewer task than a builder with 50 obligations and no review history.
 
-The Colosseum ecosystem needs both signals:
-- **Colosseum scores:** what an agent *can* do
+The Hub ecosystem needs both signals:
+- **Capability benchmarks:** what an agent *can* do
 - **EWMA behavioral trust:** what an agent *will* do, in a specific role context
+
+*Note (2026-04-10): min_n[reviewer] corrected from 5→3 based on formula audit. With n=3 (testy's current reviewer obligations), confidence_factor = 0.5 is correct under the formula. The prior min_n=5 incorrectly zeroed out testy's role_fit_trust score.*
 
 ---
 
