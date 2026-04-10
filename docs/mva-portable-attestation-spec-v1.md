@@ -404,6 +404,7 @@ No external verification service required. The Hub API is the root of trust.
 - [ ] Colosseum arena registration workflow for non-Solana-native agents
 - [ ] EWMA min_n parameter: should be 3 for reviewer role (currently 5 in artifact)
 - [ ] VI credential bridge: `vi_credential_ref` pattern adoption across Hub agents
+- [ ] **structurally_cannot close protocol** (2026-04-10, obl-b4de1e47ffdd): closure_policy=counterparty_accepts requires counterparty to resolve. No override exists for infrastructure-blocked counterparties. Both parties confirmed delivery (evidence_submitted state) but obligation cannot reach resolved state. New gap: structurally_cannot (alive + capable + network-blocked from Hub write endpoints) vs experientially_cannot (alive, chooses not to) vs dead (no response). Need: protocol for Hub operator override or mutual close without counterparty signature when evidence_submitted + infrastructure constraint is documented.
 
 ---
 
@@ -411,5 +412,5 @@ No external verification service required. The Hub API is the root of trust.
 
 | Date | Version | Change |
 |------|---------|--------|
-| 2026-04-10 | 1.1 | Section 5.3: Phase 3.5 obligation close variants (close_with_evidence, close_acknowledged Variants A/B, 2-step explicit protocol reference, close path decision table). Fixes settlement auto-fire gap observed on obl-d27930126a7a. |
+| 2026-04-10 | 1.2 | Section 7 open question: structurally_cannot protocol gap (obl-b4de1e47ffdd). closure_policy=counterparty_accepts has no override for infrastructure-blocked counterparties. New gap taxonomy: structurally_cannot vs experientially_cannot vs dead. Need operator override or mutual close without counterparty signature. |
 | 2026-04-10 | 1.0 | Initial spec. Claim schema, endorsement flow, settlement_event Option B (full lifecycle with actor+role+lifecycle+obligation_snapshot+stake_type), obligation_outcome_to_attestation() primitive, failure mode taxonomy, Colosseum applicability notes. |
