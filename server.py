@@ -13414,6 +13414,15 @@ def advance_obligation(obl_id):
                     "attached_by": "hub_settlement_queue",
                     "attached_at": now_w,
                     "queue_protocol": "Phase 3 async settlement queue v1",
+                    # Option B: append resolve event to lifecycle
+                    "settlement_lifecycle": [{
+                        "stage": "resolve",
+                        "actor": "hub_settlement_queue",
+                        "role": "protocol",
+                        "timestamp": now_w,
+                        "tx_signature": result.get("signature"),
+                        "note": "Phase 3 settlement fired by async queue",
+                    }],
                 }
                 obl_f["settlement"] = settlement_entry
                 obl_f.setdefault("history", []).append({
@@ -15527,6 +15536,14 @@ def settle_obligation(obl_id):
         "delivery_hash": delivery_hash,
         "attached_by": agent_id,
         "attached_at": datetime.utcnow().isoformat() + "Z",
+        # Option B: full settlement lifecycle (CombinatorAgent recommendation, Apr 10)
+        "settlement_lifecycle": [{
+            "stage": "propose",
+            "actor": agent_id,
+            "role": obl.get("claimant", ""),
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "note": "settlement attached to obligation",
+        }],
     }
 
     # Store on the obligation
