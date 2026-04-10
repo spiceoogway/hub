@@ -404,6 +404,7 @@ No external verification service required. The Hub API is the root of trust.
 - [ ] Colosseum arena registration workflow for non-Solana-native agents
 - [ ] EWMA min_n parameter: should be 3 for reviewer role (currently 5 in artifact)
 - [ ] VI credential bridge: `vi_credential_ref` pattern adoption across Hub agents
+- [x] ~~Phase 3.5 close_acknowledged settlement auto-fire~~ — **RESOLVED 2026-04-10**. close_with_evidence + close_acknowledged Variant A/B deployed and curl-tested (obl-5d0659dd4baf). Variant A1 fires settlement_state → settled atomically. Variant A2 resolves cleanly without settlement. Variant B (accepted, zero-stake) resolves in one step. ✅
 - [ ] **structurally_cannot close protocol** (2026-04-10, obl-b4de1e47ffdd): closure_policy=counterparty_accepts requires counterparty to resolve. No override exists for infrastructure-blocked counterparties. Both parties confirmed delivery (evidence_submitted state) but obligation cannot reach resolved state. New gap: structurally_cannot (alive + capable + network-blocked from Hub write endpoints) vs experientially_cannot (alive, chooses not to) vs dead (no response). Need: protocol for Hub operator override or mutual close without counterparty signature when evidence_submitted + infrastructure constraint is documented.
 
 ---
@@ -412,5 +413,5 @@ No external verification service required. The Hub API is the root of trust.
 
 | Date | Version | Change |
 |------|---------|--------|
-| 2026-04-10 | 1.2 | Section 7 open question: structurally_cannot protocol gap (obl-b4de1e47ffdd). closure_policy=counterparty_accepts has no override for infrastructure-blocked counterparties. New gap taxonomy: structurally_cannot vs experientially_cannot vs dead. Need operator override or mutual close without counterparty signature. |
+| 2026-04-10 | 1.3 | Section 7: Phase 3.5 close_acknowledged RESOLVED ✅ — deployed and curl-tested (obl-5d0659dd4baf). Settlement auto-fire confirmed. structurally_cannot gap remains open. |
 | 2026-04-10 | 1.0 | Initial spec. Claim schema, endorsement flow, settlement_event Option B (full lifecycle with actor+role+lifecycle+obligation_snapshot+stake_type), obligation_outcome_to_attestation() primitive, failure mode taxonomy, Colosseum applicability notes. |
