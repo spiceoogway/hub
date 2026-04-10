@@ -94,7 +94,7 @@ def msg_app():
     from flask_sock import Sock
     from hub.messaging import (
         messaging_bp, init_messaging, register_websocket,
-        on_message_sent, on_agent_registered, on_message_read, on_agent_event,
+        on_message_sent, on_agent_registered, on_message_read, on_message_acked, on_agent_event,
     )
 
     tmpdir = tempfile.mkdtemp(prefix="hub-test-")
@@ -107,6 +107,7 @@ def msg_app():
     on_message_sent.clear()
     on_agent_registered.clear()
     on_message_read.clear()
+    on_message_acked.clear()
     on_agent_event.clear()
 
     init_messaging(Path(tmpdir))
@@ -119,6 +120,7 @@ def msg_app():
     on_message_sent.clear()
     on_agent_registered.clear()
     on_message_read.clear()
+    on_message_acked.clear()
     on_agent_event.clear()
     shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -749,6 +751,269 @@ class TestWebSocketSend:
             threaded = [m for m in inbox if m.get("topic") == "ws-thread"]
             assert len(threaded) == 1
             assert threaded[0]["reply_to"] == "prev-msg"
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Passive ACK (session_loaded) Tests
+# ══════════════════════════════════════════════════════════════════════
+
+class TestPassiveAck:
+    def _setup(self, client):
+        """Register sender + receiver, send a message, return secrets + message_id."""
+        s1 = client.post("/agents/register", json={"agent_id": "ack-sender"}).get_json()["secret"]
+        s2 = client.post("/agents/register", json={"agent_id": "ack-receiver"}).get_json()["secret"]
+        client.post("/agents/ack-receiver/message", json={
+            "from": "ack-sender", "secret": s1, "message": "ack me"
+        })
+        inbox = client.get(f"/agents/ack-receiver/messages?secret={s2}").get_json()
+        msg = [m for m in inbox["messages"] if m["from"] == "ack-sender"][0]
+        return s1, s2, msg["id"]
+
+    def test_ack_happy_path(self, msg_app):
+        app, _ = msg_app
+        with app.test_client() as c:
+            s1, s2, msg_id = self._setup(c)
+
+            resp = c.post(f"/agents/ack-receiver/messages/{msg_id}/ack", json={
+                "secret": s2, "ack_type": "session_loaded", "runtime_id": "rt-123"
+            })
+            data = resp.get_json()
+            assert resp.status_code == 200
+            assert data["ok"] is True
+            assert data["ack_type"] == "session_loaded"
+            assert data["delivery_state"] == "session_loaded"
+            assert data["already_acked"] is False
+            assert "acked_at" in data
+
+            # Verify inbox record was updated
+            inbox = c.get(f"/agents/ack-receiver/messages?secret={s2}").get_json()
+            msg = [m for m in inbox["messages"] if m["id"] == msg_id][0]
+            assert msg["session_loaded"] is True
+            assert msg["ack_type"] == "session_loaded"
+            assert msg["session_runtime_id"] == "rt-123"
+
+            # Verify sent record was updated
+            sent = c.get(f"/agents/ack-sender/messages/sent?secret={s1}").get_json()
+            rec = [r for r in sent["messages"] if r["message_id"] == msg_id][0]
+            assert rec["session_loaded"] is True
+            assert rec["delivery_state"] == "session_loaded"
+            assert rec["ack_type"] == "session_loaded"
+
+    def test_ack_bad_secret(self, msg_app):
+        app, _ = msg_app
+        with app.test_client() as c:
+            _, s2, msg_id = self._setup(c)
+            resp = c.post(f"/agents/ack-receiver/messages/{msg_id}/ack", json={
+                "secret": "wrong-secret"
+            })
+            assert resp.status_code == 403
+
+    def test_ack_unknown_agent(self, msg_app):
+        app, _ = msg_app
+        with app.test_client() as c:
+            resp = c.post("/agents/nonexistent/messages/fake-id/ack", json={
+                "secret": "whatever"
+            })
+            assert resp.status_code == 404
+
+    def test_ack_unknown_message(self, msg_app):
+        app, _ = msg_app
+        with app.test_client() as c:
+            _, s2, _ = self._setup(c)
+            resp = c.post("/agents/ack-receiver/messages/no-such-msg/ack", json={
+                "secret": s2
+            })
+            assert resp.status_code == 404
+
+    def test_ack_idempotent(self, msg_app):
+        """Re-acking returns 200 with the original stored timestamp and ack_type."""
+        app, _ = msg_app
+        with app.test_client() as c:
+            _, s2, msg_id = self._setup(c)
+
+            resp1 = c.post(f"/agents/ack-receiver/messages/{msg_id}/ack", json={
+                "secret": s2, "ack_type": "session_loaded"
+            })
+            data1 = resp1.get_json()
+            assert data1["already_acked"] is False
+            original_ts = data1["acked_at"]
+
+            resp2 = c.post(f"/agents/ack-receiver/messages/{msg_id}/ack", json={
+                "secret": s2, "ack_type": "session_loaded"
+            })
+            data2 = resp2.get_json()
+            assert resp2.status_code == 200
+            assert data2["already_acked"] is True
+            # Idempotent: returns original timestamp, not current time
+            assert data2["acked_at"] == original_ts
+            assert data2["ack_type"] == "session_loaded"
+
+    def test_ack_fires_hook_once(self, msg_app):
+        """Event hook fires on first ack, not on idempotent re-ack."""
+        app, _ = msg_app
+        from hub.messaging import on_message_acked
+        hook_log = []
+        on_message_acked.subscribe(
+            lambda agent_id, message_id, sender_id, ack_type, runtime_id: hook_log.append(message_id)
+        )
+        with app.test_client() as c:
+            _, s2, msg_id = self._setup(c)
+            c.post(f"/agents/ack-receiver/messages/{msg_id}/ack", json={"secret": s2})
+            c.post(f"/agents/ack-receiver/messages/{msg_id}/ack", json={"secret": s2})
+        assert hook_log == [msg_id]
+
+    def test_ack_then_read_state_progression(self, msg_app):
+        """session_loaded -> read produces session_loaded_read delivery state on sent record."""
+        app, _ = msg_app
+        with app.test_client() as c:
+            s1, s2, msg_id = self._setup(c)
+
+            # ACK first
+            c.post(f"/agents/ack-receiver/messages/{msg_id}/ack", json={"secret": s2})
+
+            # Verify sent record is session_loaded
+            sent = c.get(f"/agents/ack-sender/messages/sent?secret={s1}").get_json()
+            rec = [r for r in sent["messages"] if r["message_id"] == msg_id][0]
+            assert rec["delivery_state"] == "session_loaded"
+
+            # Now mark read
+            c.post(f"/agents/ack-receiver/messages/{msg_id}/read?secret={s2}")
+
+            # Verify sent record preserves session_loaded signal through read
+            sent2 = c.get(f"/agents/ack-sender/messages/sent?secret={s1}").get_json()
+            rec2 = [r for r in sent2["messages"] if r["message_id"] == msg_id][0]
+            assert rec2["read"] is True
+            assert rec2["session_loaded"] is True
+            # delivery_state should be session_loaded_read (not plain inbox_read)
+            assert "session_loaded_read" in rec2["delivery_state"]
+
+    def test_read_then_ack_no_downgrade(self, msg_app):
+        """If already read, ack should not downgrade sent record delivery_state.
+        Response should report already_acked=True and hook should NOT fire."""
+        app, _ = msg_app
+        from hub.messaging import on_message_acked
+        hook_log = []
+        on_message_acked.subscribe(
+            lambda agent_id, message_id, sender_id, ack_type, runtime_id: hook_log.append(message_id)
+        )
+        with app.test_client() as c:
+            s1, s2, msg_id = self._setup(c)
+
+            # Read first
+            c.post(f"/agents/ack-receiver/messages/{msg_id}/read?secret={s2}")
+
+            sent = c.get(f"/agents/ack-sender/messages/sent?secret={s1}").get_json()
+            rec = [r for r in sent["messages"] if r["message_id"] == msg_id][0]
+            assert "read" in rec["delivery_state"]
+
+            # Now ack — message already read, treated as already-acked
+            resp = c.post(f"/agents/ack-receiver/messages/{msg_id}/ack", json={"secret": s2})
+            data = resp.get_json()
+            assert data["already_acked"] is True
+
+            # Hook should not have fired (already at higher state)
+            assert hook_log == []
+
+            # Sent record should now have session_loaded=True and a session_loaded_read state
+            sent2 = c.get(f"/agents/ack-sender/messages/sent?secret={s1}").get_json()
+            rec2 = [r for r in sent2["messages"] if r["message_id"] == msg_id][0]
+            assert rec2["session_loaded"] is True
+            assert "session_loaded_read" in rec2["delivery_state"]
+
+    def test_ack_without_runtime_id(self, msg_app):
+        """runtime_id is optional — omitting it should not set session_runtime_id."""
+        app, _ = msg_app
+        with app.test_client() as c:
+            _, s2, msg_id = self._setup(c)
+
+            c.post(f"/agents/ack-receiver/messages/{msg_id}/ack", json={"secret": s2})
+
+            inbox = c.get(f"/agents/ack-receiver/messages?secret={s2}").get_json()
+            msg = [m for m in inbox["messages"] if m["id"] == msg_id][0]
+            assert msg["session_loaded"] is True
+            assert "session_runtime_id" not in msg
+
+    def test_ack_deleted_message_returns_404(self, msg_app):
+        """Acking a message that was deleted from inbox returns 404."""
+        app, _ = msg_app
+        with app.test_client() as c:
+            _, s2, msg_id = self._setup(c)
+
+            # Delete the message first
+            c.delete(f"/agents/ack-receiver/messages/{msg_id}?secret={s2}")
+
+            # Now try to ack — should 404
+            resp = c.post(f"/agents/ack-receiver/messages/{msg_id}/ack", json={"secret": s2})
+            assert resp.status_code == 404
+
+    def test_ack_invalid_ack_type(self, msg_app):
+        """Only 'session_loaded' is a valid ack_type."""
+        app, _ = msg_app
+        with app.test_client() as c:
+            _, s2, msg_id = self._setup(c)
+
+            resp = c.post(f"/agents/ack-receiver/messages/{msg_id}/ack", json={
+                "secret": s2, "ack_type": "garbage"
+            })
+            assert resp.status_code == 400
+
+
+class TestSessionLoadedFilter:
+    def _setup(self, client):
+        """Register sender + receiver, send two messages, ack one."""
+        s1 = client.post("/agents/register", json={"agent_id": "filter-sender"}).get_json()["secret"]
+        s2 = client.post("/agents/register", json={"agent_id": "filter-receiver"}).get_json()["secret"]
+        client.post("/agents/filter-receiver/message", json={
+            "from": "filter-sender", "secret": s1, "message": "msg-acked"
+        })
+        client.post("/agents/filter-receiver/message", json={
+            "from": "filter-sender", "secret": s1, "message": "msg-not-acked"
+        })
+        inbox = client.get(f"/agents/filter-receiver/messages?secret={s2}").get_json()
+        msgs = [m for m in inbox["messages"] if m["from"] == "filter-sender"]
+        # Ack only the first message
+        client.post(f"/agents/filter-receiver/messages/{msgs[0]['id']}/ack", json={"secret": s2})
+        return s1, s2, msgs[0]["id"], msgs[1]["id"]
+
+    def test_filter_session_loaded_true(self, msg_app):
+        app, _ = msg_app
+        with app.test_client() as c:
+            s1, _, acked_id, not_acked_id = self._setup(c)
+            sent = c.get(f"/agents/filter-sender/messages/sent?secret={s1}&session_loaded=true").get_json()
+            ids = [r["message_id"] for r in sent["messages"]]
+            assert acked_id in ids
+            assert not_acked_id not in ids
+
+    def test_filter_session_loaded_false(self, msg_app):
+        app, _ = msg_app
+        with app.test_client() as c:
+            s1, _, acked_id, not_acked_id = self._setup(c)
+            sent = c.get(f"/agents/filter-sender/messages/sent?secret={s1}&session_loaded=false").get_json()
+            ids = [r["message_id"] for r in sent["messages"]]
+            assert not_acked_id in ids
+            assert acked_id not in ids
+
+    def test_filter_not_present_returns_all(self, msg_app):
+        """When session_loaded param is absent, all records are returned."""
+        app, _ = msg_app
+        with app.test_client() as c:
+            s1, _, acked_id, not_acked_id = self._setup(c)
+            sent = c.get(f"/agents/filter-sender/messages/sent?secret={s1}").get_json()
+            ids = [r["message_id"] for r in sent["messages"]]
+            assert acked_id in ids
+            assert not_acked_id in ids
+
+    def test_filter_empty_string_does_not_activate(self, msg_app):
+        """?session_loaded= (empty) should not activate the filter — returns all records.
+        This is a documented-by-design behavior: empty query params use truthiness check."""
+        app, _ = msg_app
+        with app.test_client() as c:
+            s1, _, acked_id, not_acked_id = self._setup(c)
+            sent = c.get(f"/agents/filter-sender/messages/sent?secret={s1}&session_loaded=").get_json()
+            ids = [r["message_id"] for r in sent["messages"]]
+            # Empty string should NOT activate filter — both records returned
+            assert acked_id in ids
+            assert not_acked_id in ids
 
 
 if __name__ == "__main__":

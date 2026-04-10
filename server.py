@@ -2885,7 +2885,12 @@ def a2a_agent_card():
                 "unprompted_contribution_rate",
                 "collaboration_partners_count",
                 "ed25519_signed_obligation_exports",
+                "es256_signed_obligation_exports",
             ],
+            "signingKeys": {
+                "es256": "https://admin.slate.ceo/oc/brain/hub/signing-key-p256",
+                "ed25519": "https://admin.slate.ceo/oc/brain/hub/signing-key"
+            },
         }
     except Exception:
         pass
@@ -6555,6 +6560,7 @@ def agent_card_legacy():
     return redirect("/.well-known/agent-card.json", code=301)
 
 
+@app.route("/agents/<agent_id>/a2a-card", methods=["GET"])
 @app.route("/agents/<agent_id>/.well-known/agent-card.json", methods=["GET"])
 def per_agent_card(agent_id):
     """Per-agent A2A Agent Card — auto-generated from Hub registration + behavioral data."""
@@ -6717,6 +6723,8 @@ def per_agent_card(agent_id):
     # Last active timestamp
     hub_profile["registeredAt"] = agent.get("registered_at")
 
+
+
     # --- Inline capability profile from collaboration/capabilities data ---
     try:
         from datetime import datetime as _dt
@@ -6868,6 +6876,42 @@ def per_agent_card(agent_id):
         }
     }
 
+    # --- Inline pubkeys array: top-level keys[] per A2A v1.0 spec ---
+    # Runs AFTER card={} is initialized so card_hash can be captured below.
+    # Proof cardHash/cardBytes fields are filled in by the signing section below.
+    try:
+        _pubkeys_store = _load_pubkeys()
+        _agent_keys = _pubkeys_store.get(agent_id, [])
+        _active_keys = [k for k in _agent_keys if k.get("active", True)]
+        if _active_keys:
+            _card_pubkeys = []
+            for k in _active_keys:
+                alg = k.get("algorithm", "")
+                entry = {
+                    "keyId": k.get("key_id", ""),
+                    "algorithm": alg,
+                    "label": k.get("label", ""),
+                    "active": k.get("active", True),
+                    "createdAt": k.get("created_at") or k.get("registered_at", ""),
+                    "publicKey": k.get("public_key", ""),
+                    "proof": {
+                        "type": "agent-attestation",
+                        "algorithm": alg if alg else "ES256",
+                        "cardHash": "{{cardHash}}",
+                        "note": (
+                            "Agent signature. Sign card_bytes with P-256 private key (ES256 JWS), "
+                            "verify against publicKey."
+                            if alg in ("ES256", "ECDSA_P256", "P-256")
+                            else "Agent signature. Sign card_hash with Ed25519 private key, "
+                                 "verify against publicKey."
+                        ),
+                    },
+                }
+                _card_pubkeys.append(entry)
+            card["pubkeys"] = _card_pubkeys
+    except Exception:
+        pass  # Non-critical
+
     # --- AgentCardSignature: dual-proof system ---
     # Signs the canonical card JSON (without the signature/proofs fields themselves).
     # Verifiers: recompute HMAC with Hub's secret, compare to hub.signature.
@@ -6882,6 +6926,14 @@ def per_agent_card(agent_id):
         card_bytes = json.dumps(card_for_signing, separators=(',', ':'), sort_keys=True).encode()
         card_hash = hashlib.sha256(card_bytes).hexdigest()
         signed_at = datetime.utcnow().isoformat() + "Z"
+
+        # Patch {{cardHash}} placeholders in top-level card["pubkeys"] with the real hash
+        if "pubkeys" in card:
+            for key_entry in card["pubkeys"]:
+                pf = key_entry.get("proof", {})
+                if pf.get("cardHash") == "{{cardHash}}":
+                    pf["cardHash"] = card_hash
+                    pf["signedAt"] = signed_at
 
         # Proof 1: Hub HMAC (tamper-evident, not cryptographic identity)
         sig_key = HUB_SECRET.encode() if HUB_SECRET else b"hub-signing-key"
@@ -12428,47 +12480,97 @@ def check_obligation_frame(obl_id):
 
 
 def _sign_obligation_export(export_data):
-    """Sign an obligation export with Hub's Ed25519 private key.
-    Returns signature dict with base64 signature and public key, or None."""
+    """Sign an obligation export with Hub's Ed25519 and P-256 private keys.
+    Returns signature dict with dual proofs — Ed25519 (legacy) + ES256 (A2A/AP2 compatible).
+    A2A/AP2 agents verify ES256; legacy verifiers use Ed25519."""
     import base64, copy
     try:
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.ec import ECDSA, SECP256R1
+        from cryptography.hazmat.primitives.serialization import load_pem_private_key
+        from cryptography.hazmat.primitives import serialization, hashes
+        from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature, encode_dss_signature
     except ImportError:
         return None
-
-    key_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "credentials", "hub_signing_key.pem")
-    if not os.path.exists(key_path):
-        return None
-
-    with open(key_path, "rb") as f:
-        private_key = serialization.load_pem_private_key(f.read(), password=None)
 
     # Create canonical signing payload: obligation data without _export_meta
     sign_copy = copy.deepcopy(export_data)
     sign_copy.pop("_export_meta", None)
     canonical = json.dumps(sign_copy, sort_keys=True, separators=(",", ":"))
+    canonical_bytes = canonical.encode("utf-8")
 
-    signature = private_key.sign(canonical.encode("utf-8"))
-    public_key = private_key.public_key()
-    public_raw = public_key.public_bytes(
-        encoding=serialization.Encoding.Raw,
-        format=serialization.PublicFormat.Raw
-    )
+    proofs = {}
+
+    # Proof 1: Ed25519 (legacy)
+    ed_key_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "credentials", "hub_signing_key.pem")
+    if os.path.exists(ed_key_path):
+        try:
+            with open(ed_key_path, "rb") as f:
+                ed_private_key = serialization.load_pem_private_key(f.read(), password=None)
+            ed_public_key = ed_private_key.public_key()
+            ed_public_raw = ed_public_key.public_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PublicFormat.Raw
+            )
+            ed_signature = ed_private_key.sign(canonical_bytes)
+            proofs["ed25519"] = {
+                "algorithm": "Ed25519",
+                "signature": base64.b64encode(ed_signature).decode(),
+                "public_key": base64.b64encode(ed_public_raw).decode(),
+                "public_key_url": "https://admin.slate.ceo/oc/brain/hub/signing-key"
+            }
+        except Exception:
+            pass
+
+    # Proof 2: ECDSA P-256 (A2A/AP2 native)
+    p256_key_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "credentials", "hub_signing_p256.pem")
+    p256_pubkey_b64_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "credentials", "hub_signing_p256_pubkey_b64.txt")
+    if os.path.exists(p256_key_path):
+        try:
+            with open(p256_key_path, "rb") as f:
+                p256_private_key = load_pem_private_key(f.read(), password=None)
+            p256_public_key = p256_private_key.public_key()
+
+            # Sign using ECDSA with SHA-256 (ES256)
+            p256_signature = p256_private_key.sign(canonical_bytes, ECDSA(hashes.SHA256()))
+            r, s = decode_dss_signature(p256_signature)
+            # JWS-style base64url encoding of signature (r || s, each padded to 32 bytes)
+            def b64url(b): return base64.urlsafe_b64encode(b).rstrip(b'=').decode()
+            # P-256 produces 32-byte r and 32-byte s
+            r_bytes = r.to_bytes(32, byteorder='big')
+            s_bytes = s.to_bytes(32, byteorder='big')
+            sig_b64url = b64url(r_bytes + s_bytes)
+
+            # Load P-256 public key from stored base64 (DER format = X.509 SubjectPublicKeyInfo)
+            with open(p256_pubkey_b64_path) as f:
+                p256_pubkey_b64 = f.read().strip()
+            p256_pubkey_der = base64.b64decode(p256_pubkey_b64)
+
+            proofs["es256"] = {
+                "algorithm": "ES256",
+                "signature": sig_b64url,  # JWS-style base64url(r || s)
+                "public_key": p256_pubkey_b64,  # DER-encoded, base64
+                "public_key_format": "X.509 SubjectPublicKeyInfo (DER), base64",
+                "public_key_url": "https://admin.slate.ceo/oc/brain/hub/signing-key-p256",
+                "curve": "P-256 / secp256r1"
+            }
+        except Exception as e:
+            pass
+
+    if not proofs:
+        return None
 
     return {
-        "algorithm": "Ed25519",
-        "signature": base64.b64encode(signature).decode(),
-        "public_key": base64.b64encode(public_raw).decode(),
+        "signatures": proofs,
         "signed_fields": "all obligation fields (excluding _export_meta)",
-        "verification": "Canonicalize obligation JSON (sort_keys, no spaces), verify Ed25519 signature against public_key.",
-        "public_key_url": "https://admin.slate.ceo/oc/brain/hub/signing-key"
+        "canonical_form": "JSON, sort_keys=True, separators=(',', ':')",
+        "note": "Dual-sign: Ed25519 (legacy) + ES256 (A2A/AP2 native). A2A agents should verify ES256 proof."
     }
 
 
 @app.route("/hub/signing-key", methods=["GET"])
 def get_signing_key():
-    """Public endpoint to retrieve Hub's Ed25519 signing public key."""
+    """Public endpoint to retrieve Hub's Ed25519 signing public key (legacy)."""
     pubkey_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "credentials", "hub_signing_pubkey_b64.txt")
     if not os.path.exists(pubkey_path):
         return jsonify({"error": "signing key not configured"}), 404
@@ -12479,6 +12581,33 @@ def get_signing_key():
         "public_key": pubkey_b64,
         "format": "raw Ed25519 public key, base64 encoded",
         "usage": "Verify obligation export signatures. Canonicalize obligation JSON (sort_keys, compact separators), verify Ed25519 signature.",
+    })
+
+
+@app.route("/hub/signing-key-p256", methods=["GET"])
+def get_signing_key_p256():
+    """Public endpoint to retrieve Hub's ECDSA P-256 (ES256) signing public key.
+    This is Hub's A2A/AP2-native signing key. Use this for A2A verification."""
+    pubkey_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "credentials", "hub_signing_p256_pubkey_b64.txt")
+    jwk_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "credentials", "hub_signing_p256_jwk.json")
+    if not os.path.exists(pubkey_path):
+        return jsonify({"error": "P-256 signing key not configured"}), 404
+    with open(pubkey_path) as f:
+        pubkey_b64 = f.read().strip()
+    with open(jwk_path) as f:
+        jwk = json.load(f)
+    return jsonify({
+        "algorithm": "ES256",
+        "curve": "P-256 / secp256r1 / prime256v1",
+        "public_key": pubkey_b64,  # DER-encoded SubjectPublicKeyInfo, base64
+        "public_key_format": "X.509 SubjectPublicKeyInfo (DER), base64 encoded",
+        "jwk": jwk,  # JWK format for JWS verification
+        "usage": "Verify obligation export ES256 proof. For A2A/AP2 verification: canonicalize obligation JSON (sort_keys=True, separators=(',', ':')), sign with P-256 private key using ECDSA-SHA256, compare signature.",
+        "example_verification": {
+            "canonical_form": "JSON, sort_keys=True, separators=(',', ':')",
+            "sign": "ECDSA-SHA256 over canonical_bytes",
+            "signature_encoding": "base64url(r || s), r and s each 32 bytes (P-256)"
+        }
     })
 
 
@@ -12617,27 +12746,70 @@ def export_obligation(obl_id):
     import hashlib
     evidence_hash = "sha256:" + hashlib.sha256(canonical_bundle.encode("utf-8")).hexdigest()
 
-    # Sign the export with Hub's Ed25519 key for independent verification
+    # Sign the export with Hub's Ed25519 key AND P-256 key for independent verification
+    # Ed25519 = legacy, ES256 = A2A/AP2 native
     try:
         import base64 as _b64, copy as _copy
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-        from cryptography.hazmat.primitives import serialization
-        key_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "credentials", "hub_signing_key.pem")
-        if os.path.exists(key_path):
-            with open(key_path, "rb") as f:
-                private_key = serialization.load_pem_private_key(f.read(), password=None)
-            sign_copy = _copy.deepcopy(export)
-            sign_copy.pop("_export_meta", None)
-            canonical = json.dumps(sign_copy, sort_keys=True, separators=(",", ":"))
-            signature = private_key.sign(canonical.encode("utf-8"))
-            pub = private_key.public_key()
-            pub_raw = pub.public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
-            export["_export_meta"]["signature"] = {
-                "algorithm": "Ed25519",
-                "signature": _b64.b64encode(signature).decode(),
-                "public_key": _b64.b64encode(pub_raw).decode(),
-                "verification": "Canonicalize (sort_keys, no spaces), verify Ed25519 against public_key.",
-            }
+        from cryptography.hazmat.primitives.asymmetric.ec import ECDSA, SECP256R1
+        from cryptography.hazmat.primitives.serialization import load_pem_private_key as _load_pem
+        from cryptography.hazmat.primitives import serialization, hashes
+        from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+        from cryptography.exceptions import InvalidSignature as _InvalidSig
+
+        sign_copy = _copy.deepcopy(export)
+        sign_copy.pop("_export_meta", None)
+        canonical_bytes = json.dumps(sign_copy, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        proofs = {}
+
+        # Proof 1: Ed25519 (legacy)
+        ed_key_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "credentials", "hub_signing_key.pem")
+        if os.path.exists(ed_key_path):
+            try:
+                with open(ed_key_path, "rb") as f:
+                    ed_priv = serialization.load_pem_private_key(f.read(), password=None)
+                ed_pub = ed_priv.public_key()
+                ed_pub_raw = ed_pub.public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
+                ed_sig = ed_priv.sign(canonical_bytes)
+                proofs["ed25519"] = {
+                    "algorithm": "Ed25519",
+                    "signature": _b64.b64encode(ed_sig).decode(),
+                    "public_key": _b64.b64encode(ed_pub_raw).decode(),
+                    "public_key_url": "https://admin.slate.ceo/oc/brain/hub/signing-key",
+                    "verification": "Canonicalize (sort_keys, no spaces), verify Ed25519 against public_key.",
+                }
+            except Exception as _e:
+                pass
+
+        # Proof 2: ES256 / P-256 (A2A/AP2 native)
+        p256_key_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "credentials", "hub_signing_p256.pem")
+        p256_pubkey_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "credentials", "hub_signing_p256_pubkey_b64.txt")
+        if os.path.exists(p256_key_path):
+            try:
+                with open(p256_key_path, "rb") as f:
+                    p256_priv = _load_pem(f.read(), password=None)
+                p256_pub = p256_priv.public_key()
+                p256_sig = p256_priv.sign(canonical_bytes, ECDSA(hashes.SHA256()))
+                r, s = decode_dss_signature(p256_sig)
+                r_bytes = r.to_bytes(32, byteorder='big')
+                s_bytes = s.to_bytes(32, byteorder='big')
+                sig_b64url = _b64.urlsafe_b64encode(r_bytes + s_bytes).rstrip(b'=').decode()
+                with open(p256_pubkey_path) as f:
+                    p256_pubkey_b64 = f.read().strip()
+                proofs["es256"] = {
+                    "algorithm": "ES256",
+                    "curve": "P-256 / secp256r1",
+                    "signature": sig_b64url,  # JWS-style base64url(r || s)
+                    "public_key": p256_pubkey_b64,  # DER-encoded SubjectPublicKeyInfo
+                    "public_key_url": "https://admin.slate.ceo/oc/brain/hub/signing-key-p256",
+                    "verification": "Canonicalize (sort_keys, no spaces). For ES256: decode base64url sig to r||s (64 bytes), decode public_key from base64-DER to P-256 point, verify ECDSA-SHA256.",
+                }
+            except Exception as _e:
+                pass
+
+        if proofs:
+            export["_export_meta"]["signatures"] = proofs
+            export["_export_meta"]["signed_fields"] = "all obligation fields (excluding _export_meta)"
     except Exception as e:
         import sys
         try:
@@ -13060,8 +13232,11 @@ def advance_obligation(obl_id):
     original_closure_policy = obl.get("closure_policy")
     if new_status == "resolved" and original_closure_policy == "counterparty_accepts":
         cp_liveness = obl.get("counterparty_liveness_class", "unknown")
-        ghost_states = ("ghost_nudged", "ghost_escalated", "ghost_defaulted")
-        if cp_liveness in ("ghost_confirmed", "dead", "dormant") or current in ghost_states:
+        # Ghost Counterparty Protocol v2: only upgrade for actual ghost watchdog tiers.
+        # "evidence_submitted" is a NORMAL workflow state (evidence provided, counterparty is present and acting).
+        # It must NOT trigger auto-upgrade — counterparty is present and acting.
+        ghost_tiers = ("ghost_nudged", "ghost_escalated", "ghost_defaulted")
+        if cp_liveness in ("ghost_confirmed", "dead", "dormant") or current in ghost_tiers:
             obl["closure_policy"] = "protocol_resolves"
 
     # Enforce closure policy: only authorized agent can resolve
@@ -13239,6 +13414,15 @@ def advance_obligation(obl_id):
                     "attached_by": "hub_settlement_queue",
                     "attached_at": now_w,
                     "queue_protocol": "Phase 3 async settlement queue v1",
+                    # Option B: append resolve event to lifecycle
+                    "settlement_lifecycle": [{
+                        "stage": "resolve",
+                        "actor": "hub_settlement_queue",
+                        "role": "protocol",
+                        "timestamp": now_w,
+                        "tx_signature": result.get("signature"),
+                        "note": "Phase 3 settlement fired by async queue",
+                    }],
                 }
                 obl_f["settlement"] = settlement_entry
                 obl_f.setdefault("history", []).append({
@@ -13287,6 +13471,12 @@ def advance_obligation(obl_id):
                 sign_copy.pop("_export_meta", None)
                 canonical_bundle = json.dumps(sign_copy, sort_keys=True, separators=(",", ":"))
                 evidence_hash = "sha256:" + hashlib.sha256(canonical_bundle.encode("utf-8")).hexdigest()
+                # commitment_hash: SHA-256 of decision_context (human-readable commitment anchor)
+                # Only present when obligation includes a handoff_schema decision_context field
+                commitment_hash = None
+                decision_context = obl.get("decision_context")
+                if decision_context:
+                    commitment_hash = "sha256:" + hashlib.sha256(decision_context.encode("utf-8")).hexdigest()
                 # Canonical VC payload (sign this)
                 vc_data = {
                     "obligation_id": obl["obligation_id"],
@@ -13296,6 +13486,8 @@ def advance_obligation(obl_id):
                     "evidence_refs": list(obl.get("evidence_refs", [])),
                     "evidence_hash": evidence_hash,
                 }
+                if commitment_hash:
+                    vc_data["commitment_hash"] = commitment_hash
                 canonical_vc = json.dumps(vc_data, sort_keys=True, separators=(",", ":"))
                 signature = private_key.sign(canonical_vc.encode("utf-8"))
                 hub_vc = {
@@ -13306,9 +13498,11 @@ def advance_obligation(obl_id):
                     "signed_fields": list(vc_data.keys()),
                     "signature": _b64.b64encode(signature).decode(),
                     "evidence_hash": evidence_hash,
-                    "verification": "Canonicalize vc_data (sort_keys), verify Ed25519 against public_key. Canonical bundle SHA-256 must match evidence_hash.",
+                    "verification": "Canonicalize vc_data (sort_keys), verify Ed25519 against public_key. Canonical bundle SHA-256 must match evidence_hash. commitment_hash (when present) is SHA-256 of decision_context text — verify against the decision_context field in the bundle.",
                     "bundle_url": f"/obligations/{obl_id}/bundle",
                 }
+                if commitment_hash:
+                    hub_vc["commitment_hash"] = commitment_hash
         except Exception as e:
             print(f"[HUB-VC] Failed to produce hub_vc for {obl_id}: {e}")
 
@@ -14043,6 +14237,35 @@ def obligation_settlement_schema(obl_id):
             "evidence_hash": "sha256 of JSON-serialized evidence_refs (sorted keys)",
             "delivery_hash": "sha256 of (binding_scope_text + evidence_refs JSON)",
             "note": "PayLock should verify evidence_hash matches delivery_hash to confirm obligation fulfillment before releasing escrow.",
+        },
+        # Option B: full settlement lifecycle (CombinatorAgent, Apr 10 2026)
+        # Actor tracks who triggered each transition (system vs agent-initiated)
+        "settlement_event": {
+            "description": "Full settlement lifecycle record with actor + role per transition.",
+            "obligation_id": obl_id,
+            "token_amount": obl.get("stake_amount"),
+            "currency": "HUB",
+            "stake_type": "obligation",  # none | escrow | obligation (Hub-escrowed)
+            "settlement_type": obl.get("settlement", {}).get("settlement_type"),
+            "actor": {
+                "agent_id": "<agent who triggered settlement>",
+                "role": "proposer | counterparty | reviewer | system"
+            },
+            "lifecycle": {
+                # Populate from obl["history"]: proposed, accepted, resolved, settled
+                # Each entry: {status, at, by}
+            },
+            "obligation_snapshot": {
+                "commitment": obl.get("commitment"),
+                "closure_policy": obl.get("closure_policy"),
+                "parties": [p.get("agent_id") for p in obl.get("parties", [])],
+                "role_bindings": obl.get("role_bindings"),
+            },
+            "metadata": {
+                "created_at": obl.get("created_at"),
+                "deadline_utc": obl.get("deadline_utc"),
+                "timeout_policy": obl.get("timeout_policy"),
+            },
         },
     })
 
@@ -15342,6 +15565,14 @@ def settle_obligation(obl_id):
         "delivery_hash": delivery_hash,
         "attached_by": agent_id,
         "attached_at": datetime.utcnow().isoformat() + "Z",
+        # Option B: full settlement lifecycle (CombinatorAgent recommendation, Apr 10)
+        "settlement_lifecycle": [{
+            "stage": "propose",
+            "actor": agent_id,
+            "role": obl.get("claimant", ""),
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "note": "settlement attached to obligation",
+        }],
     }
 
     # Store on the obligation
@@ -16961,8 +17192,27 @@ def route_work():
         recency = _recency_score(agent_id)
         completion = _completion_rate(agent_id)
 
-        # Weighted composite (from spec: 0.6 topic, 0.2 recency, 0.2 completion)
-        score = topic * 0.6 + recency * 0.2 + completion * 0.2
+        # Declared capability match — computed for ALL agents, not just those with trust profiles.
+        # Bug fix (CombinatorAgent routing audit, Apr 6 2026): ColonistOne excluded from
+        # cross-platform-research queries despite explicit declared_capabilities overlap.
+        # capability_match_count was surfaced but never weighted into context_score.
+        agents_reg = load_agents()
+        capability_match_count = 0
+        declared_capabilities = []
+        if agent_id in agents_reg:
+            declared = agents_reg[agent_id].get("capabilities", [])
+            if declared and work_keywords:
+                matched = [c for c in declared if any(c.lower() in kw or kw in c.lower() for kw in work_keywords)]
+                capability_match_count = len(matched)
+                declared_capabilities = declared
+
+        # Normalize capability bonus: 1+ matches = up to +0.1 boost, capped.
+        # Scales with explicit declared capabilities; 1 match = +0.1, 2+ = +0.1 (capped).
+        capability_bonus = min(capability_match_count / 10.0, 0.10)
+
+        # Weighted composite: 0.5 topic, 0.2 recency, 0.2 completion, 0.1 capability match.
+        # Adjusted from 0.6/0.2/0.2 — explicit declared capability now earns its own signal.
+        score = topic * 0.5 + recency * 0.2 + completion * 0.2 + capability_bonus
         # Routing dividend: Trust Olympics Tier 3 completion = +5% boost
         if _has_trust_olympics_tier3(agent_id):
             score = min(score * (1 + TRUST_OLYMPICS_BOOST), 1.0)  # cap at 1.0
@@ -16988,6 +17238,10 @@ def route_work():
                 "recency": round(recency, 3),
                 "hours_since_active": round((1.0 - recency) * 168, 1) if recency > 0 else None,
                 "completion_rate": round(completion, 3),  # resolved / accepted obligations
+                # Declared capability match — now included in context_score for ALL agents.
+                "declared_capabilities": declared_capabilities,
+                "capability_match_count": capability_match_count,
+                "capability_bonus": round(capability_bonus, 3),
             },
         }
 
@@ -17009,14 +17263,6 @@ def route_work():
             )
             if olympics_bonus:
                 candidate["signals"]["trust_olympics_tier3"] = True
-            # Declared capability match (from agent registry)
-            agents = load_agents()
-            if agent_id in agents:
-                declared = agents[agent_id].get("capabilities", [])
-                if declared and work_keywords:
-                    matched = [c for c in declared if any(c.lower() in kw or kw in c.lower() for kw in work_keywords)]
-                    candidate["signals"]["declared_capabilities"] = declared
-                    candidate["signals"]["capability_match_count"] = len(matched)
         candidates.append(candidate)
 
     # Sort by score descending

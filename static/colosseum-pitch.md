@@ -36,7 +36,7 @@ Most agent trust systems measure inputs (wallet tenure, code audits, identity as
 
 ## The Accountability Gap (Market Validation)
 
-x402 (Linux Foundation, April 2026) enables AI agents to pay each other. But volume collapsed 92-99.8% post-launch because there was no way to verify whether agents actually delivered. Every x402 project (SP3ND, SAID Protocol, Breeze Agent Kit, OpenDexter) has payments without accountability verification.
+**x402 Foundation launched April 2, 2026 at Linux Foundation with 20+ member organizations.** The protocol enables AI agents to pay each other via HTTP 402 + USDC on Base. But volume collapsed 92-99.8% from peak — not a technical failure, a trust failure. Every x402 project (SP3ND, SAID Protocol, Breeze Agent Kit, OpenDexter) has payment rails without delivery verification. Agents pay; nobody knows if the work happened.
 
 The Drift Protocol exploit ($285M, April 2026) was a commitment-scoping failure: attackers made commitments they never intended to honor, and no accountability infrastructure existed.
 

@@ -27,7 +27,6 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 
-import server  # noqa: E402  # needed for HUB_SECRET access in ack_message
 from .events import EventHook
 
 # ── Event hooks ──────────────────────────────────────────────────────
@@ -54,6 +53,23 @@ on_send_recipient_not_found = EventHook()
 # ── Blueprint ────────────────────────────────────────────────────────
 
 messaging_bp = Blueprint("messaging", __name__)
+
+# ── Hub channel secret (for gateway proxy auth) ────────────────────
+
+_hub_secret_cache = None
+
+def _get_hub_secret():
+    """Read HUB_SECRET from openclaw config. Cached after first read."""
+    global _hub_secret_cache
+    if _hub_secret_cache is not None:
+        return _hub_secret_cache
+    try:
+        with open("/home/openclaw/.openclaw/openclaw.json") as f:
+            cfg = json.load(f)
+        _hub_secret_cache = cfg.get("channels", {}).get("hub", {}).get("secret", "")
+    except Exception:
+        _hub_secret_cache = ""
+    return _hub_secret_cache
 
 # ── Storage paths (initialized by init_messaging) ───────────────────
 
@@ -323,8 +339,19 @@ def _derive_delivery_state(delivered_channels, callback_status=None):
     return "inbox_queued"
 
 
-def _derive_acknowledged_delivery_state(delivered_channels, callback_status=None):
+def _derive_acknowledged_delivery_state(delivered_channels, callback_status=None, session_loaded=False):
     channels = list(dict.fromkeys(delivered_channels or []))
+    if session_loaded:
+        # session_loaded_read preserves the ack signal through the read transition
+        if "websocket" in channels and "callback" in channels:
+            return "websocket_callback_session_loaded_read"
+        if "websocket" in channels:
+            return "websocket_session_loaded_read"
+        if "callback" in channels:
+            return "callback_session_loaded_read"
+        if "poll" in channels:
+            return "poll_session_loaded_read"
+        return "session_loaded_read"
     if "websocket" in channels and "callback" in channels:
         return "websocket_callback_read"
     if "websocket" in channels:
@@ -366,7 +393,7 @@ def _mark_sent_records_delivered(sender_id, recipient_id, message_ids, channel, 
             record["delivered_channels"] = channels
             record["delivered_at"] = record.get("delivered_at") or delivered_at
             if record.get("read"):
-                record["delivery_state"] = _derive_acknowledged_delivery_state(channels, record.get("callback_status"))
+                record["delivery_state"] = _derive_acknowledged_delivery_state(channels, record.get("callback_status"), session_loaded=bool(record.get("session_loaded")))
             else:
                 record["delivery_state"] = _derive_delivery_state(channels, record.get("callback_status"))
             changed = True
@@ -393,6 +420,7 @@ def _mark_sent_records_read(sender_id, recipient_id, message_ids, read_at=None):
             next_state = _derive_acknowledged_delivery_state(
                 record.get("delivered_channels"),
                 record.get("callback_status"),
+                session_loaded=bool(record.get("session_loaded")),
             )
             if record.get("delivery_state") != next_state:
                 record["delivery_state"] = next_state
@@ -402,7 +430,7 @@ def _mark_sent_records_read(sender_id, recipient_id, message_ids, read_at=None):
     return _mutate_sent_records(sender_id, recipient_id, _mutate)
 
 
-def _mark_sent_records_session_loaded(sender_id, recipient_id, message_ids, loaded_at=None, runtime_id=None):
+def _mark_sent_records_session_loaded(sender_id, recipient_id, message_ids, loaded_at=None, runtime_id=None, ack_type="session_loaded"):
     """Mark sent records as session_loaded (passive ack from recipient runtime).
 
     Updates delivery_state to 'session_loaded' unless already at a higher state (read).
@@ -418,17 +446,25 @@ def _mark_sent_records_session_loaded(sender_id, recipient_id, message_ids, load
         for record in records:
             if record.get("message_id") not in message_id_set:
                 continue
-            # Don't downgrade: if already read, skip
-            if record.get("read"):
-                continue
             # Don't re-ack: if already session_loaded, skip (idempotent)
             if record.get("session_loaded"):
                 continue
             record["session_loaded"] = True
             record["session_loaded_at"] = loaded_at
+            record["ack_type"] = ack_type
             if runtime_id:
                 record["session_runtime_id"] = runtime_id
-            record["delivery_state"] = "session_loaded"
+            # Don't downgrade delivery_state: if already read, re-derive
+            # with session_loaded=True to get the correct read+ack state.
+            # This handles the race where read propagation beats ack propagation.
+            if record.get("read"):
+                record["delivery_state"] = _derive_acknowledged_delivery_state(
+                    record.get("delivered_channels"),
+                    record.get("callback_status"),
+                    session_loaded=True,
+                )
+            else:
+                record["delivery_state"] = "session_loaded"
             changed = True
         return changed
 
@@ -501,7 +537,7 @@ def _finalize_sent_record_delivery(
             record["callback_status"] = callback_status
             record["callback_error"] = callback_error
             if record.get("read"):
-                record["delivery_state"] = _derive_acknowledged_delivery_state(merged_channels, callback_status)
+                record["delivery_state"] = _derive_acknowledged_delivery_state(merged_channels, callback_status, session_loaded=bool(record.get("session_loaded")))
             else:
                 record["delivery_state"] = _derive_delivery_state(merged_channels, callback_status)
             changed = True
@@ -1124,7 +1160,7 @@ def send_message(agent_id):
     data = request.get_json() or {}
     from_agent = data.get("from")
     message = data.get("message")
-    sender_secret = data.get("secret")
+    sender_secret = request.headers.get("X-Agent-Secret") or data.get("secret")
 
     if not from_agent:
         return jsonify({"ok": False, "error": "Missing 'from'"}), 400
@@ -1302,20 +1338,30 @@ def register_websocket(sock_instance):
         """WebSocket endpoint for real-time message push."""
         import time as _time
 
-        try:
-            auth = json.loads(ws.receive(timeout=10))
-        except Exception:
-            ws.send(json.dumps({"ok": False, "error": "Auth timeout \u2014 send {\"secret\": \"...\"} within 10s"}))
-            return
-
-        secret = auth.get("secret", "")
-        probe = bool(auth.get("probe"))
+        # Auth: check X-Agent-Secret header first (for proxy architecture),
+        # fall back to JSON auth message (backwards compatible with direct clients)
+        secret_from_header = request.headers.get("X-Agent-Secret")
         agents = load_agents()
-        if agent_id not in agents or agents[agent_id].get("secret") != secret:
-            ws.send(json.dumps({"ok": False, "error": "Invalid agent_id or secret"}))
-            return
 
-        ws.send(json.dumps({"ok": True, "type": "auth", "agent_id": agent_id, "probe": probe}))
+        if secret_from_header and agent_id in agents and agents[agent_id].get("secret") == secret_from_header:
+            # Authenticated via header — skip JSON handshake
+            probe = False
+            ws.send(json.dumps({"ok": True, "type": "auth", "agent_id": agent_id, "probe": probe}))
+        else:
+            # Fall back to JSON auth (existing behavior)
+            try:
+                auth = json.loads(ws.receive(timeout=10))
+            except Exception:
+                ws.send(json.dumps({"ok": False, "error": "Auth timeout \u2014 send {\"secret\": \"...\"} within 10s"}))
+                return
+
+            secret = auth.get("secret", "")
+            probe = bool(auth.get("probe"))
+            if agent_id not in agents or agents[agent_id].get("secret") != secret:
+                ws.send(json.dumps({"ok": False, "error": "Invalid agent_id or secret"}))
+                return
+
+            ws.send(json.dumps({"ok": True, "type": "auth", "agent_id": agent_id, "probe": probe}))
         if probe:
             return
 
@@ -1332,20 +1378,23 @@ def register_websocket(sock_instance):
                 try:
                     data = ws.receive(timeout=20)
                     if data is None:
-                        break
+                        # simple_websocket returns None on BOTH timeout and
+                        # clean client close. Check ws.connected to distinguish.
+                        if not ws.connected:
+                            break  # client closed the connection
+                        # Timeout — send heartbeat pong + deliver unread
+                        try:
+                            _send_on_ws(ws, json.dumps({"type": "pong"}))
+                            _ws_deliver_unread(ws, agent_id)
+                            continue
+                        except Exception:
+                            break  # send failed — connection is dead
                     msg = json.loads(data)
                     if msg.get("type") == "ping":
                         _send_on_ws(ws, json.dumps({"type": "pong"}))
                     elif msg.get("type") == "send":
                         # Bidirectional: agent sends a message over the WS connection
                         _handle_ws_send(ws, agent_id, msg)
-                except TimeoutError:
-                    try:
-                        _send_on_ws(ws, json.dumps({"type": "pong"}))
-                        _ws_deliver_unread(ws, agent_id)
-                        continue
-                    except Exception:
-                        break
                 except Exception:
                     break
         finally:
@@ -1498,11 +1547,15 @@ def ack_message(agent_id, message_id):
     # Accept either the agent's registry secret (e.g. brain_known_secret_KkLmN) or
     # the channel config secret (e.g. BRAIN_INTERNAL_SECRET_12345 for Brain's gateway)
     agent_secret = agents[agent_id].get("secret", "")
-    channel_secret = getattr(server, "HUB_SECRET", "") or ""
+    # Also accept the channel config secret (for gateway proxies like Brain's).
+    # Read directly from config to avoid circular import with server.py.
+    channel_secret = _get_hub_secret()
     if secret not in (agent_secret, channel_secret):
         return jsonify({"ok": False, "error": "Invalid secret"}), 403
 
     ack_type = data.get("ack_type", "session_loaded")
+    if ack_type != "session_loaded":
+        return jsonify({"ok": False, "error": "Invalid ack_type. Only 'session_loaded' is supported."}), 400
     runtime_id = data.get("runtime_id")
     loaded_at = datetime.utcnow().isoformat() + "Z"
 
@@ -1510,6 +1563,8 @@ def ack_message(agent_id, message_id):
     found = False
     sender_id = None
     already_acked = False
+    already_read = False
+    stored_ack = {}
     with _exclusive_file_lock(_inbox_lock_path(agent_id)):
         inbox = load_inbox(agent_id)
         for m in inbox:
@@ -1518,36 +1573,48 @@ def ack_message(agent_id, message_id):
                 sender_id = m.get("from")
                 if m.get("session_loaded"):
                     already_acked = True
+                    stored_ack = {
+                        "acked_at": m.get("session_loaded_at", loaded_at),
+                        "ack_type": m.get("ack_type", "session_loaded"),
+                    }
+                elif m.get("read"):
+                    # Message already read — read > session_loaded.
+                    # Don't set session_loaded on inbox (already at higher state).
+                    already_read = True
                 else:
                     m["session_loaded"] = True
                     m["session_loaded_at"] = loaded_at
+                    m["ack_type"] = ack_type
                     if runtime_id:
                         m["session_runtime_id"] = runtime_id
                 break
-        if found and not already_acked:
+        if found and not already_acked and not already_read:
             _save_inbox_unlocked(agent_id, inbox)
 
     if not found:
         return jsonify({"ok": False, "error": "Message not found"}), 404
 
-    # Propagate to sender's sent records (fire-and-forget)
+    # Propagate to sender's sent records (fire-and-forget).
+    # Always propagate unless already acked — even if already read, so the
+    # session_loaded flag is captured on the sent record (handles race where
+    # read propagation beats ack propagation).
     if sender_id and not already_acked:
         try:
-            _mark_sent_records_session_loaded(sender_id, agent_id, [message_id], loaded_at, runtime_id)
+            _mark_sent_records_session_loaded(sender_id, agent_id, [message_id], loaded_at, runtime_id, ack_type)
         except Exception as e:
             print(f"[PASSIVE-ACK] Failed to propagate session_loaded for {message_id}: {e}")
 
-    # Fire event hook
-    if not already_acked:
+    # Fire event hook (not for re-acks or already-read messages)
+    if not already_acked and not already_read:
         on_message_acked.fire(agent_id, message_id, sender_id, ack_type, runtime_id)
 
     return jsonify({
         "ok": True,
         "message_id": message_id,
-        "ack_type": ack_type,
-        "acked_at": loaded_at,
+        "ack_type": stored_ack.get("ack_type", ack_type) if already_acked else ack_type,
+        "acked_at": stored_ack.get("acked_at", loaded_at) if already_acked else loaded_at,
         "delivery_state": "session_loaded",
-        "already_acked": already_acked,
+        "already_acked": already_acked or already_read,
     })
 
 
@@ -1687,7 +1754,7 @@ def get_sent_messages(agent_id):
 
     if delivery_filter:
         records = [r for r in records if r.get("delivery_state") == delivery_filter]
-    if session_loaded_filter is not None:
+    if session_loaded_filter:
         want_loaded = session_loaded_filter.lower() in ("true", "1", "yes")
         records = [r for r in records if bool(r.get("session_loaded")) == want_loaded]
     if since_filter:
