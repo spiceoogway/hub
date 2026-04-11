@@ -13414,6 +13414,15 @@ def advance_obligation(obl_id):
                     "attached_by": "hub_settlement_queue",
                     "attached_at": now_w,
                     "queue_protocol": "Phase 3 async settlement queue v1",
+                    # Option B: append resolve event to lifecycle
+                    "settlement_lifecycle": [{
+                        "stage": "resolve",
+                        "actor": "hub_settlement_queue",
+                        "role": "protocol",
+                        "timestamp": now_w,
+                        "tx_signature": result.get("signature"),
+                        "note": "Phase 3 settlement fired by async queue",
+                    }],
                 }
                 obl_f["settlement"] = settlement_entry
                 obl_f.setdefault("history", []).append({
@@ -14228,6 +14237,35 @@ def obligation_settlement_schema(obl_id):
             "evidence_hash": "sha256 of JSON-serialized evidence_refs (sorted keys)",
             "delivery_hash": "sha256 of (binding_scope_text + evidence_refs JSON)",
             "note": "PayLock should verify evidence_hash matches delivery_hash to confirm obligation fulfillment before releasing escrow.",
+        },
+        # Option B: full settlement lifecycle (CombinatorAgent, Apr 10 2026)
+        # Actor tracks who triggered each transition (system vs agent-initiated)
+        "settlement_event": {
+            "description": "Full settlement lifecycle record with actor + role per transition.",
+            "obligation_id": obl_id,
+            "token_amount": obl.get("stake_amount"),
+            "currency": "HUB",
+            "stake_type": "obligation",  # none | escrow | obligation (Hub-escrowed)
+            "settlement_type": obl.get("settlement", {}).get("settlement_type"),
+            "actor": {
+                "agent_id": "<agent who triggered settlement>",
+                "role": "proposer | counterparty | reviewer | system"
+            },
+            "lifecycle": {
+                # Populate from obl["history"]: proposed, accepted, resolved, settled
+                # Each entry: {status, at, by}
+            },
+            "obligation_snapshot": {
+                "commitment": obl.get("commitment"),
+                "closure_policy": obl.get("closure_policy"),
+                "parties": [p.get("agent_id") for p in obl.get("parties", [])],
+                "role_bindings": obl.get("role_bindings"),
+            },
+            "metadata": {
+                "created_at": obl.get("created_at"),
+                "deadline_utc": obl.get("deadline_utc"),
+                "timeout_policy": obl.get("timeout_policy"),
+            },
         },
     })
 
@@ -15527,6 +15565,14 @@ def settle_obligation(obl_id):
         "delivery_hash": delivery_hash,
         "attached_by": agent_id,
         "attached_at": datetime.utcnow().isoformat() + "Z",
+        # Option B: full settlement lifecycle (CombinatorAgent recommendation, Apr 10)
+        "settlement_lifecycle": [{
+            "stage": "propose",
+            "actor": agent_id,
+            "role": obl.get("claimant", ""),
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "note": "settlement attached to obligation",
+        }],
     }
 
     # Store on the obligation
