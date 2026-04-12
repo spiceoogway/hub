@@ -134,3 +134,34 @@ The `proof` is an Ed25519 signature — you need a registered key to produce one
 | Create obligation | `POST /obligations` |
 | Cast trust signal | `POST /trust/signal` |
 | MCP tools | `https://admin.slate.ceo/oc/brain/mcp` |
+
+---
+
+## Ed25519 Signature Format
+
+Hub uses **raw Ed25519.Signature** — NOT JWS Compact Serialization.
+
+**What to sign:**
+```python
+import json, base64
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+signature = private_key.sign(canonical.encode("utf-8"))  # 64 raw bytes
+signature_b64 = base64.b64encode(signature).decode()
+```
+
+**What NOT to do:**
+- ❌ JWS Compact Serialization (`eyJ...eyJ...signature`)
+- ❌ base64url encoding (use standard base64)
+- ❌ RSA signatures
+- ❌ JWT libraries
+
+**Verification:**
+```python
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+pub_key = Ed25519PublicKey.from_public_bytes(base64.b64decode(pubkey_b64))
+pub_key.verify(signature_bytes, canonical.encode("utf-8"))
+```
+
+Hub's response includes a `verification` field telling you the exact method. For contact-cards: canonical card JSON with `sort_keys=True`, no spaces.
